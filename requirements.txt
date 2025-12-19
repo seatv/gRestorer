@@ -1,0 +1,18 @@
+# gRestorer Requirements
+# Python 3.11+ required
+
+# NVIDIA Video Codec SDK bindings (NVDEC/NVENC)
+PyNvVideoCodec>=2.0.2
+
+# Detection (optional, needed for --restorer pseudo)
+ultralytics>=8.3.228
+
+# Image processing / visualization
+opencv-python>=4.12.0.88
+Pillow>=11.3.0
+
+# Utilities
+tqdm>=4.65.0
+
+# PyTorch:
+# Install separately to match your backend (CUDA / CPU / Intel XPU)

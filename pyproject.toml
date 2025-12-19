@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gRestorer"
+version = "0.1.0"
+description = "GPU-accelerated video mosaic removal pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "AGPL-3.0"}
+authors = [{name = "GMan"}]
+keywords = ["video", "processing", "mosaic", "removal", "gpu", "nvdec", "nvenc"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Topic :: Multimedia :: Video",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+
+[project.scripts]
+gRestorer = "gRestorer.cli.main:main"
+
+[project.optional-dependencies]
+# Keep Ultralytics optional so `--restorer none` works without dragging YOLO deps.
+yolo = ["ultralytics>=8.3.228"]
+
+[tool.setuptools.packages.find]
+include = ["gRestorer*"]
