@@ -26,12 +26,13 @@ The CLI prints **per-stage timing** so you can see where the time goes and optim
 
 ```
 gRestorer/
-  cli/        # CLI entry + pipeline orchestration
-  core/       # scene/clip logic (next phase)
-  detector/   # mosaic detector wrapper (YOLO)
-  restorer/   # restorers: none, pseudo, (future) grestorer
-  utils/      # config + visualization helpers
-  video/      # NVDEC/NVENC wrappers: decoder.py, encoder.py
+  cli/         # CLI entry + pipeline orchestration for gRestorer & mosaic
+  core/        # scene/clip logic (next phase)
+  detector/    # mosaic detector wrapper (YOLO)
+  restorer/    # restorers: none, pseudo, (future) grestorer
+  utils/       # config + visualization helpers
+  video/       # NVDEC/NVENC wrappers: decoder.py, encoder.py
+  synthmosaic/ # mosaic addition functions
 pyproject.toml
 requirements.txt
 config.json   # optional; loaded by CLI if present
@@ -81,6 +82,22 @@ python -m gRestorer.cli `
   --restorer pseudo `
   --det-model "D:\Models\lada\lada_mosaic_detection_model_v3.1_accurate.pt"
 ```
+# gRestorer
+
+gRestorer is an NVDEC → (RGBP) → BGR → Detect → Restore → NVENC pipeline designed to be **measurable first** and then optimized until it matches (and hopefully beats) LADA throughput.
+
+## CLI commands
+
+- `gRestorer` — main pipeline (decode → [detect] → restore → encode)
+- `mosaic` — synthetic mosaic generator (for creating SFW test clips)
+
+## Install (Windows / PowerShell)
+
+```powershell
+py -m venv venv
+.\venv\Scripts\Activate.ps1
+python -m pip install -U pip
+pip install -e .
 
 ### Install as an editable package (optional)
 

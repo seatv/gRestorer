@@ -4,9 +4,9 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
-from gRestorer.utils.config import Config
+from gRestorer.utils.config_util import Config
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -22,6 +22,9 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", dest="batch_size", type=int, default=None)
     p.add_argument("--max-frames", dest="max_frames", type=int, default=None)
     p.add_argument("--debug", dest="debug", action="store_true", default=None)
+
+    # Timing (ok if pipeline ignores it)
+    p.add_argument("--profile-sync", dest="profile_sync", action="store_true", default=None)
 
     # Restorer selection
     p.add_argument("--restorer", dest="restorer", choices=["none", "pseudo", "grestorer"], default=None)
@@ -49,40 +52,38 @@ def create_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _apply_if_not_none(dst: Config, key: str, value: Any) -> None:
+def _apply_if_not_none(cfg: Config, key: str, value: Any) -> None:
     if value is not None:
-        dst.data[key] = value
+        cfg.data[key] = value
 
 
-def _apply_visual_if_not_none(dst: Config, key: str, value: Any) -> None:
+def _apply_visual_if_not_none(cfg: Config, key: str, value: Any) -> None:
     if value is not None:
-        dst.set("visualization", key, value=value)
+        cfg.set("visualization", key, value=value)
 
 
 def parse_args(argv=None) -> Config:
-    p = create_parser()
-    args = p.parse_args(argv)
+    args = create_parser().parse_args(argv)
 
     # 1) Load base config.json
     cfg_path = args.config_path or os.environ.get("GRESTORER_CONFIG") or "config.json"
     base = Config.load_json(cfg_path)
-
     cfg = Config(base)
 
     # 2) Mandatory CLI values always win
     cfg.data["input_path"] = args.input_path
     cfg.data["output_path"] = args.output_path
 
-    # 3) Optional CLI overrides (only if user actually supplied them)
-    #    NOTE: argparse sets unspecified optional args to None (we used default=None everywhere).
+    # 3) Optional overrides (only when specified)
     _apply_if_not_none(cfg, "gpu_id", args.gpu_id)
     _apply_if_not_none(cfg, "batch_size", args.batch_size)
     _apply_if_not_none(cfg, "max_frames", args.max_frames)
     _apply_if_not_none(cfg, "restorer", args.restorer)
 
-    # Debug flag: if present on CLI, force True; otherwise keep config value.
     if args.debug is not None and args.debug:
         cfg.data["debug"] = True
+    if args.profile_sync is not None and args.profile_sync:
+        cfg.data["profile_sync"] = True
 
     # Detector
     _apply_if_not_none(cfg, "det_model_path", args.det_model_path)
@@ -105,7 +106,7 @@ def parse_args(argv=None) -> Config:
     _apply_if_not_none(cfg, "qp", args.qp)
     _apply_if_not_none(cfg, "alpha", args.alpha)
 
-    # 4) Defaults if neither config nor CLI provided them (so pipeline always has sane values)
+    # 4) Hard defaults (if neither config nor CLI provided them)
     cfg.data.setdefault("restorer", "none")
     cfg.data.setdefault("gpu_id", 0)
     cfg.data.setdefault("batch_size", 8)
@@ -114,8 +115,11 @@ def parse_args(argv=None) -> Config:
     cfg.data.setdefault("profile", "main")
     cfg.data.setdefault("qp", 23)
     cfg.data.setdefault("alpha", 255)
+    cfg.data.setdefault("det_conf", 0.25)
+    cfg.data.setdefault("det_iou", 0.45)
+    cfg.data.setdefault("det_imgsz", 640)
 
-    # Visualization defaults (nested)
+    # Visualization defaults
     if cfg.get("visualization", default=None) is None:
         cfg.data["visualization"] = {}
     cfg.set("visualization", "box_color", value=cfg.get("visualization", "box_color", default="0,255,0"))

@@ -1,7 +1,6 @@
 # gRestorer/cli/pipeline.py
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple
@@ -9,7 +8,6 @@ from typing import Any, List, Optional, Sequence, Tuple
 import torch
 
 from gRestorer.video import Decoder, Encoder
-from gRestorer.detector.core import Detector as MosaicDetector, Detection
 from gRestorer.restorer import NoneRestorer, PseudoRestorer
 
 
@@ -39,8 +37,6 @@ def _sync_device(device: torch.device) -> None:
 @dataclass
 class StageTimes:
     frames: int = 0
-    batches: int = 0
-
     t_total: float = 0.0
     t_decode_batch: float = 0.0
     t_wrap_dlpack: float = 0.0
@@ -52,16 +48,14 @@ class StageTimes:
     t_encode: float = 0.0
     t_flush: float = 0.0
 
-    def fps(self) -> float:
-        return (self.frames / self.t_total) if self.t_total > 0 else 0.0
+    def _ms_per_frame(self, seconds: float) -> float:
+        return (seconds * 1000.0 / self.frames) if self.frames else 0.0
 
-    def _ms_per_frame(self, t: float) -> float:
-        return (t * 1000.0 / self.frames) if self.frames else 0.0
-
-    def summary(self) -> str:
+    def pretty(self) -> str:
         return "\n".join(
             [
-                f"[Timing] frames={self.frames} batches={self.batches} total={self.t_total:.3f}s ({self.fps():.2f} fps)",
+                f"[Timing] frames:       {self.frames}",
+                f"[Timing] total:        {self.t_total:.3f}s ({self._ms_per_frame(self.t_total):.3f} ms/f)",
                 f"[Timing] decode_batch: {self.t_decode_batch:.3f}s ({self._ms_per_frame(self.t_decode_batch):.3f} ms/f)",
                 f"[Timing] wrap_dlpack:  {self.t_wrap_dlpack:.3f}s ({self._ms_per_frame(self.t_wrap_dlpack):.3f} ms/f)",
                 f"[Timing] rgb->bgr:     {self.t_to_bgr:.3f}s ({self._ms_per_frame(self.t_to_bgr):.3f} ms/f)",
@@ -78,6 +72,7 @@ class StageTimes:
 # ---------------------------
 # Config helpers (MODULE SCOPE!)
 # ---------------------------
+
 def _get(cfg: Any, name: str, default: Any = None) -> Any:
     """
     Best-effort config getter. IMPORTANT: if the key exists but value is None,
@@ -111,126 +106,44 @@ def _get(cfg: Any, name: str, default: Any = None) -> Any:
     return default if v is None else v
 
 
-
-def _cfg_get(cfg: Any, *keys: str, default: Any = None) -> Any:
-    """
-    Nested getter: _cfg_get(cfg, "visualization", "fill_color", default=None)
-
-    Works with:
-      - dict nesting
-      - utils.config.Config (.data dict nesting)
-      - attribute nesting (rare, but supported)
-    """
-    if cfg is None:
-        return default
-
-    cur: Any
-    if isinstance(cfg, dict):
-        cur = cfg
-    else:
-        data = getattr(cfg, "data", None)
-        cur = data if isinstance(data, dict) else cfg
-
-    for k in keys:
-        if isinstance(cur, dict):
-            cur = cur.get(k, None)
-        else:
-            cur = getattr(cur, k, None)
-        if cur is None:
-            return default
-    return cur
-
-
-def _parse_bgr(v: Any, allow_none: bool = True) -> Optional[Tuple[int, int, int]]:
-    """
-    Parse a BGR color from:
-      - "B,G,R" string
-      - (b,g,r) list/tuple
-      - None
-    """
-    if v is None:
-        return None if allow_none else (0, 0, 0)
-
-    if isinstance(v, (list, tuple)) and len(v) == 3:
-        return (int(v[0]), int(v[1]), int(v[2]))
-
-    if isinstance(v, str):
-        parts = [p.strip() for p in v.split(",")]
-        if len(parts) != 3:
-            raise ValueError(f"Expected 'B,G,R', got: {v!r}")
-        return (int(parts[0]), int(parts[1]), int(parts[2]))
-
-    raise TypeError(f"Unsupported color type: {type(v)} ({v!r})")
+def _parse_bgr(s: Any, allow_none: bool = False) -> Optional[Tuple[int, int, int]]:
+    if s is None:
+        return None if allow_none else (0, 255, 0)
+    if isinstance(s, (list, tuple)) and len(s) == 3:
+        return (int(s[0]), int(s[1]), int(s[2]))
+    if isinstance(s, str):
+        parts = [p.strip() for p in s.split(",")]
+        if len(parts) == 3:
+            return (int(parts[0]), int(parts[1]), int(parts[2]))
+    if allow_none:
+        return None
+    return (0, 255, 0)
 
 
 # ---------------------------
-# Tensor helpers
+# Color / packing helpers
 # ---------------------------
 
-def _to_u8(x: torch.Tensor) -> torch.Tensor:
-    if x.dtype == torch.uint8:
-        return x
-    if x.dtype.is_floating_point:
-        return (x * 255.0).round().clamp(0, 255).to(torch.uint8)
-    raise TypeError(f"Unsupported src dtype: {x.dtype}")
-
-
-def _frame_hw(frame: torch.Tensor) -> Tuple[int, int]:
+def rgb_to_bgr_u8_inplace(dst_bgr_u8: torch.Tensor, src_rgb: torch.Tensor) -> None:
     """
-    Supports:
-      - packed: [H,W,3]
-      - planar: [3,H,W]
+    dst_bgr_u8: [H,W,3] uint8
+    src_rgb:    [H,W,3] uint8 OR [3,H,W] uint8 (RGBP)
     """
-    if frame.ndim != 3:
-        raise ValueError(f"Expected 3D frame, got {tuple(frame.shape)}")
+    if dst_bgr_u8.ndim != 3 or dst_bgr_u8.shape[-1] != 3 or dst_bgr_u8.dtype != torch.uint8:
+        raise ValueError(f"Expected dst_bgr_u8 uint8 [H,W,3], got {dst_bgr_u8.dtype} {tuple(dst_bgr_u8.shape)}")
 
-    if frame.shape[-1] == 3:   # HWC
-        return int(frame.shape[0]), int(frame.shape[1])
-    if frame.shape[0] == 3:    # CHW
-        return int(frame.shape[1]), int(frame.shape[2])
-
-    raise ValueError(f"Unsupported frame layout: {tuple(frame.shape)}")
-
-
-def rgb_to_bgr_u8_inplace(dst_bgr: torch.Tensor, src_rgb: torch.Tensor) -> None:
-    """
-    Convert decoder output RGB -> BGR uint8 into dst_bgr.
-
-    src_rgb layouts supported:
-      - packed RGB:  [H,W,3]
-      - planar RGBP: [3,H,W]
-    src_rgb dtype supported:
-      - uint8
-      - float in [0,1]
-
-    dst_bgr:
-      - packed BGR uint8 [H,W,3]
-    """
-    if dst_bgr.ndim != 3 or dst_bgr.shape[-1] != 3 or dst_bgr.dtype != torch.uint8:
-        raise ValueError(f"dst_bgr must be uint8 [H,W,3], got {dst_bgr.dtype} {tuple(dst_bgr.shape)}")
-
-    if src_rgb.ndim != 3:
-        raise ValueError(f"Expected src_rgb 3D, got {tuple(src_rgb.shape)}")
-
-    src_u8 = _to_u8(src_rgb)
-
-    # packed RGB
-    if src_u8.shape[-1] == 3:
-        if tuple(dst_bgr.shape[:2]) != tuple(src_u8.shape[:2]):
-            raise ValueError(f"dst_bgr shape {tuple(dst_bgr.shape)} != src {tuple(src_u8.shape)}")
-        dst_bgr[..., 0].copy_(src_u8[..., 2])  # B
-        dst_bgr[..., 1].copy_(src_u8[..., 1])  # G
-        dst_bgr[..., 2].copy_(src_u8[..., 0])  # R
+    if src_rgb.ndim == 3 and src_rgb.shape[-1] == 3:
+        # packed HWC
+        dst_bgr_u8[..., 0].copy_(src_rgb[..., 2])  # B
+        dst_bgr_u8[..., 1].copy_(src_rgb[..., 1])  # G
+        dst_bgr_u8[..., 2].copy_(src_rgb[..., 0])  # R
         return
 
-    # planar RGBP
-    if src_u8.shape[0] == 3:
-        H, W = int(src_u8.shape[1]), int(src_u8.shape[2])
-        if tuple(dst_bgr.shape[:2]) != (H, W):
-            raise ValueError(f"dst_bgr shape {tuple(dst_bgr.shape)} != src planar {(3,H,W)}")
-        dst_bgr[..., 0].copy_(src_u8[2])  # B
-        dst_bgr[..., 1].copy_(src_u8[1])  # G
-        dst_bgr[..., 2].copy_(src_u8[0])  # R
+    if src_rgb.ndim == 3 and src_rgb.shape[0] == 3:
+        # planar CHW (RGBP)
+        dst_bgr_u8[..., 0].copy_(src_rgb[2])  # B
+        dst_bgr_u8[..., 1].copy_(src_rgb[1])  # G
+        dst_bgr_u8[..., 2].copy_(src_rgb[0])  # R
         return
 
     raise ValueError(f"Expected src_rgb [H,W,3] or [3,H,W], got {tuple(src_rgb.shape)}")
@@ -265,7 +178,7 @@ def pack_bgr_to_bgra_inplace(dst_bgra: torch.Tensor, bgr_u8: torch.Tensor, alpha
 class Pipeline:
     """
     Stage-0 pipeline:
-      Decode (GPU) -> RGB/RGBP -> BGR -> Detect (optional) -> Restore (none/pseudo) -> Encode (GPU)
+      Decode (GPU) -> RGBP -> BGR -> Detect (optional) -> Restore (none/pseudo) -> Encode (GPU)
     """
 
     def __init__(self, cfg: Any):
@@ -278,41 +191,36 @@ class Pipeline:
         self.batch_size: int = int(_get(cfg, "batch_size", 8))
 
         self.max_frames: Optional[int] = _get(cfg, "max_frames", None)
-        if self.max_frames is None:
-            env_max = os.environ.get("GRESTORER_MAX_FRAMES")
-            if env_max:
-                try:
-                    self.max_frames = int(env_max)
-                except Exception:
-                    self.max_frames = None
 
-        # Restorer choice
-        self.restorer_name: str = str(_get(cfg, "restorer", "none")).lower()
+        self.debug: bool = bool(_get(cfg, "debug", False))
+
+        # Timing control: sync slows throughput but makes stage timings honest.
+        self.profile_sync: bool = bool(_get(cfg, "profile_sync", False))
+
+        # Restorer
+        self.restorer_name: str = str(_get(cfg, "restorer", "none"))
 
         # Detector config
-        det_model = _get(cfg, "det_model_path", None)
-        self.det_model_path: Optional[str] = str(det_model) if det_model else None
+        self.det_model_path: Optional[str] = _get(cfg, "det_model_path", None)
         self.det_conf: float = float(_get(cfg, "det_conf", 0.25))
         self.det_iou: float = float(_get(cfg, "det_iou", 0.45))
         self.det_imgsz: int = int(_get(cfg, "det_imgsz", 640))
-        self.det_fp16: bool = bool(_get(cfg, "det_fp16", True))
+        self.det_fp16: bool = bool(_get(cfg, "det_fp16", False))
 
-        # Visualization options (prefer visualization.*; fall back to top-level)
-        self.box_color = _cfg_get(cfg, "visualization", "box_color", default=_get(cfg, "box_color", "0,255,0"))
-        self.box_thickness = int(_cfg_get(cfg, "visualization", "box_thickness", default=_get(cfg, "box_thickness", 2)))
-        self.fill_color = _cfg_get(cfg, "visualization", "fill_color", default=_get(cfg, "fill_color", None))
-        self.fill_opacity = float(_cfg_get(cfg, "visualization", "fill_opacity", default=_get(cfg, "fill_opacity", 0.5)))
+        # Viz overrides
+        self.box_color: Any = _get(cfg, "box_color", None)
+        self.box_thickness: int = int(_get(cfg, "box_thickness", 2))
+        self.fill_color: Any = _get(cfg, "fill_color", None)
+        self.fill_opacity: float = float(_get(cfg, "fill_opacity", 0.5))
 
-        # Encode config
-        self.alpha: int = int(_get(cfg, "alpha", 255))
+        # Encode overrides
         self.codec: str = str(_get(cfg, "codec", "hevc"))
         self.preset: str = str(_get(cfg, "preset", "P7"))
         self.profile: str = str(_get(cfg, "profile", "main"))
         self.qp: int = int(_get(cfg, "qp", 23))
+        self.alpha: int = int(_get(cfg, "alpha", 255))
 
-        self.debug: bool = bool(_get(cfg, "debug", False))
-
-        # Torch device for buffers
+        # Device
         if torch.cuda.is_available():
             self.device = torch.device(f"cuda:{self.gpu_id}")
         elif hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -320,8 +228,9 @@ class Pipeline:
         else:
             self.device = torch.device("cpu")
 
-        if self.debug:
-            print(f"[Pipeline] device={self.device} batch_size={self.batch_size} restorer={self.restorer_name}")
+    def _maybe_sync(self) -> None:
+        if self.profile_sync:
+            _sync_device(self.device)
 
     def run(self) -> StageTimes:
         t = StageTimes()
@@ -329,7 +238,7 @@ class Pipeline:
 
         decoder: Optional[Decoder] = None
         encoder: Optional[Encoder] = None
-        detector: Optional[MosaicDetector] = None
+        detector: Any = None
         restorer: Any = None
 
         # Reused batch buffers (allocated after we know H/W)
@@ -338,13 +247,9 @@ class Pipeline:
 
         try:
             decoder = Decoder(self.input_path, batch_size=self.batch_size, gpu_id=self.gpu_id)
-
-            width = int(getattr(decoder.metadata, "width", 0))
-            height = int(getattr(decoder.metadata, "height", 0))
-            fps = float(getattr(decoder.metadata, "fps", 30.0))
-
-            if width <= 0 or height <= 0:
-                raise RuntimeError(f"Decoder metadata invalid: {width}x{height}")
+            width = decoder.metadata.width
+            height = decoder.metadata.height
+            fps = decoder.metadata.fps
 
             encoder = Encoder(
                 self.output_path,
@@ -358,23 +263,30 @@ class Pipeline:
                 gpu_id=self.gpu_id,
             )
 
-            # detector only if pseudo
-            if self.restorer_name == "pseudo":
+            # detector init ONLY if needed
+            requires_detection = (self.restorer_name != "none")
+            if requires_detection:
                 if not self.det_model_path:
-                    raise ValueError("Pseudo restorer requires --det-model / det_model_path")
+                    raise ValueError("restorer requires detection but --det-model was not provided")
+
+                try:
+                    from gRestorer.detector.core import Detector as MosaicDetector
+                except Exception as e:
+                    raise RuntimeError(
+                        "Detector initialization failed. Ensure ultralytics is installed and the model path is valid.")(
+                        e)
+
                 detector = MosaicDetector(
                     model_path=self.det_model_path,
-                    device=str(self.device),
                     imgsz=self.det_imgsz,
-                    conf_thres=self.det_conf,
-                    iou_thres=self.det_iou,
-                    classes=None,
+                    conf=self.det_conf,
+                    iou=self.det_iou,
                     fp16=self.det_fp16,
                 )
 
             # restorer init
             if self.restorer_name == "none":
-                restorer = NoneRestorer(width=width, height=height, gpu_id=self.gpu_id)
+                restorer = NoneRestorer(width=width, height=height)
             elif self.restorer_name == "pseudo":
                 restorer = PseudoRestorer(
                     width=width,
@@ -383,7 +295,6 @@ class Pipeline:
                     box_thickness=self.box_thickness,
                     fill_color=_parse_bgr(self.fill_color, allow_none=True),
                     fill_opacity=self.fill_opacity,
-                    gpu_id=self.gpu_id,
                 )
             else:
                 raise ValueError(f"Unknown restorer: {self.restorer_name}")
@@ -396,49 +307,44 @@ class Pipeline:
 
                 tb = _now()
                 frames = decoder.read_batch()
-                _sync_device(self.device)
+                self._maybe_sync()
                 t.t_decode_batch += (_now() - tb)
 
                 if not frames:
                     break
 
-                t.batches += 1
-
-                # dlpack -> torch
+                # wrap dlpack -> torch
                 tb = _now()
-                rgb_tensors: List[torch.Tensor] = []
-                for fr in frames:
-                    rgb_tensors.append(torch.from_dlpack(fr))
-                _sync_device(self.device)
+                rgb_list: List[torch.Tensor] = []
+                for f in frames:
+                    rgb_list.append(torch.from_dlpack(f))
+                self._maybe_sync()
                 t.t_wrap_dlpack += (_now() - tb)
 
-                # allocate buffers if needed
-                H, W = _frame_hw(rgb_tensors[0])
-                if not bgr_u8_bufs or bgr_u8_bufs[0].shape[0] != H or bgr_u8_bufs[0].shape[1] != W:
-                    bgr_u8_bufs = [torch.empty((H, W, 3), dtype=torch.uint8, device=self.device) for _ in range(self.batch_size)]
-                    bgra_u8_bufs = [torch.empty((H, W, 4), dtype=torch.uint8, device=self.device) for _ in range(self.batch_size)]
+                # allocate buffers for this batch size
+                if len(bgr_u8_bufs) != len(rgb_list):
+                    bgr_u8_bufs = [torch.empty((height, width, 3), dtype=torch.uint8, device=self.device) for _ in rgb_list]
+                    bgra_u8_bufs = [torch.empty((height, width, 4), dtype=torch.uint8, device=self.device) for _ in rgb_list]
 
-                # RGB/RGBP -> BGR u8
+                # rgb->bgr (u8)
                 tb = _now()
-                bgr_u8_list: List[torch.Tensor] = []
-                for i, rgb in enumerate(rgb_tensors):
-                    dst = bgr_u8_bufs[i]
-                    rgb_to_bgr_u8_inplace(dst, rgb)
-                    bgr_u8_list.append(dst)
-                _sync_device(self.device)
+                for i, rgb in enumerate(rgb_list):
+                    rgb_to_bgr_u8_inplace(bgr_u8_bufs[i], rgb)
+                self._maybe_sync()
                 t.t_to_bgr += (_now() - tb)
 
-                # BGR u8 -> float [0,1]
+                # to float for models/restorers
                 tb = _now()
-                bgr_f32_list = [bgr_u8_to_bgr_f32(x) for x in bgr_u8_list]
-                _sync_device(self.device)
+                bgr_f32_list = [bgr_u8_to_bgr_f32(x) for x in bgr_u8_bufs]
+                self._maybe_sync()
                 t.t_to_float += (_now() - tb)
 
                 # detect (optional)
-                detections: Optional[List[Detection]] = None
+                detections: Optional[Sequence[Any]] = None
                 if detector is not None:
                     tb = _now()
                     detections = detector.detect_batch(bgr_f32_list)
+                    self._maybe_sync()
                     t.t_detect += (_now() - tb)
 
                 # restore
@@ -448,48 +354,45 @@ class Pipeline:
                 else:
                     assert detections is not None
                     out_f32_list = restorer.process_batch(bgr_f32_list, detections)
-                _sync_device(self.device)
+                self._maybe_sync()
                 t.t_restore += (_now() - tb)
 
                 # pack for encoder (BGRA u8)
                 tb = _now()
-                out_bgra_list: List[torch.Tensor] = []
                 for i, out_f32 in enumerate(out_f32_list):
-                    bgr_u8 = _to_u8(out_f32)
-                    dst_bgra = bgra_u8_bufs[i]
-                    pack_bgr_to_bgra_inplace(dst_bgra, bgr_u8, alpha=self.alpha)
-                    out_bgra_list.append(dst_bgra)
-                _sync_device(self.device)
+                    out_u8 = (out_f32.clamp(0, 1) * 255.0).to(torch.uint8)
+                    pack_bgr_to_bgra_inplace(bgra_u8_bufs[i], out_u8, alpha=self.alpha)
+                self._maybe_sync()
                 t.t_pack += (_now() - tb)
 
                 # encode
                 tb = _now()
-                for frm in out_bgra_list:
-                    encoder.encode_frame(frm)
-                _sync_device(self.device)
+                encoder.encode_frames(bgra_u8_bufs)
+                self._maybe_sync()
                 t.t_encode += (_now() - tb)
 
                 frames_done += len(frames)
-                t.frames += len(frames)
+                t.frames = frames_done
 
-            # flush encoder
             tb = _now()
-            if encoder is not None:
-                encoder.flush()
-            _sync_device(self.device)
+            encoder.flush()
+            self._maybe_sync()
             t.t_flush += (_now() - tb)
 
         finally:
-            # Close encoder file handle
+# Always close encoder file handle (flush is done above, but try anyway on error)
             try:
                 if encoder is not None:
+                    try:
+                        encoder.flush()
+                    except Exception:
+                        pass
                     encoder.close()
             except Exception:
                 pass
 
-            # Decoder wrapper has no close(); rely on GC
-            decoder = None
+            t.t_total = (_now() - t0)
+            if self.debug:
+                print(t.pretty())
 
-        t.t_total = _now() - t0
-        print(t.summary())
         return t

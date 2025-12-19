@@ -1,9 +1,9 @@
 """
-gRestorer CLI module
+gRestorer CLI package.
 
-Command-line interface for gRestorer video processing pipeline.
+Keep this lightweight: do not import pipeline/decoder at import time.
 """
 
-from .main import main
+from __future__ import annotations
 
-__all__ = ['main']
+__all__ = []

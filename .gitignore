@@ -32,3 +32,6 @@ Thumbs.db
 *.hevc
 *.ts
 *.log
+
+#Custom
+/gitShuldNotSee/

@@ -1,0 +1,49 @@
+{
+  "decoder": {
+    "output_format": "RGB",
+    "gpu_id": 0
+  },
+  "encoder": {
+    "codec": "hevc",
+    "preset": "P7",
+    "profile": "main",
+    "qp": 23,
+    "format": "ARGB",
+    "gpu_id": 0
+  },
+  "detection": {
+    "batch_size": 8,
+    "conf_threshold": 0.5,
+    "iou_threshold": 0.45,
+    "imgsz": 640
+  },
+  "restoration": {
+    "max_clip_length": 30,
+    "clip_size": 256,
+    "border_ratio": 0.06,
+    "pad_mode": "reflect",
+    "fp16": true
+  },
+  "scene_tracking": {
+    "min_iou": 0.3,
+    "max_clip_frames": 120,
+    "min_clip_frames": 5
+  },
+  "visualization": {
+    "box_color": [0, 255, 0],
+    "box_thickness": 2,
+    "show_confidence": true,
+    "show_class": true,
+    "fill_color": [128,128,128],
+    "fill_opacity": 0.5
+  },
+  "batch_processing": {
+    "video_extensions": [".mp4", ".mkv", ".avi", ".mov"],
+    "skip_existing": false
+  },
+  "debug": {
+    "save_detection_frames": false,
+    "save_detection_json": false,
+    "output_dir": "debug_output"
+  }
+}

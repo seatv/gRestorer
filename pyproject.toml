@@ -14,6 +14,7 @@ keywords = ["video", "processing", "mosaic", "removal", "gpu", "nvdec", "nvenc"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
+  "License :: OSI Approved :: GNU Affero General Public License v3",
   "Topic :: Multimedia :: Video",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
@@ -21,12 +22,17 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 
+dependencies = [
+  "PyNvVideoCodec>=2.0.2",
+  "ultralytics>=8.3.228",
+  "opencv-python>=4.12.0.88",
+  "Pillow>=11.3.0",
+  "tqdm>=4.65.0",
+]
+
 [project.scripts]
 gRestorer = "gRestorer.cli.main:main"
-
-[project.optional-dependencies]
-# Keep Ultralytics optional so `--restorer none` works without dragging YOLO deps.
-yolo = ["ultralytics>=8.3.228"]
+mosaic = "gRestorer.cli.mosaic:main"
 
 [tool.setuptools.packages.find]
 include = ["gRestorer*"]

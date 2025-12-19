@@ -1,10 +1,9 @@
 # gRestorer Requirements
-# Python 3.11+ required
 
 # NVIDIA Video Codec SDK bindings (NVDEC/NVENC)
 PyNvVideoCodec>=2.0.2
 
-# Detection (optional, needed for --restorer pseudo)
+# Detection
 ultralytics>=8.3.228
 
 # Image processing / visualization

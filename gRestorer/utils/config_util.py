@@ -1,10 +1,10 @@
-# gRestorer/utils/config.py
+# gRestorer/utils/app_config.py
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 def _deep_update(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
@@ -24,6 +24,8 @@ class Config:
 
     - data: backing dictionary (may contain nested dicts, e.g. data["visualization"]["fill_color"])
     - get(): nested getter
+    - set(): nested setter
+    - merge_dict(): recursive merge of a dict into config
     - attribute access: cfg.input_path works for top-level keys
     """
     data: Dict[str, Any]
@@ -69,7 +71,6 @@ class Config:
     def merge_dict(self, extra: Dict[str, Any]) -> None:
         _deep_update(self.data, extra)
 
-    # Backwards-friendly: allow cfg.foo for top-level keys.
     def __getattr__(self, name: str) -> Any:
         if name in self.data:
             return self.data[name]
