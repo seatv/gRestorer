@@ -1,135 +1,471 @@
-# gRestorer/core/scene.py
-# Scene - Temporal grouping of mosaic detections
-#
-# A Scene represents a contiguous sequence of frames where mosaic detections
-# overlap spatially. Scenes are converted to Clips for restoration.
+# SPDX-FileCopyrightText: gRestorer Authors
+# SPDX-License-Identifier: AGPL-3.0
 
-from typing import List, Tuple, Optional
+"""Scene / Clip primitives matching LADA 0.9.x semantics (inference pipeline).
+
+This module is a focused, GPU-friendly port of the behavior described in the
+"LadaAnalysis - Restoration Analysis.md" spec and the corresponding LADA 0.9.x
+helpers.
+
+Coordinate convention:
+  - Boxes are tuples (t, l, b, r) == (y1, x1, y2, x2), inclusive.
+
+Key behaviors mirrored from LADA:
+  - Scene.belongs() uses a strict overlap check (NOT IoU).
+  - Multiple detections belonging to the same scene *in the same frame* are
+    UNIONed (box union; mask union if provided).
+  - Clip creation normalizes crops to a fixed clip_size via per-clip scaling
+    based on the maximum crop width/height across the scene.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+import math
+
 import torch
+import torch.nn.functional as F
+
+Box = Tuple[int, int, int, int]  # (t, l, b, r) inclusive
+Pad = Tuple[int, int, int, int]  # (pad_top, pad_bottom, pad_left, pad_right)
 
 
+# -------------------------
+# Box helpers (tlbr)
+# -------------------------
+
+
+def _clamp_int(v: float, lo: int, hi: int) -> int:
+    return int(max(lo, min(hi, int(v))))
+
+
+def xyxy_to_tlbr(xyxy: Tuple[float, float, float, float], h: int, w: int) -> Box:
+    """Convert (x1,y1,x2,y2) -> (t,l,b,r) with clamping."""
+    x1, y1, x2, y2 = xyxy
+    l = _clamp_int(x1, 0, w - 1)
+    t = _clamp_int(y1, 0, h - 1)
+    r = _clamp_int(x2, 0, w - 1)
+    b = _clamp_int(y2, 0, h - 1)
+    if r < l:
+        l, r = r, l
+    if b < t:
+        t, b = b, t
+    return (t, l, b, r)
+
+
+def tlbr_to_xyxy(b: Box) -> Tuple[int, int, int, int]:
+    t, l, b_, r = b
+    return (l, t, r, b_)
+
+
+def _union_box(a: Box, b: Box) -> Box:
+    at, al, ab, ar = a
+    bt, bl, bb, br = b
+    return (min(at, bt), min(al, bl), max(ab, bb), max(ar, br))
+
+
+def _box_size(b: Box) -> Tuple[int, int]:
+    t, l, b_, r = b
+    return (b_ - t + 1, r - l + 1)
+
+
+def _box_overlap(a: Box, b: Box) -> bool:
+    """LADA-style overlap predicate used for Scene.belongs()."""
+    at, al, ab, ar = a
+    bt, bl, bb, br = b
+    # Strict overlap (touching edges is NOT overlap).
+    if ar <= bl or br <= al:
+        return False
+    if ab <= bt or bb <= at:
+        return False
+    return True
+
+
+# -------------------------
+# LADA crop_to_box_v3 (ported)
+# -------------------------
+
+
+def crop_box_to_target_v3(
+    box: Box,
+    img_h: int,
+    img_w: int,
+    target_hw: Tuple[int, int],
+    *,
+    max_box_expansion_factor: float = 1.0,
+    border_size: float = 0.0,
+) -> Tuple[Box, float]:
+    """Exact port of LADA `crop_to_box_v3` box-expansion math.
+
+    This returns the *cropped box coordinates* (t,l,b,r) within the original
+    image and the computed scale_factor. It does NOT resize.
+
+    Notes:
+      - target_hw is (H,W) here, while LADA passes (W,H). For square clip_size
+        (the default), this doesn't matter. We still implement the math
+        faithfully by mapping appropriately.
+    """
+    target_h, target_w = int(target_hw[0]), int(target_hw[1])
+    # LADA treats target_size as (target_width, target_height)
+    target_width, target_height = target_w, target_h
+
+    t, l, b, r = box
+    width = int(r - l + 1)
+    height = int(b - t + 1)
+
+    # border expansion
+    if border_size and border_size > 0.0:
+        border_px = max(20, int(max(width, height) * float(border_size)))
+    else:
+        border_px = 0
+
+    t = max(0, t - border_px)
+    l = max(0, l - border_px)
+    b = min(img_h - 1, b + border_px)
+    r = min(img_w - 1, r + border_px)
+
+    width = int(r - l + 1)
+    height = int(b - t + 1)
+
+    down_scale_factor = min(target_width / width, target_height / height)
+    if down_scale_factor > 1.0:
+        down_scale_factor = 1.0
+
+    missing_width = int((target_width - (width * down_scale_factor)) / down_scale_factor)
+    missing_height = int((target_height - (height * down_scale_factor)) / down_scale_factor)
+
+    available_width_l = l
+    available_width_r = (img_w - 1) - r
+    available_height_t = t
+    available_height_b = (img_h - 1) - b
+
+    budget_width = int(max_box_expansion_factor * width)
+    budget_height = int(max_box_expansion_factor * height)
+
+    expand_width_lr = min(available_width_l, available_width_r, missing_width // 2, budget_width)
+    expand_width_l = min(available_width_l - expand_width_lr, missing_width - expand_width_lr * 2, budget_width - expand_width_lr)
+    expand_width_r = min(
+        available_width_r - expand_width_lr,
+        missing_width - expand_width_lr * 2 - expand_width_l,
+        budget_width - expand_width_lr - expand_width_l,
+    )
+
+    expand_height_tb = min(available_height_t, available_height_b, missing_height // 2, budget_height)
+    expand_height_t = min(available_height_t - expand_height_tb, missing_height - expand_height_tb * 2, budget_height - expand_height_tb)
+    expand_height_b = min(
+        available_height_b - expand_height_tb,
+        missing_height - expand_height_tb * 2 - expand_height_t,
+        budget_height - expand_height_tb - expand_height_t,
+    )
+
+    l2 = l - math.floor(expand_width_lr / 2) - expand_width_l
+    r2 = r + math.ceil(expand_width_lr / 2) + expand_width_r
+    t2 = t - math.floor(expand_height_tb / 2) - expand_height_t
+    b2 = b + math.ceil(expand_height_tb / 2) + expand_height_b
+
+    width2 = int(r2 - l2 + 1)
+    height2 = int(b2 - t2 + 1)
+
+    if down_scale_factor <= 1.0:
+        scale_factor = float(down_scale_factor)
+    else:
+        # kept for parity with LADA, though down_scale_factor is clamped to <=1
+        scale_factor = float(min(target_width / width2, target_height / height2))
+
+    return (int(t2), int(l2), int(b2), int(r2)), scale_factor
+
+
+# -------------------------
+# Padding / resize (torch, HWC)
+# -------------------------
+
+
+def _torch_pad_reflect(x: torch.Tensor, pad: Pad) -> torch.Tensor:
+    """Reflect pad that supports large pads by chunking."""
+    pt, pb, pl, pr = pad
+    if pt < 0 or pb < 0 or pl < 0 or pr < 0:
+        raise ValueError(f"Negative pad: {pad}")
+
+    # Work in NCHW for F.pad.
+    x_nchw = x.permute(2, 0, 1).unsqueeze(0)  # [1,C,H,W]
+
+    def pad_once(y: torch.Tensor, p: Tuple[int, int, int, int]) -> torch.Tensor:
+        return F.pad(y, p, mode="reflect")
+
+    # Height
+    while pt > 0 or pb > 0:
+        _, _, hh, _ = x_nchw.shape
+        max_step = max(1, hh - 1)
+        step_t = min(pt, max_step)
+        step_b = min(pb, max_step)
+        x_nchw = pad_once(x_nchw, (0, 0, step_t, step_b))
+        pt -= step_t
+        pb -= step_b
+
+    # Width
+    while pl > 0 or pr > 0:
+        _, _, _, ww = x_nchw.shape
+        max_step = max(1, ww - 1)
+        step_l = min(pl, max_step)
+        step_r = min(pr, max_step)
+        x_nchw = pad_once(x_nchw, (step_l, step_r, 0, 0))
+        pl -= step_l
+        pr -= step_r
+
+    return x_nchw.squeeze(0).permute(1, 2, 0).contiguous()
+
+
+def pad_image_hwc(
+    x: torch.Tensor,
+    target_hw: Tuple[int, int],
+    *,
+    pad_mode: str = "reflect",
+    pad_value: float = 0.0,
+) -> Tuple[torch.Tensor, Pad]:
+    """Pad HWC tensor to target (H,W). Returns padded tensor and pad tuple."""
+    th, tw = target_hw
+    h, w = int(x.shape[0]), int(x.shape[1])
+    if h > th or w > tw:
+        raise ValueError(f"Cannot pad from {(h, w)} to {(th, tw)}; resize first")
+
+    dh = th - h
+    dw = tw - w
+    pt = dh // 2
+    pb = dh - pt
+    pl = dw // 2
+    pr = dw - pl
+    pad = (pt, pb, pl, pr)
+
+    if dh == 0 and dw == 0:
+        return x, pad
+
+    if pad_mode == "reflect":
+        return _torch_pad_reflect(x, pad), pad
+
+    if pad_mode in ("zero", "constant"):
+        x_nchw = x.permute(2, 0, 1).unsqueeze(0)
+        y = F.pad(x_nchw, (pl, pr, pt, pb), mode="constant", value=float(pad_value))
+        y = y.squeeze(0).permute(1, 2, 0).contiguous()
+        return y, pad
+
+    raise ValueError(f"Unsupported pad_mode: {pad_mode}")
+
+
+def resize_hwc(x: torch.Tensor, out_hw: Tuple[int, int], *, mode: str) -> torch.Tensor:
+    """Resize HWC tensor via interpolate. mode: 'bilinear' or 'nearest'."""
+    oh, ow = out_hw
+    oh = max(1, int(oh))
+    ow = max(1, int(ow))
+    x_nchw = x.permute(2, 0, 1).unsqueeze(0)  # [1,C,H,W]
+    if mode == "bilinear":
+        y = F.interpolate(x_nchw, size=(oh, ow), mode="bilinear", align_corners=False)
+    elif mode == "nearest":
+        y = F.interpolate(x_nchw, size=(oh, ow), mode="nearest")
+    else:
+        raise ValueError(f"Unsupported resize mode: {mode}")
+    return y.squeeze(0).permute(1, 2, 0).contiguous()
+
+
+def resize_hw_mask(m: torch.Tensor, out_hw: Tuple[int, int]) -> torch.Tensor:
+    """Resize HW mask (uint8/float) with nearest."""
+    oh, ow = out_hw
+    oh = max(1, int(oh))
+    ow = max(1, int(ow))
+    if m.ndim != 2:
+        raise ValueError(f"Expected HW mask, got {tuple(m.shape)}")
+    m_f = m.to(torch.float32).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+    y = F.interpolate(m_f, size=(oh, ow), mode="nearest")
+    y = y.squeeze(0).squeeze(0)
+    if m.dtype == torch.uint8:
+        y = y.clamp(0, 255).to(torch.uint8)
+    return y.contiguous()
+
+
+def pad_mask_hw(m: torch.Tensor, target_hw: Tuple[int, int]) -> Tuple[torch.Tensor, Pad]:
+    """Pad HW mask to target with zeros."""
+    th, tw = target_hw
+    h, w = int(m.shape[0]), int(m.shape[1])
+    dh = th - h
+    dw = tw - w
+    pt = dh // 2
+    pb = dh - pt
+    pl = dw // 2
+    pr = dw - pl
+    pad = (pt, pb, pl, pr)
+    if dh == 0 and dw == 0:
+        return m, pad
+    m_nchw = m.unsqueeze(0).unsqueeze(0)
+    y = F.pad(m_nchw, (pl, pr, pt, pb), mode="constant", value=0)
+    y = y.squeeze(0).squeeze(0).contiguous()
+    return y, pad
+
+
+# -------------------------
+# Scene + Clip
+# -------------------------
+
+
+@dataclass
 class Scene:
-    """
-    Temporal grouping of frames with overlapping mosaic detections.
-    
-    Stores frames, masks, and boxes for a sequence of detections that belong
-    together spatially and temporally. Used to create Clips for restoration.
-    
-    Attributes:
-        frames: List of BGR frames [H, W, 3] float32 [0,1] on GPU
-        masks: List of masks [H, W] uint8 [0,255] on GPU
-        boxes: List of bounding boxes (x1, y1, x2, y2)
-        frame_start: Global frame number where scene starts
-        frame_end: Global frame number where scene ends (inclusive)
-    """
-    
-    def __init__(self):
-        """Initialize empty scene."""
-        self.frames: List[torch.Tensor] = []      # [H, W, 3] BGR float32 [0,1] GPU
-        self.masks: List[torch.Tensor] = []       # [H, W] uint8 [0,255] GPU
-        self.boxes: List[Tuple[int, int, int, int]] = []  # (x1, y1, x2, y2)
-        self.frame_start: Optional[int] = None
-        self.frame_end: Optional[int] = None
-    
+    """Tracks one mosaic region across consecutive frames."""
+
+    id: int
+    frame_start: int
+    frame_nums: List[int]
+    roi_boxes: List[Box]
+    crop_boxes: List[Box]
+    crops: List[torch.Tensor]
+    masks: List[Optional[torch.Tensor]]
+
+    def __init__(self, *, id: int, start_frame: int) -> None:
+        self.id = int(id)
+        self.frame_start = int(start_frame)
+        self.frame_nums = []
+        self.roi_boxes = []
+        self.crop_boxes = []
+        self.crops = []
+        self.masks = []
+
+    @property
+    def frame_end(self) -> int:
+        return self.frame_nums[-1] if self.frame_nums else (self.frame_start - 1)
+
     def __len__(self) -> int:
-        """Number of frames in scene."""
-        return len(self.frames)
-    
+        return len(self.frame_nums)
+
+    def belongs(self, roi_box: Box) -> bool:
+        if not self.roi_boxes:
+            return False
+        return _box_overlap(self.roi_boxes[-1], roi_box)
+
     def add_frame(
         self,
+        *,
         frame_num: int,
-        frame: torch.Tensor,  # [H, W, 3] BGR float32 [0,1] GPU
-        mask: torch.Tensor,   # [H, W] uint8 GPU
-        box: Tuple[int, int, int, int]  # (x1, y1, x2, y2)
+        roi_box: Box,
+        crop_box: Box,
+        crop_img: torch.Tensor,
+        crop_mask: Optional[torch.Tensor],
     ) -> None:
-        """
-        Add frame to scene.
-        
-        Args:
-            frame_num: Global frame number
-            frame: BGR frame [H, W, 3] float32 [0,1] on GPU
-            mask: Mask [H, W] uint8 on GPU
-            box: Bounding box (x1, y1, x2, y2)
-        """
-        if self.frame_start is None:
-            self.frame_start = frame_num
-            self.frame_end = frame_num
-        else:
-            assert frame_num == self.frame_end + 1, "Frames must be consecutive"
-            self.frame_end = frame_num
-        
-        self.frames.append(frame)
-        self.masks.append(mask)
-        self.boxes.append(box)
-    
-    def merge_mask_box(
+        if self.frame_nums and frame_num != self.frame_nums[-1] + 1:
+            raise AssertionError(
+                f"Scene frames must be consecutive: last={self.frame_nums[-1]} new={frame_num}"
+            )
+        self.frame_nums.append(int(frame_num))
+        self.roi_boxes.append(roi_box)
+        self.crop_boxes.append(crop_box)
+        self.crops.append(crop_img)
+        self.masks.append(crop_mask)
+
+    def merge_same_frame(
         self,
-        mask: torch.Tensor,
-        box: Tuple[int, int, int, int]
+        *,
+        roi_box: Box,
+        crop_box: Box,
+        crop_img: torch.Tensor,
+        crop_mask: Optional[torch.Tensor],
     ) -> None:
-        """
-        Merge additional detection into current frame (multiple detections/frame).
-        
-        Takes the union of boxes and max of masks for the current frame.
-        
-        Args:
-            mask: Additional mask to merge
-            box: Additional box to merge
-        """
-        assert len(self) > 0, "Cannot merge into empty scene"
-        
-        # Union of boxes
-        x1 = min(self.boxes[-1][0], box[0])
-        y1 = min(self.boxes[-1][1], box[1])
-        x2 = max(self.boxes[-1][2], box[2])
-        y2 = max(self.boxes[-1][3], box[3])
-        self.boxes[-1] = (x1, y1, x2, y2)
-        
-        # Union of masks (element-wise max)
-        self.masks[-1] = torch.maximum(self.masks[-1], mask)
-    
-    def belongs(self, box: Tuple[int, int, int, int]) -> bool:
-        """
-        Check if box belongs to this scene (overlaps with last box).
-        
-        Args:
-            box: Box to check (x1, y1, x2, y2)
-            
-        Returns:
-            True if box overlaps with scene's last box
-        """
-        if len(self.boxes) == 0:
-            return False
-        
-        last_box = self.boxes[-1]
-        return self._box_overlap(last_box, box)
-    
-    @staticmethod
-    def _box_overlap(
-        box1: Tuple[int, int, int, int],
-        box2: Tuple[int, int, int, int]
-    ) -> bool:
-        """
-        Check if two boxes overlap (IOU-based).
-        
-        Args:
-            box1: (x1, y1, x2, y2)
-            box2: (x1, y1, x2, y2)
-            
-        Returns:
-            True if boxes overlap
-        """
-        x1_1, y1_1, x2_1, y2_1 = box1
-        x1_2, y1_2, x2_2, y2_2 = box2
-        
-        # Check for no overlap
-        if x2_1 < x1_2 or x2_2 < x1_1:
-            return False
-        if y2_1 < y1_2 or y2_2 < y1_1:
-            return False
-        
-        return True
-    
-    def __repr__(self) -> str:
-        return (f"Scene(frames={len(self)}, "
-                f"start={self.frame_start}, end={self.frame_end})")
+        if not self.frame_nums:
+            raise AssertionError("Cannot merge into empty scene")
+        self.roi_boxes[-1] = _union_box(self.roi_boxes[-1], roi_box)
+        self.crop_boxes[-1] = crop_box
+        self.crops[-1] = crop_img
+        if crop_mask is None:
+            self.masks[-1] = None
+        else:
+            if self.masks[-1] is None:
+                self.masks[-1] = crop_mask
+            else:
+                self.masks[-1] = torch.maximum(self.masks[-1], crop_mask)
+
+    def max_crop_hw(self) -> Tuple[int, int]:
+        max_h = 0
+        max_w = 0
+        for b in self.crop_boxes:
+            h, w = _box_size(b)
+            max_h = max(max_h, h)
+            max_w = max(max_w, w)
+        return max_h, max_w
+
+
+@dataclass
+class Clip:
+    """A normalized clip built from a Scene."""
+
+    id: int
+    frame_start: int
+    frame_end: int
+    frames: List[torch.Tensor]
+    masks: List[torch.Tensor]
+    boxes: List[Box]
+    crop_shapes: List[Tuple[int, int]]
+    pad_after_resizes: List[Pad]
+    clip_size: int
+    pad_mode: str
+
+    def __init__(self, *, scene: Scene, clip_id: int, clip_size: int, pad_mode: str = "reflect") -> None:
+        if len(scene) == 0:
+            raise ValueError("Cannot build clip from empty scene")
+        self.id = int(clip_id)
+        self.frame_start = int(scene.frame_nums[0])
+        self.frame_end = int(scene.frame_nums[-1])
+        self.clip_size = int(clip_size)
+        self.pad_mode = str(pad_mode)
+        self.boxes = list(scene.crop_boxes)
+        self.crop_shapes = [(int(x.shape[0]), int(x.shape[1])) for x in scene.crops]
+
+        max_h, max_w = scene.max_crop_hw()
+        if max_h <= 0 or max_w <= 0:
+            raise ValueError("Invalid max crop size")
+
+        scale_h = self.clip_size / float(max_h)
+        scale_w = self.clip_size / float(max_w)
+
+        self.frames = []
+        self.masks = []
+        self.pad_after_resizes = []
+
+        for i, crop_u8 in enumerate(scene.crops):
+            ch, cw = self.crop_shapes[i]
+            out_h = max(1, int(ch * scale_h))
+            out_w = max(1, int(cw * scale_w))
+
+            img_f = crop_u8.to(torch.float32) / 255.0
+            img_rs = resize_hwc(img_f, (out_h, out_w), mode="bilinear")
+            img_pd, pad = pad_image_hwc(
+                img_rs, (self.clip_size, self.clip_size), pad_mode=self.pad_mode, pad_value=0.0
+            )
+
+            m = scene.masks[i]
+            if m is None:
+                m = torch.ones((ch, cw), dtype=torch.uint8, device=crop_u8.device) * 255
+            m_rs = resize_hw_mask(m, (out_h, out_w))
+            m_pd, _ = pad_mask_hw(m_rs, (self.clip_size, self.clip_size))
+
+            self.frames.append(img_pd)
+            self.masks.append(m_pd)
+            self.pad_after_resizes.append(pad)
+
+    def __len__(self) -> int:
+        return len(self.frames)
+
+    def pop(self) -> Tuple[torch.Tensor, torch.Tensor, Box, Tuple[int, int], Pad]:
+        frame = self.frames.pop(0)
+        mask = self.masks.pop(0)
+        box = self.boxes.pop(0)
+        crop_shape = self.crop_shapes.pop(0)
+        pad = self.pad_after_resizes.pop(0)
+        return frame, mask, box, crop_shape, pad
+
+
+__all__ = [
+    "Box",
+    "Pad",
+    "Scene",
+    "Clip",
+    "xyxy_to_tlbr",
+    "tlbr_to_xyxy",
+    "crop_box_to_target_v3",
+]

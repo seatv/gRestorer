@@ -31,7 +31,7 @@
   },
   "visualization": {
     "box_color": [0, 255, 0],
-    "box_thickness": 2,
+    "box_thickness": 5,
     "show_confidence": true,
     "show_class": true,
     "fill_color": [128,128,128],
