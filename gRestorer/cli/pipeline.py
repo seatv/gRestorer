@@ -1,498 +1,393 @@
 # gRestorer/cli/pipeline.py
 from __future__ import annotations
 
-import os
 import time
-from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from gRestorer.video import Decoder, Encoder
-from gRestorer.restorer import NoneRestorer, PseudoRestorer
-from gRestorer.detector.core import Detector, Detection
-
-from gRestorer.core.scene import Box, tlbr_to_xyxy, xyxy_to_tlbr
+from gRestorer.core.scene import Box, Clip, xyxy_to_tlbr
 from gRestorer.core.scene_tracker import SceneTracker, TrackerConfig
+from gRestorer.detector.core import Detection, MosaicDetector
+from gRestorer.restorer import NoneRestorer, PseudoRestorer
+from gRestorer.restorer.pseudo_clip_restorer import PseudoClipRestorer
+from gRestorer.utils.config_util import Config
+from gRestorer.video import Decoder, Encoder
 
-
-# ---------------------------
-# Timing / sync helpers
-# ---------------------------
-
-def _now() -> float:
-    return time.perf_counter()
-
-
-def _sync_device(device: torch.device) -> None:
-    """Synchronize GPU for honest timings (no-op on CPU)."""
-    try:
-        if device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.synchronize(device)
-        elif device.type == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
-            torch.xpu.synchronize(device)
-    except Exception:
-        pass
-
-
-@dataclass
-class StageTimes:
-    frames: int = 0
-    clips_created: int = 0
-
-    t_total: float = 0.0
-    t_decode_batch: float = 0.0
-    t_wrap_dlpack: float = 0.0
-    t_to_bgr: float = 0.0
-    t_to_float: float = 0.0
-    t_detect: float = 0.0
-    t_track: float = 0.0
-    t_clip_build: float = 0.0
-    t_restore: float = 0.0
-    t_pack: float = 0.0
-    t_encode: float = 0.0
-    t_flush: float = 0.0
-
-    def _ms_per_frame(self, seconds: float) -> float:
-        return (seconds * 1000.0 / self.frames) if self.frames else 0.0
-
-    def pretty(self) -> str:
-        return "\n".join(
-            [
-                f"[Timing] frames:       {self.frames}",
-                f"[Timing] clips:        {self.clips_created}",
-                f"[Timing] total:        {self.t_total:.3f}s ({self._ms_per_frame(self.t_total):.3f} ms/f)",
-                f"[Timing] decode_batch: {self.t_decode_batch:.3f}s ({self._ms_per_frame(self.t_decode_batch):.3f} ms/f)",
-                f"[Timing] wrap_dlpack:  {self.t_wrap_dlpack:.3f}s ({self._ms_per_frame(self.t_wrap_dlpack):.3f} ms/f)",
-                f"[Timing] rgb->bgr:     {self.t_to_bgr:.3f}s ({self._ms_per_frame(self.t_to_bgr):.3f} ms/f)",
-                f"[Timing] to_float:     {self.t_to_float:.3f}s ({self._ms_per_frame(self.t_to_float):.3f} ms/f)",
-                f"[Timing] detect:       {self.t_detect:.3f}s ({self._ms_per_frame(self.t_detect):.3f} ms/f)",
-                f"[Timing] track:        {self.t_track:.3f}s ({self._ms_per_frame(self.t_track):.3f} ms/f)",
-                f"[Timing] clip_build:   {self.t_clip_build:.3f}s ({self._ms_per_frame(self.t_clip_build):.3f} ms/f)",
-                f"[Timing] restore:      {self.t_restore:.3f}s ({self._ms_per_frame(self.t_restore):.3f} ms/f)",
-                f"[Timing] pack:         {self.t_pack:.3f}s ({self._ms_per_frame(self.t_pack):.3f} ms/f)",
-                f"[Timing] encode:       {self.t_encode:.3f}s ({self._ms_per_frame(self.t_encode):.3f} ms/f)",
-                f"[Timing] flush:        {self.t_flush:.3f}s ({self._ms_per_frame(self.t_flush):.3f} ms/f)",
-            ]
-        )
-
-
-# ---------------------------
-# Config helpers
-# ---------------------------
-
-def _get(cfg: Any, name: str, default: Any = None) -> Any:
-    """Best-effort config getter (dict / Config / attribute)."""
-    if cfg is None:
-        return default
-
-    if isinstance(cfg, dict):
-        v = cfg.get(name, default)
-        return default if v is None else v
-
-    data = getattr(cfg, "data", None)
-    if isinstance(data, dict) and name in data:
-        v = data.get(name, default)
-        return default if v is None else v
-
-    fn = getattr(cfg, "get", None)
-    if callable(fn):
-        try:
-            v = fn(name, default)
-            return default if v is None else v
-        except Exception:
-            pass
-
-    v = getattr(cfg, name, default)
-    return default if v is None else v
-
-
-def _get_first(cfg: Any, names: Sequence[str], default: Any = None) -> Any:
-    for n in names:
-        v = _get(cfg, n, None)
-        if v is not None:
-            return v
-    return default
-
-
-def _parse_bgr(s: Any, allow_none: bool = False) -> Optional[Tuple[int, int, int]]:
-    if s is None:
-        return None if allow_none else (0, 255, 0)
-    if isinstance(s, (list, tuple)) and len(s) == 3:
-        return (int(s[0]), int(s[1]), int(s[2]))
-    if isinstance(s, str):
-        parts = [p.strip() for p in s.split(",")]
-        if len(parts) == 3:
-            return (int(parts[0]), int(parts[1]), int(parts[2]))
-    return None if allow_none else (0, 255, 0)
-
-
-# ---------------------------
-# Color / packing helpers
-# ---------------------------
-
-def rgb_to_bgr_u8_inplace(dst_bgr_u8: torch.Tensor, src_rgb: torch.Tensor) -> None:
-    """dst: [H,W,3] uint8, src: [H,W,3] uint8 OR [3,H,W] uint8 (RGBP)."""
-    if dst_bgr_u8.ndim != 3 or dst_bgr_u8.shape[-1] != 3 or dst_bgr_u8.dtype != torch.uint8:
-        raise ValueError(f"Expected dst uint8 [H,W,3], got {dst_bgr_u8.dtype} {tuple(dst_bgr_u8.shape)}")
-
-    # Packed RGB
-    if src_rgb.ndim == 3 and src_rgb.shape[-1] == 3:
-        dst_bgr_u8[..., 0].copy_(src_rgb[..., 2])  # B
-        dst_bgr_u8[..., 1].copy_(src_rgb[..., 1])  # G
-        dst_bgr_u8[..., 2].copy_(src_rgb[..., 0])  # R
-        return
-
-    # Planar RGBP (3,H,W)
-    if src_rgb.ndim == 3 and src_rgb.shape[0] == 3:
-        dst_bgr_u8[..., 0].copy_(src_rgb[2])  # B
-        dst_bgr_u8[..., 1].copy_(src_rgb[1])  # G
-        dst_bgr_u8[..., 2].copy_(src_rgb[0])  # R
-        return
-
-    raise ValueError(f"Expected src [H,W,3] or [3,H,W], got {tuple(src_rgb.shape)}")
-
-
-def bgr_u8_to_bgr_f32(bgr_u8: torch.Tensor) -> torch.Tensor:
-    if bgr_u8.dtype != torch.uint8:
-        raise ValueError(f"Expected uint8, got {bgr_u8.dtype}")
-    return bgr_u8.to(torch.float32) / 255.0
-
-
-def pack_bgr_to_bgra_inplace(dst_bgra: torch.Tensor, bgr_u8: torch.Tensor, alpha: int = 255) -> None:
-    """dst_bgra: [H,W,4] uint8 (BGRA), bgr_u8: [H,W,3] uint8."""
-    if bgr_u8.ndim != 3 or bgr_u8.shape[-1] != 3 or bgr_u8.dtype != torch.uint8:
-        raise ValueError(f"Expected bgr_u8 uint8 [H,W,3], got {bgr_u8.dtype} {tuple(bgr_u8.shape)}")
-    if dst_bgra.ndim != 3 or dst_bgra.shape[-1] != 4 or dst_bgra.dtype != torch.uint8:
-        raise ValueError(f"Expected dst_bgra uint8 [H,W,4], got {dst_bgra.dtype} {tuple(dst_bgra.shape)}")
-
-    dst_bgra[..., 0].copy_(bgr_u8[..., 0])  # B
-    dst_bgra[..., 1].copy_(bgr_u8[..., 1])  # G
-    dst_bgra[..., 2].copy_(bgr_u8[..., 2])  # R
-    dst_bgra[..., 3].fill_(int(alpha))      # A
-
-
-# ---------------------------
-# Pipeline
-# ---------------------------
+from gRestorer.cli.pipeline_utils import (
+    _cfg_first,
+    _cfg_get,
+    _parse_color_bgr,
+    _sync_device,
+    pack_bgr_u8_to_bgra_u8_inplace,
+    rgb_to_bgr_u8_inplace,
+    wrap_surface_as_tensor,
+)
+from gRestorer.restorer.compositor import _composite_clip_into_store
 
 class Pipeline:
-    """Decode (GPU) -> Convert -> Detect -> Track/Clip -> Overlay/Restore -> Encode (GPU)."""
-
-    def __init__(self, cfg: Any):
+    def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
 
-        self.input_path: str = str(_get_first(cfg, ["input_path", "input"], ""))
-        self.output_path: str = str(_get_first(cfg, ["output_path", "output"], ""))
+        # Debug / instrumentation
+        self.debug = bool(_cfg_first(cfg, [("debug",), ("verbose",)], default=False))
 
-        self.gpu_id: int = int(_get(cfg, "gpu_id", 0))
-        self.batch_size: int = int(_get(cfg, "batch_size", 8))
-        self.max_frames: Optional[int] = _get(cfg, "max_frames", None)
-        self.debug: bool = bool(_get(cfg, "debug", False))
+        self.input_path = str(_cfg_get(cfg, "input_path"))
+        self.output_path = str(_cfg_get(cfg, "output_path"))
 
-        # Optional honest timings (sync after each stage)
-        self.profile_sync: bool = bool(_get(cfg, "profile_sync", False))
+        # Device / GPU id
+        self.gpu_id = int(_cfg_first(cfg, [("decoder", "gpu_id"), ("encoder", "gpu_id"), ("gpu_id",)], default=0))
+        self.device_str = str(_cfg_first(cfg, [("device",)], default=(f"cuda:{self.gpu_id}" if torch.cuda.is_available() else "cpu")))
+        self.device = torch.device(self.device_str)
 
-        # Debug cadence (optional): prints per-frame line every N frames.
-        # 0 disables per-frame spam. Per-batch summaries still print when --debug.
-        self.debug_every: int = int(_get(cfg, "debug_every", int(os.getenv("GRESTORER_DEBUG_EVERY", "0"))))
+        # Restorer selection
+        self.restorer_name = str(_cfg_first(cfg, [("restorer",)], default="none"))
 
-        # Restorer
-        self.restorer_name: str = str(_get(cfg, "restorer", "none"))
+        # Diagnostic knob: if True, synchronize device before handing frames to the encoder.
+        # This avoids rare torch->NVENC stream races (seen as occasional unshaded / stale frames).
+        default_sync = (self.restorer_name.endswith("_clip") and (self.device.type in ("cuda", "xpu")))
+        self.sync_before_encode = bool(
+            _cfg_first(cfg, [("encoder", "sync_before_encode"), ("sync_before_encode",)], default=default_sync)
+        )
 
-        # Detector config (accept a few common key variants)
-        self.det_model_path: Optional[str] = _get_first(cfg, ["det_model_path", "det_model", "det_model_file"], None)
-        self.det_conf: float = float(_get(cfg, "det_conf", _get(cfg, "conf_thres", 0.25)))
-        self.det_iou: float = float(_get(cfg, "det_iou", _get(cfg, "iou_thres", 0.45)))
-        self.det_imgsz: int = int(_get(cfg, "det_imgsz", 640))
-        self.det_fp16: bool = bool(_get(cfg, "det_fp16", False))
-        self.det_classes: Optional[Sequence[int]] = _get(cfg, "det_classes", None)
+        # Decode / encode settings
+        self.batch_size = int(_cfg_first(cfg, [("detection", "batch_size"), ("batch_size",)], default=8))
+        self.max_frames = _cfg_first(cfg, [("max_frames",)], default=None)
+        self.max_frames = int(self.max_frames) if self.max_frames is not None else None
 
-        # Scene/Clip tracker (LADA-ish)
-        self.max_clip_length: int = int(_get(cfg, "max_clip_length", 30))
-        self.clip_size: int = int(_get(cfg, "clip_size", 256))
-        self.pad_mode: str = str(_get(cfg, "pad_mode", "reflect"))
-        self.border_size: float = float(_get(cfg, "border_size", 0.06))
-        self.max_box_expansion_factor: float = float(_get(cfg, "max_box_expansion_factor", 1.0))
+        # Detector settings
+        self.det_model = _cfg_first(cfg, [("det_model_path",), ("det_model",), ("detection", "model_path")], default=None)
+        self.det_imgsz = int(_cfg_first(cfg, [("detection", "imgsz"), ("det_imgsz",)], default=640))
+        self.det_conf = float(_cfg_first(cfg, [("detection", "conf_threshold"), ("det_conf",)], default=0.25))
+        self.det_iou = float(_cfg_first(cfg, [("detection", "iou_threshold"), ("det_iou",)], default=0.45))
+        self.det_fp16 = bool(_cfg_first(cfg, [("restoration", "fp16"), ("det_fp16",)], default=True))
 
-        # Viz overrides
-        self.box_color: Any = _get(cfg, "box_color", None)
-        self.box_thickness: int = int(_get(cfg, "box_thickness", 2))
-        self.fill_color: Any = _get(cfg, "fill_color", None)
-        self.fill_opacity: float = float(_get(cfg, "fill_opacity", 0.5))
+        # Clip/tracking settings
+        self.clip_size = int(_cfg_first(cfg, [("restoration", "clip_size"), ("clip_size",)], default=256))
+        self.max_clip_length = int(_cfg_first(cfg, [("restoration", "max_clip_length"), ("max_clip_length",)], default=30))
+        self.border_size = float(_cfg_first(cfg, [("restoration", "border_ratio"), ("border_size",)], default=0.06))
+        self.pad_mode = str(_cfg_first(cfg, [("restoration", "pad_mode"), ("pad_mode",)], default="reflect"))
+        self.roi_dilate = int(_cfg_first(cfg, [("roi_dilate",)], default=0))
 
-        # Encode overrides
-        self.codec: str = str(_get(cfg, "codec", "hevc"))
-        self.preset: str = str(_get(cfg, "preset", "P7"))
-        self.profile: str = str(_get(cfg, "profile", "main"))
-        self.qp: int = int(_get(cfg, "qp", 23))
-        self.alpha: int = int(_get(cfg, "alpha", 255))
+        # Visualization settings (mainly for pseudo modes)
+        self.box_color = _parse_color_bgr(_cfg_first(cfg, [("visualization", "box_color"), ("box_color",)], default=[0, 255, 0]))
+        self.box_thickness = int(_cfg_first(cfg, [("visualization", "box_thickness"), ("box_thickness",)], default=2))
+        self.fill_color = _parse_color_bgr(_cfg_first(cfg, [("visualization", "fill_color"), ("fill_color",)], default=None))
+        self.fill_opacity = float(_cfg_first(cfg, [("visualization", "fill_opacity"), ("fill_opacity",)], default=0.5))
 
-        # Device
-        if torch.cuda.is_available():
-            self.device = torch.device(f"cuda:{self.gpu_id}")
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            self.device = torch.device(f"xpu:{self.gpu_id}")
-        else:
-            self.device = torch.device("cpu")
+    def _build_detector(self) -> MosaicDetector:
+        if not self.det_model:
+            raise ValueError("--det-model is required when using a restorer that needs detection")
 
-    def _maybe_sync(self) -> None:
-        if self.profile_sync:
-            _sync_device(self.device)
+        return MosaicDetector(
+            model_path=str(self.det_model),
+            device=self.device_str,
+            imgsz=self.det_imgsz,
+            conf_thres=self.det_conf,
+            iou_thres=self.det_iou,
+            fp16=self.det_fp16,
+        )
 
-    def run(self) -> StageTimes:
-        t = StageTimes()
-        t0 = _now()
+    def _build_tracker(self) -> SceneTracker:
+        cfg = TrackerConfig(
+            clip_size=self.clip_size,
+            max_clip_length=self.max_clip_length,
+            pad_mode=self.pad_mode,
+            border_size=self.border_size,
+            max_box_expansion_factor=1.0,
+            use_seg_masks=bool(_cfg_first(self.cfg, [("use_seg_masks",), ("tracker", "use_seg_masks")], default=True)),
+            debug=bool(_cfg_first(self.cfg, [("debug",), ("tracker_debug",)], default=False)),
+        )
+        return SceneTracker(cfg)
 
-        decoder: Optional[Decoder] = None
-        encoder: Optional[Encoder] = None
-        detector: Optional[Detector] = None
-        restorer: Any = None
-        tracker: Optional[SceneTracker] = None
+    def run(self) -> None:
+        # Decoder
+        decoder = Decoder(self.input_path, batch_size=self.batch_size, gpu_id=self.gpu_id)
+        width = int(decoder.metadata.width)
+        height = int(decoder.metadata.height)
+        fps = float(decoder.metadata.fps) if decoder.metadata.fps else 30.0
 
-        # Reused batch buffers (allocated after we know H/W)
-        bgr_u8_bufs: List[torch.Tensor] = []
-        bgra_u8_bufs: List[torch.Tensor] = []
+        # Encoder
+        enc_codec = str(_cfg_first(self.cfg, [("encoder", "codec"), ("codec",)], default="hevc"))
+        enc_preset = str(_cfg_first(self.cfg, [("encoder", "preset"), ("preset",)], default="P7"))
+        enc_profile = str(_cfg_first(self.cfg, [("encoder", "profile"), ("profile",)], default="main"))
+        enc_qp = int(_cfg_first(self.cfg, [("encoder", "qp"), ("qp",)], default=23))
+        # Encoder always expects BGRA surfaces (ARGB in PyNvVideoCodec terms) in this project.
+        # The Encoder implementation enforces that internally.
+        enc_container = _cfg_first(self.cfg, [("encoder", "container"), ("container",)], default=None)
 
-        try:
-            decoder = Decoder(self.input_path, batch_size=self.batch_size, gpu_id=self.gpu_id)
-            width = decoder.metadata.width
-            height = decoder.metadata.height
-            fps = decoder.metadata.fps
+        encoder = Encoder(
+            self.output_path,
+            width=width,
+            height=height,
+            fps=fps,
+            codec=enc_codec,
+            preset=enc_preset,
+            profile=enc_profile,
+            qp=enc_qp,
+            gpu_id=self.gpu_id,
+            container=enc_container,
+        )
 
-            encoder = Encoder(
-                self.output_path,
+        restorer_name = self.restorer_name.lower().strip()
+
+        if restorer_name == "none":
+            restorer = NoneRestorer(device=self.device)
+            detector = None
+            tracker = None
+            clip_restorer = None
+            clip_mode = False
+
+        elif restorer_name == "pseudo":
+            restorer = PseudoRestorer(
                 width=width,
                 height=height,
-                fps=fps,
-                codec=self.codec,
-                preset=self.preset,
-                profile=self.profile,
-                qp=self.qp,
+                box_color=self.box_color or (0, 255, 0),
+                box_thickness=self.box_thickness,
+                fill_color=self.fill_color,
+                fill_opacity=self.fill_opacity,
                 gpu_id=self.gpu_id,
             )
+            detector = self._build_detector()
+            tracker = None
+            clip_restorer = None
+            clip_mode = False
 
-            # Restorer init
-            if self.restorer_name == "none":
-                restorer = NoneRestorer(width=width, height=height)
-            elif self.restorer_name == "pseudo":
-                restorer = PseudoRestorer(
-                    width=width,
-                    height=height,
-                    box_color=_parse_bgr(self.box_color) or (0, 255, 0),
-                    box_thickness=self.box_thickness,
-                    fill_color=_parse_bgr(self.fill_color, allow_none=True),
-                    fill_opacity=float(self.fill_opacity),
-                )
-            else:
-                raise ValueError(f"Unknown restorer: {self.restorer_name}")
+        elif restorer_name == "pseudo_clip":
+            restorer = None
+            detector = self._build_detector()
+            tracker = self._build_tracker()
+            clip_restorer = PseudoClipRestorer(
+                device=self.device,
+                fill_color_bgr=self.fill_color or (255, 0, 255),
+                fill_opacity=self.fill_opacity,
+            )
+            clip_mode = True
 
-            requires_detection = bool(getattr(restorer, "requires_detection", False)) or (self.restorer_name != "none")
+        else:
+            raise ValueError(f"Unknown restorer: {self.restorer_name}")
 
-            # Detector + tracker init only if needed
-            if requires_detection:
-                if not self.det_model_path:
-                    raise ValueError("This restorer requires detection but det_model_path/det_model was not provided")
+        print(f"[Pipeline] input='{self.input_path}' -> output='{self.output_path}'")
+        print(f"[Pipeline] device={self.device_str} restorer={restorer_name} batch={self.batch_size}")
 
-                detector = Detector(
-                    model_path=self.det_model_path,
-                    device=str(self.device),
-                    imgsz=self.det_imgsz,
-                    conf_thres=self.det_conf,
-                    iou_thres=self.det_iou,
-                    classes=self.det_classes,
-                    fp16=self.det_fp16,
-                )
+        # --- Streaming loop ---
+        frame_num_base = 0
+        frames_done = 0
 
-                tracker = SceneTracker(
-                    TrackerConfig(
-                        clip_size=self.clip_size,
-                        max_clip_length=self.max_clip_length,
-                        pad_mode=self.pad_mode,
-                        border_size=self.border_size,
-                        max_box_expansion_factor=self.max_box_expansion_factor,
-                    )
-                )
+        # For clip-mode, we buffer full frames (uint8 BGR) until they are safe to emit.
+        store_bgr_u8: Dict[int, torch.Tensor] = {}
+        next_out = 0
 
-            frames_done = 0
+        t_decode_total = 0.0
+        t_det_total = 0.0
+        t_track_total = 0.0
+        t_restore_total = 0.0
+        t_encode_total = 0.0
 
-            while True:
-                if self.max_frames is not None and frames_done >= int(self.max_frames):
-                    break
+        def drain_ready(safe_before: int) -> None:
+            nonlocal next_out, t_encode_total
+            if safe_before <= next_out:
+                return
 
-                # Per-batch debug counters
-                batch_total_boxes = 0
-                batch_frames_with_boxes = 0
-                batch_total_overlay = 0
-                batch_new_clips = 0
+            while next_out < safe_before:
+                # Batch consecutive frames if available.
+                batch_nums: List[int] = []
+                for _ in range(self.batch_size):
+                    # Never drain/encode frame >= safe_before (safe_before is exclusive).
+                    if next_out >= safe_before:
+                        break
+                    if next_out in store_bgr_u8:
+                        batch_nums.append(next_out)
+                        next_out += 1
+                    else:
+                        break
 
-                tb = _now()
-                frames = decoder.read_batch()
-                self._maybe_sync()
-                t.t_decode_batch += (_now() - tb)
+                if not batch_nums:
+                    # We don't have the next frame yet.
+                    return
 
-                if not frames:
-                    break
+                t0 = time.perf_counter()
+                bgra_list: List[torch.Tensor] = []
+                for n in batch_nums:
+                    bgr = store_bgr_u8.pop(n)
+                    bgra = torch.empty((height, width, 4), device=bgr.device, dtype=torch.uint8)
+                    pack_bgr_u8_to_bgra_u8_inplace(bgra, bgr)
+                    bgra_list.append(bgra)
+                # Optional diagnostic sync: helps detect async races between torch ops and NVENC.
+                if self.sync_before_encode:
+                    _sync_device(self.device)
 
-                # Wrap dlpack -> torch
-                tb = _now()
-                rgb_list: List[torch.Tensor] = [torch.from_dlpack(f) for f in frames]
-                self._maybe_sync()
-                t.t_wrap_dlpack += (_now() - tb)
+                encoder.encode_frames(bgra_list)
+                t1 = time.perf_counter()
+                t_encode_total += (t1 - t0)
 
-                # Allocate buffers for this batch size
-                if len(bgr_u8_bufs) != len(rgb_list):
-                    bgr_u8_bufs = [torch.empty((height, width, 3), dtype=torch.uint8, device=self.device) for _ in rgb_list]
-                    bgra_u8_bufs = [torch.empty((height, width, 4), dtype=torch.uint8, device=self.device) for _ in rgb_list]
+        while True:
+            if self.max_frames is not None and frames_done >= self.max_frames:
+                break
 
-                # RGB -> BGR (u8)
-                tb = _now()
-                for i, rgb in enumerate(rgb_list):
-                    rgb_to_bgr_u8_inplace(bgr_u8_bufs[i], rgb)
-                self._maybe_sync()
-                t.t_to_bgr += (_now() - tb)
+            t0 = time.perf_counter()
+            frames = decoder.read_batch()
+            t1 = time.perf_counter()
+            t_decode_total += (t1 - t0)
 
-                # To float for detector/restorer
-                tb = _now()
-                bgr_f32_list = [bgr_u8_to_bgr_f32(x) for x in bgr_u8_bufs]
-                self._maybe_sync()
-                t.t_to_float += (_now() - tb)
+            if not frames:
+                break
 
-                # Detect (optional)
-                detections: Optional[List[Detection]] = None
-                if detector is not None:
-                    tb = _now()
-                    detections = detector.detect_batch(bgr_f32_list)
-                    self._maybe_sync()
-                    t.t_detect += (_now() - tb)
+            # Convert decoder output to BGR uint8 HWC.
+            rgb_list = [wrap_surface_as_tensor(f) for f in frames]
+            bgr_list: List[torch.Tensor] = []
+            for rgb in rgb_list:
+                bgr = torch.empty((height, width, 3), device=rgb.device, dtype=torch.uint8)
+                rgb_to_bgr_u8_inplace(bgr, rgb)
+                bgr_list.append(bgr)
 
-                # Track scenes + build clips + overlay detections
-                dets_for_restorer: Optional[Sequence[Detection]] = detections
+            # Detection
+            detections: Optional[List[Detection]] = None
+            if detector is not None:
+                td0 = time.perf_counter()
+                detections = detector.detect_batch(bgr_list)
+                td1 = time.perf_counter()
+                t_det_total += (td1 - td0)
 
-                if tracker is not None:
-                    assert detections is not None
-                    overlay_dets: List[Detection] = []
-                    frame_base = frames_done
+            if not clip_mode:
+                # Frame-mode output (none/pseudo): process and encode immediately.
+                out_bgr: List[torch.Tensor] = bgr_list
+                if restorer is not None:
+                    tr0 = time.perf_counter()
+                    out_bgr = restorer.process_batch(bgr_list, detections_per_frame=detections)
+                    tr1 = time.perf_counter()
+                    t_restore_total += (tr1 - tr0)
 
-                    for i, det in enumerate(detections):
-                        frame_num = frame_base + i
+                te0 = time.perf_counter()
+                bgra_list: List[torch.Tensor] = []
+                for bgr in out_bgr:
+                    bgra = torch.empty((height, width, 4), device=bgr.device, dtype=torch.uint8)
+                    pack_bgr_u8_to_bgra_u8_inplace(bgra, bgr)
+                    bgra_list.append(bgra)
+                if self.sync_before_encode:
+                    _sync_device(self.device)
+                encoder.encode_frames(bgra_list)
+                te1 = time.perf_counter()
+                t_encode_total += (te1 - te0)
 
-                        # Convert detector boxes (xyxy float) -> tlbr int boxes.
-                        roi_boxes: List[Box] = []
-                        n_det = 0
-                        if det.boxes is not None and det.boxes.numel() > 0:
-                            n_det = int(det.boxes.shape[0])
-                            if self.debug:
-                                batch_total_boxes += n_det
-                                batch_frames_with_boxes += 1
-                            # Boxes are in original coords already.
-                            for (x1, y1, x2, y2) in det.boxes.tolist():
-                                roi_boxes.append(
-                                    xyxy_to_tlbr(
-                                        (float(x1), float(y1), float(x2), float(y2)),
-                                        height,
-                                        width,
-                                    )
-                                )
-
-                        tb2 = _now()
-                        overlay_roi_boxes = tracker.ingest_frame(frame_num, bgr_u8_bufs[i], roi_boxes)
-                        self._maybe_sync()
-                        t.t_track += (_now() - tb2)
-
-                        tb3 = _now()
-                        new_clips = tracker.flush_completed(frame_num, eof=False)
-                        self._maybe_sync()
-                        t.t_clip_build += (_now() - tb3)
-                        t.clips_created += len(new_clips)
-
-                        if self.debug:
-                            batch_new_clips += len(new_clips)
-
-                        n_overlay = len(overlay_roi_boxes) if overlay_roi_boxes else 0
-                        if self.debug:
-                            batch_total_overlay += n_overlay
-
-                        # Overlay uses the *tracked* ROI boxes (unioned per scene), converted back to xyxy.
-                        if overlay_roi_boxes:
-                            xyxy_boxes = [tlbr_to_xyxy(b) for b in overlay_roi_boxes]
-                            boxes_t = torch.as_tensor(xyxy_boxes, device=self.device, dtype=torch.float32)
-                        else:
-                            boxes_t = torch.empty((0, 4), device=self.device, dtype=torch.float32)
-
-                        overlay_dets.append(Detection(boxes=boxes_t, scores=None, classes=None, masks=None))
-
-                        # Optional per-frame debug line
-                        if self.debug and self.debug_every > 0 and (frame_num % self.debug_every == 0):
-                            print(
-                                f"[Dbg] f={frame_num:6d} det={n_det:2d} overlay={n_overlay:2d} "
-                                f"active_scenes={tracker.active_scenes:2d} new_clips={len(new_clips):2d}"
-                            )
-
-                    dets_for_restorer = overlay_dets
-
-                # Restore / overlay
-                tb = _now()
-                out_f32_list = restorer.process_batch(bgr_f32_list, dets_for_restorer)
-                self._maybe_sync()
-                t.t_restore += (_now() - tb)
-
-                # Pack for encoder (BGRA u8)
-                tb = _now()
-                for i, out_f32 in enumerate(out_f32_list):
-                    out_u8 = (out_f32.clamp(0, 1) * 255.0).to(torch.uint8)
-                    pack_bgr_to_bgra_inplace(bgra_u8_bufs[i], out_u8, alpha=self.alpha)
-                self._maybe_sync()
-                t.t_pack += (_now() - tb)
-
-                # Encode
-                tb = _now()
-                encoder.encode_frames(bgra_u8_bufs)
-                self._maybe_sync()
-                t.t_encode += (_now() - tb)
-
-                # Bookkeeping
                 frames_done += len(frames)
-                t.frames = frames_done
+                frame_num_base += len(frames)
+                continue
 
-                # Per-batch debug summary (low spam)
-                if self.debug and tracker is not None:
-                    f0 = frame_base
-                    f1 = frame_base + len(frames) - 1
+            # --- Clip-mode: buffer frames + track + restore completed clips ---
+            assert detections is not None
+            assert tracker is not None
+            assert clip_restorer is not None
+
+            # Store frames
+            for i, bgr in enumerate(bgr_list):
+                fn = frame_num_base + i
+                store_bgr_u8[fn] = bgr
+
+            # Track per frame, restore completed clips, composite into buffer.
+            for i, det in enumerate(detections):
+                fn = frame_num_base + i
+
+                roi_boxes: List[Box] = []
+                roi_masks: Optional[List[torch.Tensor]] = None
+
+                if det.boxes is not None and det.boxes.numel() > 0:
+                    # det.boxes: [N,4] xyxy float
+                    n = int(det.boxes.shape[0])
+                    if det.masks is not None and det.masks.shape[0] == n:
+                        roi_masks = []
+
+                    for j in range(n):
+                        box_xyxy = det.boxes[j]
+                        x1, y1, x2, y2 = [float(v.item()) for v in box_xyxy]
+                        # xyxy_to_tlbr signature is (xyxy, h, w)
+                        roi_boxes.append(xyxy_to_tlbr((x1, y1, x2, y2), height, width))
+
+                        if roi_masks is not None:
+                            # det.masks is CPU uint8 [N,H,W] in original resolution.
+                            roi_masks.append(det.masks[j])
+
+                tt0 = time.perf_counter()
+                step = tracker.step_frame(fn, store_bgr_u8[fn], roi_boxes, roi_masks)
+                tt1 = time.perf_counter()
+                t_track_total += (tt1 - tt0)
+
+                if self.debug:
+                    det_n = len(roi_boxes)
+                    ov_n = len(step.overlay_boxes) if step.overlay_boxes is not None else 0
                     print(
-                        f"[Dbg] batch {f0}-{f1} det_frames={batch_frames_with_boxes}/{len(frames)} "
-                        f"boxes={batch_total_boxes} overlay_sum={batch_total_overlay} "
-                        f"new_clips={batch_new_clips} active_scenes={tracker.active_scenes}"
+                        f"[Dbg] f={fn:6d} det={det_n:2d} overlay={ov_n:2d} "
+                        f"active_scenes={step.active_scenes:2d} new_clips={len(step.new_clips):2d}"
                     )
 
-            # EOF flush for tracker (like LADA calls with next frame_num)
-            if tracker is not None:
-                tb = _now()
-                new_clips = tracker.flush_eof(frames_done)
-                self._maybe_sync()
-                t.t_clip_build += (_now() - tb)
-                t.clips_created += len(new_clips)
-                if self.debug:
-                    print(f"[Dbg] EOF flush: new_clips={len(new_clips)} active_scenes={tracker.active_scenes}")
+                if step.new_clips:
+                    # Ensure stable ordering for deterministic composites.
+                    clips_sorted = sorted(step.new_clips, key=lambda c: (c.frame_start, c.id))
+                    for clip in clips_sorted:
+                        tr0 = time.perf_counter()
+                        restored = clip_restorer.restore_clip(clip)
+                        _composite_clip_into_store(
+                            clip=clip,
+                            restored_frames=restored,
+                            store_bgr_u8=store_bgr_u8,
+                            feather_radius=3,
+                        )
+                        tr1 = time.perf_counter()
+                        t_restore_total += (tr1 - tr0)
 
-            tb = _now()
-            encoder.flush()
-            self._maybe_sync()
-            t.t_flush += (_now() - tb)
+            frames_done += len(frames)
+            frame_num_base += len(frames)
 
-        finally:
+            # Drain only frames that are definitely no longer part of any active (unfinished) scene.
+            safe_before = tracker.min_active_start()
+            # Extra safety: derive from actual stored frame numbers in active scenes (guards against bugs)
             try:
-                if encoder is not None:
-                    encoder.close()
+                active = getattr(tracker, '_scenes', None)
+                if active:
+                    safe_by_frame0 = min(int(s.frame_nums[0]) for s in active if getattr(s, 'frame_nums', None))
+                    safe_before = safe_by_frame0 if safe_before is None else min(int(safe_before), safe_by_frame0)
             except Exception:
-                pass
-            try:
-                if decoder is not None:
-                    decoder.close()
-            except Exception:
-                pass
+                safe_before = None
 
-        t.t_total = _now() - t0
-        if self.debug:
-            print(t.pretty())
-        return t
+            if safe_before is None:
+                # Conservative: if we can't prove frames are safe, don't drain in clip-mode.
+                safe_before = next_out
+            else:
+                safe_before = int(safe_before)
+
+            if self.debug:
+                print(f'[Dbg] drain safe_before={safe_before} next_out={next_out} store={len(store_bgr_u8)}')
+            drain_ready(safe_before)
+
+        # EOF: flush tracker/remaining clips and emit remaining frames.
+        if clip_mode:
+            assert tracker is not None
+            assert clip_restorer is not None
+
+            remaining_clips = tracker.flush_eof(frames_done)
+            remaining_clips = sorted(remaining_clips, key=lambda c: (c.frame_start, c.id))
+            for clip in remaining_clips:
+                tr0 = time.perf_counter()
+                restored = clip_restorer.restore_clip(clip)
+                _composite_clip_into_store(
+                    clip=clip,
+                    restored_frames=restored,
+                    store_bgr_u8=store_bgr_u8,
+                    feather_radius=3,
+                )
+                tr1 = time.perf_counter()
+                t_restore_total += (tr1 - tr0)
+
+            drain_ready(frame_num_base)
+
+        # IMPORTANT: Encoder.close() does not flush tail packets; flush explicitly.
+        encoder.flush()
+        encoder.close()
+        decoder.close()
+
+        print(
+            f"[Pipeline] done frames={frames_done} "
+            f"t_decode={t_decode_total:.2f}s t_det={t_det_total:.2f}s "
+            f"t_track={t_track_total:.2f}s t_restore={t_restore_total:.2f}s "
+            f"t_encode={t_encode_total:.2f}s"
+        )

@@ -422,3 +422,45 @@ class MosaicDetectionModel:
             )
 
         return outputs
+
+# ---------------------------------------------------------------------------
+# Compatibility wrapper (pipeline expects this symbol)
+# ---------------------------------------------------------------------------
+
+class YoloMosaicDetector:
+    """
+    Backwards/compat wrapper so older/newer pipeline variants can do:
+
+        from gRestorer.detector.yolo import YoloMosaicDetector
+
+    Internally we delegate to gRestorer.detector.core.Detector.
+    Local import avoids circular-import issues (core.py imports yolo.py).
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        device: str = "cuda:0",
+        debug: bool = False,
+        imgsz: int = 640,
+        conf_thres: float = 0.25,
+        iou_thres: float = 0.45,
+        classes=None,
+        fp16: bool = True,
+        **kwargs,
+    ) -> None:
+        from .core import Detector  # local import to avoid import cycles
+
+        self._impl = Detector(
+            model_path=model_path,
+            device=device,
+            imgsz=imgsz,
+            conf_thres=conf_thres,
+            iou_thres=iou_thres,
+            classes=classes,
+            fp16=fp16,
+        )
+        self.debug = debug  # kept only for signature compatibility
+
+    def detect_batch(self, frames):
+        return self._impl.detect_batch(frames)

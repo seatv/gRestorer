@@ -328,6 +328,24 @@ class Scene:
         self.crops = []
         self.masks = []
 
+        self.ttl_after_end = 3      # allow this scene to persist for N frames
+        self.end_frame = None       # last frame before it was considered done
+        self.completed_reason = ""  # reason string for debug/logging
+
+
+    def mark_completed(self, frame_num: int, reason: str):
+        """Mark this scene as completed but keep it alive for a few frames."""
+        self.end_frame = frame_num
+        self.completed_reason = reason
+        self.completed = True
+
+    def is_expired(self, current_frame: int) -> bool:
+        """Return True only when the linger period has passed."""
+        if not self.completed or self.end_frame is None:
+            return False
+        return (current_frame - self.end_frame) > self.ttl_after_end
+
+
     @property
     def frame_end(self) -> int:
         return self.frame_nums[-1] if self.frame_nums else (self.frame_start - 1)
@@ -359,6 +377,32 @@ class Scene:
         self.crops.append(crop_img)
         self.masks.append(crop_mask)
 
+    # --- Compatibility aliases (older pipeline revisions) ---
+    def append(
+        self,
+        frame_num: int,
+        roi_box: Box,
+        crop_box: Box,
+        crop_img: torch.Tensor,
+        crop_mask: Optional[torch.Tensor],
+    ) -> None:
+        """Alias for older callers that used Scene.append(...)."""
+        self.add_frame(
+            frame_num=frame_num,
+            roi_box=roi_box,
+            crop_box=crop_box,
+            crop_img=crop_img,
+            crop_mask=crop_mask,
+        )
+
+    def to_clip(self, *, clip_id: int, clip_size: int, pad_mode: str = "reflect") -> "Clip":
+        """Build a Clip from this Scene.
+
+        Kept as a Scene method because older pipeline revisions (and our
+        SceneTracker) call s.to_clip(...).
+        """
+        return Clip(scene=self, clip_id=int(clip_id), clip_size=int(clip_size), pad_mode=str(pad_mode))
+
     def merge_same_frame(
         self,
         *,
@@ -372,13 +416,27 @@ class Scene:
         self.roi_boxes[-1] = _union_box(self.roi_boxes[-1], roi_box)
         self.crop_boxes[-1] = crop_box
         self.crops[-1] = crop_img
+        # NOTE (important): during same-frame merges, the *crop box usually changes*
+        # (we recompute it from the union ROI). That means any previously stored
+        # mask/crop for this frame may have a different spatial shape.
+        #
+        # LADA semantics are "union in full-frame coords, then re-crop".
+        # Our tracker already re-crops from the UNION ROI and passes a mask in the
+        # union-crop coordinate system.
+        #
+        # Therefore: if shapes mismatch, we must NOT try to max() them; we replace.
         if crop_mask is None:
             self.masks[-1] = None
         else:
-            if self.masks[-1] is None:
+            prev = self.masks[-1]
+            if prev is None:
                 self.masks[-1] = crop_mask
             else:
-                self.masks[-1] = torch.maximum(self.masks[-1], crop_mask)
+                if prev.shape == crop_mask.shape:
+                    self.masks[-1] = torch.maximum(prev, crop_mask)
+                else:
+                    # Replace with the union-crop mask.
+                    self.masks[-1] = crop_mask
 
     def max_crop_hw(self) -> Tuple[int, int]:
         max_h = 0
@@ -402,6 +460,7 @@ class Clip:
     boxes: List[Box]
     crop_shapes: List[Tuple[int, int]]
     pad_after_resizes: List[Pad]
+    frame_nums: List[int]
     clip_size: int
     pad_mode: str
 
@@ -411,6 +470,7 @@ class Clip:
         self.id = int(clip_id)
         self.frame_start = int(scene.frame_nums[0])
         self.frame_end = int(scene.frame_nums[-1])
+        self.frame_nums = list(scene.frame_nums)
         self.clip_size = int(clip_size)
         self.pad_mode = str(pad_mode)
         self.boxes = list(scene.crop_boxes)
@@ -451,12 +511,36 @@ class Clip:
     def __len__(self) -> int:
         return len(self.frames)
 
+    # --- Compatibility aliases ---
+    @property
+    def crop_boxes(self) -> List[Box]:
+        return self.boxes
+
     def pop(self) -> Tuple[torch.Tensor, torch.Tensor, Box, Tuple[int, int], Pad]:
+        """Pop the earliest clip element.
+
+        LADA-faithful behavior: advance frame_start as frames are popped so a clip can be
+        applied by matching `clip.frame_start == frame_num` and popping once per frame.
+        """
         frame = self.frames.pop(0)
         mask = self.masks.pop(0)
         box = self.boxes.pop(0)
         crop_shape = self.crop_shapes.pop(0)
         pad = self.pad_after_resizes.pop(0)
+
+        # Keep frame_nums/frame_start in sync with pops (LADA-style).
+        if self.frame_nums:
+            self.frame_nums.pop(0)
+
+        if self.frame_nums:
+            self.frame_start = int(self.frame_nums[0])
+            self.frame_end = int(self.frame_nums[-1])
+        else:
+            # Mark empty: keep invariant frame_start > frame_end
+            old_end = int(self.frame_end)
+            self.frame_start = old_end + 1
+            self.frame_end = old_end
+
         return frame, mask, box, crop_shape, pad
 
 

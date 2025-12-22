@@ -26,8 +26,24 @@ def create_parser() -> argparse.ArgumentParser:
     # Timing (ok if pipeline ignores it)
     p.add_argument("--profile-sync", dest="profile_sync", action="store_true", default=None)
 
+    # Scene tracking / clip mask fidelity
+    p.add_argument(
+        "--use-seg-masks",
+        dest="use_seg_masks",
+        action="store_true",
+        default=None,
+        help="Use detector segmentation masks for clip compositing (LADA-faithful).",
+    )
+    p.add_argument(
+        "--no-seg-masks",
+        dest="use_seg_masks",
+        action="store_false",
+        default=None,
+        help="Disable segmentation masks; use rectangle box masks only.",
+    )
+
     # Restorer selection
-    p.add_argument("--restorer", dest="restorer", choices=["none", "pseudo", "grestorer"], default=None)
+    p.add_argument("--restorer", dest="restorer", choices=["none", "pseudo", "pseudo_clip", "grestorer"], default=None)
 
     # Detector
     p.add_argument("--det-model", dest="det_model_path", default=None)
@@ -85,6 +101,9 @@ def parse_args(argv=None) -> Config:
     if args.profile_sync is not None and args.profile_sync:
         cfg.data["profile_sync"] = True
 
+    # Scene tracking / clip mask fidelity
+    _apply_if_not_none(cfg, "use_seg_masks", args.use_seg_masks)
+
     # Detector
     _apply_if_not_none(cfg, "det_model_path", args.det_model_path)
     _apply_if_not_none(cfg, "det_conf", args.det_conf)
@@ -118,6 +137,7 @@ def parse_args(argv=None) -> Config:
     cfg.data.setdefault("det_conf", 0.25)
     cfg.data.setdefault("det_iou", 0.45)
     cfg.data.setdefault("det_imgsz", 640)
+    cfg.data.setdefault("use_seg_masks", True)
 
     # Visualization defaults
     if cfg.get("visualization", default=None) is None:

@@ -89,36 +89,40 @@ class Decoder:
     def read_batch(self) -> List:
         """
         Read next batch of frames.
-        
+
         Returns:
             List of RGB frames as GPU surfaces [H, W, 3].
             Empty list if no more frames.
-            
+
         Note:
             Frames are DLPack-compatible GPU memory that can be wrapped
             with torch.from_dlpack() for zero-copy access.
         """
-        frames = self._decoder.get_batch_frames(self.batch_size)
-        
-        if frames:
-            self._frames_read += len(frames)
-        
+        # If container reports a finite frame count, avoid calling into decoder past EOF.
+        frames = None
+        if not self.is_complete:
+            frames = self._decoder.get_batch_frames(self.batch_size)
+
+            if frames:
+                self._frames_read += len(frames)
+
         return frames
-    
+
+
     @property
     def num_frames(self) -> int:
         """Total number of frames in video."""
         return self.metadata.num_frames
-    
+
     @property
     def frames_read(self) -> int:
         """Number of frames read so far."""
         return self._frames_read
-    
+
     @property
     def is_complete(self) -> bool:
         """Check if all frames have been read."""
-        return self._frames_read >= self.metadata.num_frames
+        return (self.metadata.num_frames > 0) and (self._frames_read >= self.metadata.num_frames)
     
     def __repr__(self) -> str:
         return (f"Decoder(path='{self.input_path}', "
