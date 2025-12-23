@@ -105,7 +105,7 @@ class Pipeline:
 
     def run(self) -> None:
         #Let us initialize the timer
-        t0 = time.perf_counter()
+        t_start = time.perf_counter()
 
         # Decoder
         decoder = Decoder(self.input_path, batch_size=self.batch_size, gpu_id=self.gpu_id)
@@ -403,18 +403,32 @@ class Pipeline:
 
         # IMPORTANT: Encoder.close() does not flush tail packets; flush explicitly.
         encoder.flush()
+        # Capture processing time
+        t_processing = time.perf_counter() - t_start
         encoder.close()
         decoder.close()
+
         # Compute total time taken
         t1 = time.perf_counter()
-        t_total = t1 - t0
+        t_total = t1 - t_start
         t_known = t_decode_total + t_det_total + t_track_total + t_restore_total + t_encode_total
-        t_other = max(0.0, t_total - t_known)
+        t_other_processing = t_processing - t_known
+        t_other = t_total - t_known
 
         print(
-            f"[Pipeline] done frames={frames_done} "
+            f"[Pipeline] Processed {frames_done} frames: "
             f"t_decode={t_decode_total:.2f}s t_det={t_det_total:.2f}s "
             f"t_track={t_track_total:.2f}s t_restore={t_restore_total:.2f}s "
             f"t_encode={t_encode_total:.2f}s"
         )
-        print(f"[Pipeline] Total execution time = {t_total:.2f}s Overhead = {t_other:.2f}s")
+
+        if t_other_processing < -0.05:
+            print(f"[Pipeline] Processing time (no mux) = {t_processing:.2f}s " f"(parts overlap/async by {-t_other_processing:.2f}s; sum_parts={t_known:.2f}s)")
+        else:
+            print(f"[Pipeline] Processing time (no mux) = {t_processing:.2f}s " f"Overhead = {max(0.0, t_other_processing):.2f}s (sum_parts={t_known:.2f}s)")
+
+        # Full end-to-end: includes remux
+        mux_time = max(0.0, t_total - t_processing)
+        print(f"[Pipeline] Total time (with mux) = {t_total:.2f}s " f"(mux={mux_time:.2f}s)")
+        print( f"[Pipeline] DONE: Processed  &  Remuxed {frames_done} frames" )
+
