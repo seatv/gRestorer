@@ -104,6 +104,9 @@ class Pipeline:
         return SceneTracker(cfg)
 
     def run(self) -> None:
+        #Let us initialize the timer
+        t0 = time.perf_counter()
+
         # Decoder
         decoder = Decoder(self.input_path, batch_size=self.batch_size, gpu_id=self.gpu_id)
         width = int(decoder.metadata.width)
@@ -402,6 +405,11 @@ class Pipeline:
         encoder.flush()
         encoder.close()
         decoder.close()
+        # Compute total time taken
+        t1 = time.perf_counter()
+        t_total = t1 - t0
+        t_known = t_decode_total + t_det_total + t_track_total + t_restore_total + t_encode_total
+        t_other = max(0.0, t_total - t_known)
 
         print(
             f"[Pipeline] done frames={frames_done} "
@@ -409,3 +417,4 @@ class Pipeline:
             f"t_track={t_track_total:.2f}s t_restore={t_restore_total:.2f}s "
             f"t_encode={t_encode_total:.2f}s"
         )
+        print(f"[Pipeline] Total execution time = {t_total:.2f}s Overhead = {t_other:.2f}s")
