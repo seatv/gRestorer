@@ -1,5 +1,13 @@
 {
-  "decoder": {
+"synth_mosaic": {
+  "block_size": 16,
+  "rois": [
+    [240,260,820,980],
+    [920,1520,1500,2240],
+    [1460,2480,2060,3340]
+   ]
+  },
+"decoder": {
     "output_format": "RGB",
     "gpu_id": 0
   },

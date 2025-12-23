@@ -15,7 +15,8 @@ def create_parser() -> argparse.ArgumentParser:
     # Core
     p.add_argument("--input", dest="input_path", required=True, help="Input video path")
     p.add_argument("--output", dest="output_path", required=True, help="Output video path")
-    p.add_argument("--config", dest="config_path", default=None, help="Path to config.json (defaults to ./config.json)")
+    default_cfg = Path("config.json")
+    p.add_argument("--config", dest="config_path", default=str(default_cfg) if default_cfg.is_file() else None, help="Config path (defaults to ./config.json if present)")
 
     # Runtime / perf
     p.add_argument("--gpu-id", dest="gpu_id", type=int, default=None)
