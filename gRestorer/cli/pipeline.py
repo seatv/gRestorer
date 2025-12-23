@@ -11,6 +11,7 @@ from gRestorer.core.scene_tracker import SceneTracker, TrackerConfig
 from gRestorer.detector.core import Detection, MosaicDetector
 from gRestorer.restorer import NoneRestorer, PseudoRestorer
 from gRestorer.restorer.pseudo_clip_restorer import PseudoClipRestorer
+from gRestorer.restorer.basicvsrpp_clip_restorer import BasicVSRPPClipRestorer
 from gRestorer.utils.config_util import Config
 from gRestorer.video import Decoder, Encoder
 
@@ -45,7 +46,9 @@ class Pipeline:
 
         # Diagnostic knob: if True, synchronize device before handing frames to the encoder.
         # This avoids rare torch->NVENC stream races (seen as occasional unshaded / stale frames).
-        default_sync = (self.restorer_name.endswith("_clip") and (self.device.type in ("cuda", "xpu")))
+        # Clip modes do GPU work right before NVENC reads the surfaces; default to syncing on CUDA/XPU.
+        rn = self.restorer_name.lower().strip()
+        default_sync = (self.device.type in ("cuda", "xpu")) and (rn in ("pseudo_clip", "basicvsrpp", "basicvsrpp_clip"))
         self.sync_before_encode = bool(
             _cfg_first(cfg, [("encoder", "sync_before_encode"), ("sync_before_encode",)], default=default_sync)
         )
@@ -132,7 +135,7 @@ class Pipeline:
         restorer_name = self.restorer_name.lower().strip()
 
         if restorer_name == "none":
-            restorer = NoneRestorer(device=self.device)
+            restorer = NoneRestorer(device=self.device, width=width, height=height)
             detector = None
             tracker = None
             clip_restorer = None
@@ -161,6 +164,21 @@ class Pipeline:
                 device=self.device,
                 fill_color_bgr=self.fill_color or (255, 0, 255),
                 fill_opacity=self.fill_opacity,
+            )
+            clip_mode = True
+
+        elif restorer_name == "basicvsrpp":
+            restorer = None
+            detector = self._build_detector()
+            tracker = self._build_tracker()
+
+            ckpt = _cfg_first(self.cfg, [("restoration", "rest_model_path"), ("rest_model_path",)], default=None)
+            fp16 = bool(_cfg_first(self.cfg, [("restoration", "fp16"), ("rest_fp16",)], default=True))
+            clip_restorer = BasicVSRPPClipRestorer(
+                device=self.device,
+                checkpoint_path=str(ckpt),
+                fp16=fp16,
+                config=None,  # use LADA default gan inference config
             )
             clip_mode = True
 

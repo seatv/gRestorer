@@ -43,7 +43,32 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     # Restorer selection
-    p.add_argument("--restorer", dest="restorer", choices=["none", "pseudo", "pseudo_clip", "grestorer"], default=None)
+    p.add_argument("--restorer", dest="restorer", choices=["none", "pseudo", "pseudo_clip", "grestorer", "basicvsrpp"], default=None)
+
+    # Restorer model
+    p.add_argument(
+        "--rest-model",
+        dest="rest_model_path",
+        default=None,
+        help="Path to BasicVSR++ checkpoint (.pth). Required for --restorer basicvsrpp",
+    )
+
+    # Restorer perf
+    p.add_argument(
+        "--rest-fp16",
+        dest="rest_fp16",
+        action="store_true",
+        default=None,
+        help="Enable FP16 for restoration (CUDA only).",
+    )
+    p.add_argument(
+        "--no-rest-fp16",
+        dest="rest_fp16",
+        action="store_false",
+        default=None,
+        help="Disable FP16 for restoration.",
+    )
+
 
     # Detector
     p.add_argument("--det-model", dest="det_model_path", default=None)

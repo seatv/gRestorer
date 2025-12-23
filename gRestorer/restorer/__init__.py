@@ -12,3 +12,6 @@ __all__ = [
     "BaseClipRestorer",
     "PseudoClipRestorer",
 ]
+from .basicvsrpp_clip_restorer import BasicVSRPPClipRestorer
+
+__all__.append("BasicVSRPPClipRestorer")

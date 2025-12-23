@@ -13,17 +13,19 @@
 	"sync_before_encode": true
   },
   "detection": {
+    "model_path": "D:\\Models\\lada\\lada_mosaic_detection_model_v3.1_accurate.pt",
     "batch_size": 8,
     "conf_threshold": 0.5,
     "iou_threshold": 0.45,
     "imgsz": 640
   },
   "restoration": {
-    "max_clip_length": 30,
+    "rest_model_path": "D:\\Models\\lada\\lada_mosaic_restoration_model_generic_v1.2.pth",
+    "fp16": true,
+    "max_clip_length": 9,
     "clip_size": 256,
     "border_ratio": 0.06,
-    "pad_mode": "reflect",
-    "fp16": true
+    "pad_mode": "reflect"
   },
   "scene_tracking": {
     "min_iou": 0.3,

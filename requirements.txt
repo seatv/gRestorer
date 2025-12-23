@@ -15,3 +15,8 @@ tqdm>=4.65.0
 
 # PyTorch:
 # Install separately to match your backend (CUDA / CPU / Intel XPU)
+
+# BasicVSR++ (vendored from LADA / OpenMMLab)
+mmengine>=0.10.0
+# torchvision is typically installed with torch; listed here for clarity
+torchvision>=0.24.0
