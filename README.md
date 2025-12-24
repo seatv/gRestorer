@@ -173,8 +173,18 @@ ffprobe -v error -select_streams v:0 -count_frames `
 - Increase `detection.imgsz` (e.g., 640 → 1280)
 - For synth mosaics, use a sufficiently large mosaic block size so artifacts survive scaling
 
+## Acknowledgements
+
+This project draws heavily from:
+
+- **lada** – for the detection and restoration models and the original mmagic‑based pipeline.![](https://github.com/ladaapp/lada/blob/main/packaging/flatpak/share/io.github.ladaapp.lada.png)
+- **BasicVSR++** – for the underlying video restoration architecture.
+
+Please check the upstream projects for full training code, original implementations, and model weights.
+
 ## License
 
 AGPL-3.0
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
 
+![lada](https://github.com/ladaapp/lada/blob/main/packaging/flatpak/share/io.github.ladaapp.lada.png)
