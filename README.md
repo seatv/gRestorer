@@ -186,5 +186,3 @@ Please check the upstream projects for full training code, original implementati
 
 AGPL-3.0
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
-
-![lada](https://github.com/ladaapp/lada/blob/main/packaging/flatpak/share/io.github.ladaapp.lada.png)
