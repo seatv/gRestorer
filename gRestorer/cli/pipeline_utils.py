@@ -6,6 +6,24 @@ import torch
 
 from gRestorer.utils.config_util import Config
 
+from typing import Tuple
+
+def dilate_tlbr_inclusive(
+    box: Tuple[int, int, int, int],
+    d: int,
+    h: int,
+    w: int,
+) -> Tuple[int, int, int, int]:
+    """Dilate (t,l,b,r) box by d pixels. Assumes inclusive coords, clamps to [0..h-1/w-1]."""
+    if d <= 0:
+        return box
+    t, l, b, r = box
+    t = max(0, t - d)
+    l = max(0, l - d)
+    b = min(h - 1, b + d)
+    r = min(w - 1, r + d)
+    return (t, l, b, r)
+
 
 def _sync_device(device: torch.device) -> None:
     """Sync torch work before NVENC reads GPU buffers (CUDA/XPU)."""

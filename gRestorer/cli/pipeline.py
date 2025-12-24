@@ -78,6 +78,9 @@ class Pipeline:
         self.fill_color = _parse_color_bgr(_cfg_first(cfg, [("visualization", "fill_color"), ("fill_color",)], default=None))
         self.fill_opacity = float(_cfg_first(cfg, [("visualization", "fill_opacity"), ("fill_opacity",)], default=0.5))
 
+        #Restoratin - BasicVSR++
+        self.feather_radius = int( _cfg_first(self.cfg, [("restoration", "feather_radius"), ("feather_radius",)], default=3))
+
     def _build_detector(self) -> MosaicDetector:
         if not self.det_model:
             raise ValueError("--det-model is required when using a restorer that needs detection")
@@ -113,6 +116,12 @@ class Pipeline:
         height = int(decoder.metadata.height)
         fps = float(decoder.metadata.fps) if decoder.metadata.fps else 30.0
 
+        # Detection coverage counters (per run)
+        frames_with_det = 0
+        total_boxes = 0
+        total_roi_pixels = 0
+        frame_pixels = width * height
+
         # Encoder
         enc_codec = str(_cfg_first(self.cfg, [("encoder", "codec"), ("codec",)], default="hevc"))
         enc_preset = str(_cfg_first(self.cfg, [("encoder", "preset"), ("preset",)], default="P7"))
@@ -133,6 +142,7 @@ class Pipeline:
             qp=enc_qp,
             gpu_id=self.gpu_id,
             container=enc_container,
+            input_path=self.input_path,
         )
 
         restorer_name = self.restorer_name.lower().strip()
@@ -327,6 +337,11 @@ class Pipeline:
                         if roi_masks is not None:
                             # det.masks is CPU uint8 [N,H,W] in original resolution.
                             roi_masks.append(det.masks[j])
+                if roi_boxes:
+                    frames_with_det += 1
+                    total_boxes += len(roi_boxes)
+                    for (t, l, b, r) in roi_boxes:
+                        total_roi_pixels += (b - t + 1) * (r - l + 1)
 
                 tt0 = time.perf_counter()
                 step = tracker.step_frame(fn, store_bgr_u8[fn], roi_boxes, roi_masks)
@@ -351,7 +366,7 @@ class Pipeline:
                             clip=clip,
                             restored_frames=restored,
                             store_bgr_u8=store_bgr_u8,
-                            feather_radius=3,
+                            feather_radius=self.feather_radius,
                         )
                         tr1 = time.perf_counter()
                         t_restore_total += (tr1 - tr0)
@@ -394,7 +409,7 @@ class Pipeline:
                     clip=clip,
                     restored_frames=restored,
                     store_bgr_u8=store_bgr_u8,
-                    feather_radius=3,
+                    feather_radius=self.feather_radius,
                 )
                 tr1 = time.perf_counter()
                 t_restore_total += (tr1 - tr0)

@@ -98,17 +98,21 @@ class Decoder:
             Frames are DLPack-compatible GPU memory that can be wrapped
             with torch.from_dlpack() for zero-copy access.
         """
+
+        """Read next batch of frames. Returns [] at EOF."""
         # If container reports a finite frame count, avoid calling into decoder past EOF.
-        frames = None
-        if not self.is_complete:
-            frames = self._decoder.get_batch_frames(self.batch_size)
+        n = self.batch_size
+        if self.metadata.num_frames > 0:
+            remaining = self.metadata.num_frames - self._frames_read
+            if remaining <= 0:
+                return []
+            n = min(n, remaining)
 
-            if frames:
-                self._frames_read += len(frames)
-
-        return frames
-
-
+        frames = self._decoder.get_batch_frames(n)
+        if frames:
+            self._frames_read += len(frames)
+            return frames
+        return []
     @property
     def num_frames(self) -> int:
         """Total number of frames in video."""

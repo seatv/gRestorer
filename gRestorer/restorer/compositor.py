@@ -53,7 +53,7 @@ def _composite_clip_into_store(
     clip: Clip,
     restored_frames: List[torch.Tensor],
     store_bgr_u8: Dict[int, torch.Tensor],
-    feather_radius: int = 3,
+    feather_radius: int = 0,
 ) -> None:
     """Paste restored clip results back into buffered full frames (in-place)."""
     if len(restored_frames) != len(clip):

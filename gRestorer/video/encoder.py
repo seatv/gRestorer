@@ -90,8 +90,10 @@ class Encoder:
         container: str | None = None,
         bframes: int = 0,
         ffmpeg_path: str = "ffmpeg",
+        input_path: str | Path | None = None,
     ):
         self.output_path = str(output_path)
+        self.input_path = str(input_path) if input_path else None
         self.width = int(width)
         self.height = int(height)
         self.fps = float(fps)
@@ -200,50 +202,64 @@ class Encoder:
         if tail:
             self._file.write(bytearray(tail))
 
-    def _remux_with_ffmpeg(self) -> None:
-        if not self._needs_remux:
-            return
-        assert self.container in ("mp4", "mkv")
+    def _remux_with_ffmpeg(self, input_path: str | None = None) -> None:
+        """
+        Remux raw HEVC bitstream (.hevc) into a playable MP4 container.
+        Optionally copies audio and subtitle tracks from the original input.
+        """
+        import subprocess
+        from pathlib import Path
+        import shlex
 
-        in_fmt = _ffmpeg_input_format(self.codec)
-        fps_str = f"{self.fps:g}"
+        hevc_path = Path(self.output_path).with_suffix(".mp4.hevc")
+        mp4_path = Path(self.output_path)
+        input_video = Path(input_path) if input_path else None
+
+        if not hevc_path.exists():
+            print(f"[Encoder] Remux skipped: {hevc_path} not found")
+            return
 
         cmd = [
-            self.ffmpeg_path,
+            "ffmpeg",
             "-hide_banner",
             "-y",
             "-loglevel", "error",
-            # Generate clean timestamps for raw elementary streams (CFR)
             "-fflags", "+genpts",
-            "-r", fps_str,
-            "-f", in_fmt,
-            "-i", self._raw_path,
-            "-an",
-            "-c:v", "copy",
+            "-r", str(self.fps),
+            "-f", "hevc",
+            "-i", str(hevc_path),
         ]
 
-        # MP4 prefers a stable timescale; also enables faststart for streaming/players.
-        if self.container == "mp4":
+        if input_video and input_video.exists():
+            # Add original input as second input to copy its audio/subs
+            cmd += ["-i", str(input_video)]
             cmd += [
-                "-movflags", "+faststart",
-                "-video_track_timescale", "90000",
+                "-map", "0:v:0", "-c:v", "copy",
+                "-map", "1:a?", "-c:a", "copy",
+                "-map", "1:s?", "-c:s", "copy",
             ]
+        else:
+            # Video-only (no audio input)
+            cmd += ["-an", "-c:v", "copy"]
 
-        cmd += [self.output_path]
+        cmd += [
+            "-movflags", "+faststart",
+            "-video_track_timescale", "90000",
+            str(mp4_path),
+        ]
 
-        print(f"[Encoder] Remux: {' '.join(cmd)}")
+        print("[Encoder] Remux:", " ".join(shlex.quote(x) for x in cmd))
+
         try:
             subprocess.run(cmd, check=True)
         except subprocess.CalledProcessError as e:
-            print(f"[Encoder] ERROR: ffmpeg remux failed: {e}")
-            print(f"[Encoder] Keeping raw bitstream: {self._raw_path}")
-            raise
-
-        # Best effort cleanup of raw file
-        try:
-            Path(self._raw_path).unlink(missing_ok=True)  # py3.8+ supports missing_ok
-        except Exception:
-            pass
+            print(f"[Encoder] Remux failed: {e}")
+        else:
+            # Clean up the raw HEVC if remux succeeded
+            try:
+                hevc_path.unlink()
+            except OSError:
+                pass
 
     def close(self) -> None:
         # Ensure trailer bytes are written
@@ -255,7 +271,7 @@ class Encoder:
             pass
 
         # Remux if needed
-        self._remux_with_ffmpeg()
+        self._remux_with_ffmpeg(self.input_path)
 
     @property
     def frames_encoded(self) -> int:

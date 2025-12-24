@@ -1,50 +1,55 @@
 # gRestorer
+![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
 
-gRestorer is an **NVDEC → (RGB/RGBP) → BGR → Detect → Restore → NVENC** video pipeline designed to be **measurable first, optimized second**.
+gRestorer is a **GPU-first** video pipeline for mosaic detection and restoration:
 
-Right now it focuses on two baseline modes:
+**NVDEC (PyNvVideoCodec) → RGB/RGBP → BGR → Detect → (Track → Clip Restore → Composite) → NVENC → FFmpeg remux**
 
-- **none**: no-op restorer (baseline throughput + format conversion + encode cost)
-- **pseudo**: uses the detector output to draw ROI boundaries and shade detected mosaic regions (visual sanity-check)
+It’s built to be **measurable first, optimized second**: the CLI prints per-stage timings so you can tune performance and quality surgically.
 
-The long-term goal is a LADA-faithful restoration path (BasicVSR++-style) with minimal CPU↔GPU chatter.
+## What it does
 
-## What it does today
+1. **Decode** frames on GPU using `PyNvVideoCodec` (NVDEC)
+2. Convert decoder output **RGB/RGBP → BGR** (LADA-style models expect BGR ordering)
+3. (Optional) **Detect mosaics** using a YOLO segmentation model (Ultralytics)
+4. **Restore**
+   - `none`: passthrough baseline (decode + conversion + encode cost)
+   - `pseudo`: draw ROI boxes + fill mosaic regions (visual sanity-check)
+   - `pseudo_clip`: clip-mode pipeline (tracker/compositor validation)
+   - `basicvsrpp`: clip restoration using a BasicVSR++-style model checkpoint
+5. **Encode** on GPU using `PyNvVideoCodec` (NVENC)
+6. **Remux** to MP4 with FFmpeg (optionally copying audio/subtitles from the source)
 
-1) **Decode** frames on GPU using `PyNvVideoCodec` (NVDEC)  
-2) Convert decoder output **RGB/RGBP → BGR** (LADA expects BGR ordering)  
-3) (Optional) **Detect mosaics** using a YOLO segmentation model (`ultralytics`)  
-4) **Restore**
-   - `none`: passthrough
-   - `pseudo`: draw box + apply semi-transparent fill inside mosaic mask
-5) **Pack** to the encoder-required 4-channel packed format
-6) **Encode** on GPU using `PyNvVideoCodec` (NVENC)
+## CLI commands
 
-The CLI prints **per-stage timing** so you can see where the time goes and optimize surgically.
+- `python -m gRestorer.cli` — main pipeline (decode → [detect] → restore → encode → remux)
+- `python -m gRestorer.cli.add-mosaic` — GPU synth mosaic generator (for creating SFW test clips)
+
+Both commands default to loading `./config.json` if present.
 
 ## Project layout
 
-```
+```text
 gRestorer/
-  cli/         # CLI entry + pipeline orchestration for gRestorer & mosaic
-  core/        # scene/clip logic (next phase)
-  detector/    # mosaic detector wrapper (YOLO)
-  restorer/    # restorers: none, pseudo, (future) grestorer
+  cli/         # CLI entry + pipeline orchestration
+  core/        # scene/clip tracking logic
+  detector/    # mosaic detector wrapper (YOLO seg)
+  restorer/    # restorers: none, pseudo, pseudo_clip, basicvsrpp
   utils/       # config + visualization helpers
   video/       # NVDEC/NVENC wrappers: decoder.py, encoder.py
   synthmosaic/ # mosaic addition functions
 pyproject.toml
 requirements.txt
-config.json   # optional; loaded by CLI if present
+config.json    # optional; loaded by CLI if present
 README.md
 ```
 
-## Install
+## Install (Windows / PowerShell)
 
-### 1) Create a venv (Windows / PowerShell)
+### 1) Create and activate a venv
 
 ```powershell
-py -3.11 -m venv venv
+py -3.13 -m venv venv
 .\venv\Scripts\Activate.ps1
 python -m pip install -U pip
 ```
@@ -57,94 +62,119 @@ pip install -r requirements.txt
 
 ### 3) Install PyTorch
 
-Install the torch build that matches your machine (CUDA / CPU / Intel XPU).
-Example (CUDA builds are hosted by PyTorch):
+Install the torch build that matches your machine (CUDA / CPU / Intel XPU). Example (CUDA):
 
 ```powershell
 # Example only — choose the correct index URL for your CUDA version
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+```
+
+### 4) Install gRestorer (editable, recommended for dev)
+
+```powershell
+pip install -e .
+python -m gRestorer.cli --help
 ```
 
 ## Usage
 
-### Run via module (recommended during development)
+### Baseline passthrough
 
 ```powershell
-python -m gRestorer.cli --input "D:\Videos\Test\sample.mp4" --output "D:\Videos\Test\out_none.mp4" --restorer none
+python -m gRestorer.cli `
+  --input  "D:\Videos\Test\sample.mp4" `
+  --output "D:\Videos\Test\out_none.mp4" `
+  --restorer none
 ```
 
-### Run pseudo mode (requires detector model)
+### Pseudo mode (visualize detection)
 
 ```powershell
 python -m gRestorer.cli `
   --input  "D:\Videos\Test\sample.mp4" `
   --output "D:\Videos\Test\out_pseudo.mp4" `
   --restorer pseudo `
-  --det-model "D:\Models\lada\lada_mosaic_detection_model_v3.1_accurate.pt"
+  --det-model "D:\Models\lada\lada_mosaic_detection_model_v3.1_accurate.pt" `
+  --debug
 ```
-# gRestorer
 
-gRestorer is an NVDEC → (RGBP) → BGR → Detect → Restore → NVENC pipeline designed to be **measurable first** and then optimized until it matches (and hopefully beats) LADA throughput.
-
-## CLI commands
-
-- `gRestorer` — main pipeline (decode → [detect] → restore → encode)
-- `mosaic` — synthetic mosaic generator (for creating SFW test clips)
-
-## Install (Windows / PowerShell)
+### Clip-mode pseudo (validates tracker + compositor + drain)
 
 ```powershell
-py -m venv venv
-.\venv\Scripts\Activate.ps1
-python -m pip install -U pip
-pip install -e .
+python -m gRestorer.cli `
+  --input  "D:\Videos\Test\sample.mp4" `
+  --output "D:\Videos\Test\out_pseudoClip.mp4" `
+  --restorer pseudo_clip `
+  --det-model "D:\Models\lada\lada_mosaic_detection_model_v3.1_accurate.pt" `
+  --debug
+```
 
-### Install as an editable package (optional)
+### BasicVSR++ clip restoration
 
 ```powershell
-pip install -e .
-gRestorer --help
+python -m gRestorer.cli `
+  --input  "D:\Videos\Test\sample.mp4" `
+  --output "D:\Videos\Test\out_basicvsrpp.mp4" `
+  --restorer basicvsrpp `
+  --det-model  "D:\Models\lada\lada_mosaic_detection_model_v3.1_accurate.pt" `
+  --rest-model "D:\Models\lada\lada_mosaic_restoration_model_generic_v1.2.pth" `
+  --debug
 ```
+
+## Synth mosaic generator
+
+Generate controlled SFW mosaics (fixed ROIs) for testing:
+
+```powershell
+python -m gRestorer.cli.add-mosaic `
+  --input  "D:\Videos\Test\sample.mp4" `
+  --output "D:\Videos\Mosaic\sample-M3.mp4"
+```
+
+ROIs can be specified either via CLI (`--roi t,l,b,r`, repeatable) or in `config.json` under `synth_mosaic.rois`.
 
 ## Configuration
 
-You can set defaults in `config.json` and override them on the command line.
+`config.json` is optional; CLI flags override config values.
 
-Example `config.json`:
+Common knobs:
 
-```json
-{
-  "gpu_id": 0,
-  "batch_size": 8,
-  "restorer": "pseudo",
-  "det_imgsz": 640,
-  "det_conf": 0.25,
-  "det_iou": 0.45,
-  "visualization": {
-    "box_color": [0, 255, 0],
-    "box_thickness": 2,
-    "fill_color": [128, 128, 128],
-    "fill_opacity": 0.5
-  }
-}
+- `detection.batch_size`, `detection.imgsz`, `detection.conf_threshold`, `detection.iou_threshold`, `detection.fp16`
+- `restoration.max_clip_length`, `restoration.clip_size`, `restoration.border_ratio`, `restoration.pad_mode`, `restoration.fp16`
+- `restoration.feather_radius` — compositor feather blending at ROI boundary  
+  - **Recommended default: `0`** (larger values can reintroduce mosaic-edge artifacts)
+- `roi_dilate` — expand ROI boxes (pixels) before cropping/restoring
+- `encoder.*` — codec/preset/profile/qp and remux behavior
+  - Remux uses FFmpeg and may optionally copy audio/subtitles from the input (if enabled in your encoder settings)
+
+## Output timings
+
+The pipeline reports:
+- per-stage timings (`decode / det / track / restore / encode`)
+- processing time without mux
+- total time with mux (FFmpeg remux duration shown separately)
+
+## Troubleshooting
+
+### Verify frame counts (source of truth)
+
+```powershell
+ffprobe -v error -select_streams v:0 -count_frames `
+  -show_entries stream=nb_read_frames -of default=nk=1:nw=1 "VIDEO.mp4"
 ```
 
-CLI overrides always win.
+### ROI boundary seam
 
-## Performance notes (current reality)
+- Set `restoration.feather_radius` to `0` (recommended)
+- If needed: increase `roi_dilate` slightly (+2 px)
 
-- **RGBP is usually the best decoder output** for ML pipelines because models want BCHW.
-- gRestorer supports **RGB and RGBP** and converts to **BGR** for the LADA-style detector/restoration world.
-- The current YOLO path may still incur **CPU work** in preprocessing (Ultralytics/letterbox). That’s a planned optimization.
+### Detection misses small mosaics
 
-## Roadmap
-
-- [ ] GPU-only detector preprocessing (torch letterbox/pad/normalize on GPU)
-- [ ] Scene/clip tracking (group detections into stable clips)
-- [ ] LADA-faithful restoration (BasicVSR++-style) integrated into the clip pipeline
-- [ ] Backends: CPU / CUDA / Intel XPU (decode/encode strategies per backend)
-- [ ] Expose ffmpeg-style decode/encode options (when non-NVIDIA paths are added)
+- Increase `detection.imgsz` (e.g., 640 → 1280)
+- For synth mosaics, use a sufficiently large mosaic block size so artifacts survive scaling
 
 ## License
 
-AGPL-3.0 (see `pyproject.toml`).
+AGPL-3.0
+![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
+
