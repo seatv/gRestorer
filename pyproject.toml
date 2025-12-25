@@ -31,8 +31,11 @@ dependencies = [
 ]
 
 [project.scripts]
-gRestorer = "gRestorer.cli.main:main"
-mosaic = "gRestorer.cli.mosaic:main"
+grestorer = "gRestorer.cli.main:main"
+grestorer-add-mosaic = "gRestorer.cli.add_mosaic:main"
+
+
+
 
 [tool.setuptools.packages.find]
 include = ["gRestorer*"]

@@ -45,6 +45,15 @@ def create_parser() -> argparse.ArgumentParser:
 
     # Restorer selection
     p.add_argument("--restorer", dest="restorer", choices=["none", "pseudo", "pseudo_clip", "grestorer", "basicvsrpp"], default=None)
+    # Clip length (temporal window) for clip-based restorers (pseudo_clip/basicvsrpp)
+    p.add_argument(
+        "--max-clip-length",
+        dest="max_clip_length",
+        type=int,
+        default=None,
+        help="Max frames per clip for clip-based restorers. Maps to restoration.max_clip_length.",
+    )
+
 
     # Restorer model
     p.add_argument(
@@ -70,6 +79,14 @@ def create_parser() -> argparse.ArgumentParser:
         help="Disable FP16 for restoration.",
     )
 
+    #Restorer knobs
+    p.add_argument(
+        "--roi-dilate",
+        dest="roi_dilate",
+        type=int,
+        default=None,
+        help="Dilate detected ROI boxes by N pixels (expands restored area).",
+    )
 
     # Detector
     p.add_argument("--det-model", dest="det_model_path", default=None)
@@ -121,6 +138,11 @@ def parse_args(argv=None) -> Config:
     _apply_if_not_none(cfg, "batch_size", args.batch_size)
     _apply_if_not_none(cfg, "max_frames", args.max_frames)
     _apply_if_not_none(cfg, "restorer", args.restorer)
+    if args.max_clip_length is not None:
+        if cfg.get("restoration", default=None) is None:
+            cfg.data["restoration"] = {}
+        cfg.set("restoration", "max_clip_length", value=int(args.max_clip_length))
+
 
     if args.debug is not None and args.debug:
         cfg.data["debug"] = True
@@ -130,13 +152,24 @@ def parse_args(argv=None) -> Config:
     # Scene tracking / clip mask fidelity
     _apply_if_not_none(cfg, "use_seg_masks", args.use_seg_masks)
 
-    # Detector
-    _apply_if_not_none(cfg, "det_model_path", args.det_model_path)
-    _apply_if_not_none(cfg, "det_conf", args.det_conf)
-    _apply_if_not_none(cfg, "det_iou", args.det_iou)
-    _apply_if_not_none(cfg, "det_imgsz", args.det_imgsz)
+    # Detector (CLI overrides nested detection.* so it beats config.json)
+    det = cfg.data.setdefault("detection", {})
+
+    if args.det_model_path is not None:
+        det["model_path"] = args.det_model_path
+    if args.det_conf is not None:
+        det["conf_threshold"] = float(args.det_conf)
+    if args.det_iou is not None:
+        det["iou_threshold"] = float(args.det_iou)
+    if args.det_imgsz is not None:
+        det["imgsz"] = int(args.det_imgsz)
+
+    # FP16
     if args.det_fp16 is not None and args.det_fp16:
+        # legacy (in case anything still reads it)
         cfg.data["det_fp16"] = True
+        # canonical nested form
+        det["fp16"] = True
 
     # Visualization (nested)
     _apply_visual_if_not_none(cfg, "box_color", args.box_color)
@@ -151,6 +184,9 @@ def parse_args(argv=None) -> Config:
     _apply_if_not_none(cfg, "qp", args.qp)
     _apply_if_not_none(cfg, "alpha", args.alpha)
 
+    # Restorer
+    _apply_if_not_none(cfg, "roi_dilate", args.roi_dilate)
+
     # 4) Hard defaults (if neither config nor CLI provided them)
     cfg.data.setdefault("restorer", "none")
     cfg.data.setdefault("gpu_id", 0)
@@ -160,10 +196,18 @@ def parse_args(argv=None) -> Config:
     cfg.data.setdefault("profile", "main")
     cfg.data.setdefault("qp", 23)
     cfg.data.setdefault("alpha", 255)
-    cfg.data.setdefault("det_conf", 0.25)
-    cfg.data.setdefault("det_iou", 0.45)
-    cfg.data.setdefault("det_imgsz", 640)
-    cfg.data.setdefault("use_seg_masks", True)
+
+    # Detector defaults (nested)
+    if cfg.get("detection", default=None) is None: cfg.data["detection"] = {}
+    cfg.set("detection", "conf_threshold", value=cfg.get("detection", "conf_threshold", default=0.25))
+    cfg.set("detection", "iou_threshold",  value=cfg.get("detection", "iou_threshold",  default=0.45))
+    cfg.set("detection", "imgsz",         value=cfg.get("detection", "imgsz",         default=640))
+
+    # Restoration defaults (nested)
+    if cfg.get("restoration", default=None) is None:
+        cfg.data["restoration"] = {}
+    cfg.set("restoration", "max_clip_length", value=cfg.get("restoration", "max_clip_length", default=30))
+
 
     # Visualization defaults
     if cfg.get("visualization", default=None) is None:

@@ -1,7 +1,7 @@
 {
-"roi_dilate": 6,
+  "roi_dilate": 6,
 
-"synth_mosaic": {
+  "synth_mosaic": {
   "block_size": 40,
   "rois": [
     [240,260,820,980],
@@ -9,7 +9,7 @@
     [1460,2480,2060,3340]
    ]
   },
-"decoder": {
+  "decoder": {
     "output_format": "RGB",
     "gpu_id": 0
   },
@@ -27,7 +27,7 @@
     "batch_size": 8,
     "conf_threshold": 0.5,
     "iou_threshold": 0.45,
-    "imgsz": 1280,
+    "imgsz": 960,
     "fp16": true
   },
   "restoration": {

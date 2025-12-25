@@ -54,13 +54,20 @@ py -3.13 -m venv venv
 python -m pip install -U pip
 ```
 
-### 2) Install dependencies
+### 2) Clone Repository
+At same folder level as venv above
+```
+git clone git clone <url>
+cd gRestorer
+```
+
+### 3) Install dependencies
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-### 3) Install PyTorch
+### 4) Install PyTorch
 
 Install the torch build that matches your machine (CUDA / CPU / Intel XPU). Example (CUDA):
 
@@ -69,7 +76,7 @@ Install the torch build that matches your machine (CUDA / CPU / Intel XPU). Exam
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
-### 4) Install gRestorer (editable, recommended for dev)
+### 5) Install gRestorer (editable, recommended for dev)
 
 ```powershell
 pip install -e .

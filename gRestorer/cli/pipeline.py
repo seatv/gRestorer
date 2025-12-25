@@ -23,6 +23,7 @@ from gRestorer.cli.pipeline_utils import (
     pack_bgr_u8_to_bgra_u8_inplace,
     rgb_to_bgr_u8_inplace,
     wrap_surface_as_tensor,
+    dilate_tlbr_inclusive,
 )
 from gRestorer.restorer.compositor import _composite_clip_into_store
 
@@ -331,8 +332,12 @@ class Pipeline:
                     for j in range(n):
                         box_xyxy = det.boxes[j]
                         x1, y1, x2, y2 = [float(v.item()) for v in box_xyxy]
+
                         # xyxy_to_tlbr signature is (xyxy, h, w)
-                        roi_boxes.append(xyxy_to_tlbr((x1, y1, x2, y2), height, width))
+                        tlbr = xyxy_to_tlbr((x1, y1, x2, y2), height, width)
+                        if self.roi_dilate > 0:
+                            tlbr = dilate_tlbr_inclusive(tlbr, self.roi_dilate, height, width)
+                        roi_boxes.append(tlbr)
 
                         if roi_masks is not None:
                             # det.masks is CPU uint8 [N,H,W] in original resolution.
@@ -446,4 +451,21 @@ class Pipeline:
         mux_time = max(0.0, t_total - t_processing)
         print(f"[Pipeline] Total time (with mux) = {t_total:.2f}s " f"(mux={mux_time:.2f}s)")
         print( f"[Pipeline] DONE: Processed  &  Remuxed {frames_done} frames" )
+
+        # --- Detector summary (for tuning sweeps) ---
+        if detector is not None:
+            frame_area = float(width * height) if frames_done > 0 else 0.0
+            if frames_with_det > 0 and frame_area > 0:
+                avg_roi_px = total_roi_pixels / float(frames_with_det)
+                avg_roi_pct = 100.0 * avg_roi_px / frame_area
+            else:
+                avg_roi_px = 0.0
+                avg_roi_pct = 0.0
+
+            print(
+                f"[DetStats] frames_with_det={frames_with_det}/{frames_done} "
+                f"total_boxes={total_boxes} "
+                f"avg_roi_area_px={avg_roi_px:.2f} ({avg_roi_pct:.4f}% of frame)"
+            )
+
 
