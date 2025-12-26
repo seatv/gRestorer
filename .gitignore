@@ -36,3 +36,4 @@ Thumbs.db
 #Custom
 /gitShouldNotSee/
 /logs/
+/.run/

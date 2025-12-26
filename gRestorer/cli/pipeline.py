@@ -392,7 +392,7 @@ class Pipeline:
 
             if safe_before is None:
                 # Conservative: if we can't prove frames are safe, don't drain in clip-mode.
-                safe_before = next_out
+                safe_before = frame_num_base
             else:
                 safe_before = int(safe_before)
 

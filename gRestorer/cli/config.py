@@ -184,6 +184,20 @@ def parse_args(argv=None) -> Config:
     _apply_if_not_none(cfg, "qp", args.qp)
     _apply_if_not_none(cfg, "alpha", args.alpha)
 
+    # Detector
+    # Detector (ensure nested detection.* takes precedence)
+    if cfg.get("detection", default=None) is None:
+        cfg.data["detection"] = {}
+
+    # Keep JSON’s nested model_path if present, unless CLI overrides
+    if args.det_model_path is not None:
+        cfg.set("detection", "model_path", value=args.det_model_path)
+    else:
+        # ensure config.json's nested field propagates to det_model_path for backward compatibility
+        model_path = cfg.get("detection", "model_path", default=None)
+        if model_path:
+            cfg.data["det_model_path"] = model_path
+
     # Restorer
     _apply_if_not_none(cfg, "roi_dilate", args.roi_dilate)
 
