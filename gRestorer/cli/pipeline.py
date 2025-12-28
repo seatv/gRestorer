@@ -32,7 +32,8 @@ class Pipeline:
         self.cfg = cfg
 
         # Debug / instrumentation
-        self.debug = bool(_cfg_first(cfg, [("debug",), ("verbose",)], default=False))
+        _dbg = _cfg_first(cfg, [("debug_enabled",), ("debug",), ("verbose",)], default=False)
+        self.debug = bool(_dbg) if isinstance(_dbg, bool) else False
 
         self.input_path = str(_cfg_get(cfg, "input_path"))
         self.output_path = str(_cfg_get(cfg, "output_path"))
@@ -96,6 +97,9 @@ class Pipeline:
         )
 
     def _build_tracker(self) -> SceneTracker:
+        _td = _cfg_first(self.cfg, [("tracker_debug",), ("debug_enabled",), ("debug",)], default=False)
+        tracker_debug = bool(_td) if isinstance(_td, bool) else False
+
         cfg = TrackerConfig(
             clip_size=self.clip_size,
             max_clip_length=self.max_clip_length,
@@ -103,7 +107,7 @@ class Pipeline:
             border_size=self.border_size,
             max_box_expansion_factor=1.0,
             use_seg_masks=bool(_cfg_first(self.cfg, [("use_seg_masks",), ("tracker", "use_seg_masks")], default=True)),
-            debug=bool(_cfg_first(self.cfg, [("debug",), ("tracker_debug",)], default=False)),
+            debug=tracker_debug,
         )
         return SceneTracker(cfg)
 

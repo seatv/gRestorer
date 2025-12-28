@@ -145,7 +145,7 @@ def parse_args(argv=None) -> Config:
 
 
     if args.debug is not None and args.debug:
-        cfg.data["debug"] = True
+        cfg.data["debug_enabled"] = True
     if args.profile_sync is not None and args.profile_sync:
         cfg.data["profile_sync"] = True
 

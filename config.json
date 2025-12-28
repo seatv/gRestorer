@@ -2,6 +2,7 @@
   "roi_dilate": 4,
   "use_seg_masks": true,
   "batch_size": 8,
+  "debug": false,
 
   "synth_mosaic": {
   "block_size": 40,
