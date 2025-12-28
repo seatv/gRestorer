@@ -92,13 +92,13 @@ class SceneTracker:
     ) -> Tuple[Box, torch.Tensor, torch.Tensor]:
         """Compute LADA crop_to_box_v3 crop box and slice crop from the frame.
 
-        We *always* create a per-crop mask on the frame device.
+        We create a per-crop mask on the frame device.
 
-        - Base mask is a rectangle mask derived from roi_box.
-        - If roi_mask is provided (per-pixel segmentation) and use_seg_masks=True,
-          we OR it into the crop mask. If roi_mask is on CPU at full resolution,
-          we slice *only the crop region* on CPU and transfer just that to the
-          frame device (avoids copying full HxW masks each frame).
+        - If roi_mask is provided (per-pixel segmentation) and use_seg_masks=True, we use it
+          as the clip mask (cropped to crop_box). If roi_mask is on CPU at full resolution,
+          we slice *only the crop region* on CPU and transfer just that to the frame device
+          (avoids copying full HxW masks each frame).
+        - Otherwise we fall back to a rectangle mask derived from roi_box.
         """
         h, w = int(frame_bgr_u8.shape[0]), int(frame_bgr_u8.shape[1])
         crop_box, _scale = crop_box_to_target_v3(
@@ -112,9 +112,11 @@ class SceneTracker:
         t, l, b, r = crop_box
         crop_img = frame_bgr_u8[t: b + 1, l: r + 1, :].clone()
 
-        # Fast box mask in crop coordinates
+        # Mask generation (seam-sensitive)
         crop_h = int(b - t + 1)
         crop_w = int(r - l + 1)
+
+        # 1) Rectangle base mask (always)
         crop_mask_out = torch.zeros((crop_h, crop_w), device=frame_bgr_u8.device, dtype=torch.uint8)
 
         rt, rl, rb, rr = roi_box
@@ -125,36 +127,34 @@ class SceneTracker:
         if ib >= it and ir >= il:
             crop_mask_out[it - t: ib - t + 1, il - l: ir - l + 1] = 255
 
-        # Optional segmentation mask (LADA uses masks for blend boundaries).
-        # We keep the actual transfer minimal: crop on CPU first, then move the crop.
+        # 2) Optional seg mask: OR it in (never replace rectangle)
         if roi_mask is not None and self.cfg.use_seg_masks:
             try:
+                def _mask_u8(m: torch.Tensor) -> torch.Tensor:
+                    # Normalize to uint8 {0,255} without device-sync (no .item()).
+                    if m.dtype == torch.bool:
+                        return m.to(dtype=torch.uint8) * 255
+                    if m.is_floating_point():
+                        return torch.where(m > 0.5, 255, 0).to(dtype=torch.uint8)
+                    return m.to(dtype=torch.uint8)
+
+                seg_crop: Optional[torch.Tensor] = None
                 if roi_mask.device == frame_bgr_u8.device:
                     if roi_mask.shape == (h, w):
-                        m = roi_mask[t: b + 1, l: r + 1]
-                        crop_mask_out = torch.maximum(crop_mask_out, m.to(dtype=torch.uint8))
+                        seg_crop = roi_mask[t: b + 1, l: r + 1]
                     elif roi_mask.shape == (crop_h, crop_w):
-                        crop_mask_out = torch.maximum(crop_mask_out, roi_mask.to(dtype=torch.uint8))
-
+                        seg_crop = roi_mask
                 elif roi_mask.device.type == "cpu":
-                    # Full-res CPU mask (H,W) or already-cropped CPU mask (crop_h,crop_w).
                     if roi_mask.shape == (h, w):
-                        m_cpu = roi_mask[t: b + 1, l: r + 1]
+                        seg_crop = roi_mask[t: b + 1, l: r + 1].to(device=frame_bgr_u8.device)
                     elif roi_mask.shape == (crop_h, crop_w):
-                        m_cpu = roi_mask
-                    else:
-                        m_cpu = None
+                        seg_crop = roi_mask.to(device=frame_bgr_u8.device)
 
-                    if m_cpu is not None:
-                        m = m_cpu.to(device=frame_bgr_u8.device, dtype=torch.uint8)
-                        crop_mask_out = torch.maximum(crop_mask_out, m)
-
-                else:
-                    # Unexpected device (e.g. different GPU). Ignore.
-                    pass
+                if seg_crop is not None:
+                    crop_mask_out = torch.maximum(crop_mask_out, _mask_u8(seg_crop))
 
             except Exception:
-                # Mask usage is best-effort; don't crash the pipeline.
+                # Best-effort: don't crash the pipeline on mask oddities.
                 pass
 
         return crop_box, crop_img, crop_mask_out
@@ -191,7 +191,41 @@ class SceneTracker:
             if matched.frame_end == frame_num:
                 # Same-frame merge: union ROI and recompute crop from union.
                 union_roi = _union_box(matched.roi_boxes[-1], box)
-                crop_box, crop_img, crop_mask = self._compute_crop(frame_bgr_u8, union_roi, None)
+
+                # Re-crop from union ROI. IMPORTANT: pass current detection mask (if any),
+                # then union it with the previous crop-mask by mapping old->new crop coords.
+                crop_box, crop_img, cur_mask = self._compute_crop(frame_bgr_u8, union_roi, mask)
+
+                prev_mask = matched.masks[-1] if matched.masks else None
+                prev_crop_box = matched.crop_boxes[-1] if matched.crop_boxes else None
+
+                if prev_mask is not None and prev_crop_box is not None:
+                    nt, nl, nb, nr = crop_box
+                    new_h = int(nb - nt + 1)
+                    new_w = int(nr - nl + 1)
+                    merged = torch.zeros((new_h, new_w), device=frame_bgr_u8.device, dtype=torch.uint8)
+
+                    ot, ol, ob, or_ = prev_crop_box
+                    it = max(nt, ot)
+                    il = max(nl, ol)
+                    ib = min(nb, ob)
+                    ir = min(nr, or_)
+                    if ib >= it and ir >= il:
+                        h_int = int(ib - it + 1)
+                        w_int = int(ir - il + 1)
+                        oy0 = int(it - ot)
+                        ox0 = int(il - ol)
+                        ny0 = int(it - nt)
+                        nx0 = int(il - nl)
+                        merged[ny0 : ny0 + h_int, nx0 : nx0 + w_int] = torch.maximum(
+                            merged[ny0 : ny0 + h_int, nx0 : nx0 + w_int],
+                            prev_mask[oy0 : oy0 + h_int, ox0 : ox0 + w_int].to(dtype=torch.uint8),
+                        )
+
+                    crop_mask = torch.maximum(merged, cur_mask.to(dtype=torch.uint8))
+                else:
+                    crop_mask = cur_mask
+
                 matched.merge_same_frame(
                     roi_box=union_roi,
                     crop_box=crop_box,

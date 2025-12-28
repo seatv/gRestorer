@@ -215,6 +215,7 @@ class Pipeline:
         t_track_total = 0.0
         t_restore_total = 0.0
         t_encode_total = 0.0
+        early_passthrough = 0
 
         def drain_ready(safe_before: int) -> None:
             nonlocal next_out, t_encode_total
@@ -361,6 +362,14 @@ class Pipeline:
                         f"active_scenes={step.active_scenes:2d} new_clips={len(step.new_clips):2d}"
                     )
 
+                # Early passthrough: if there are no detections and there are no active scenes/clips,
+                # encode frames immediately to avoid buffering full-res GPU frames for long stretches.
+                if (not roi_boxes) and (step.active_scenes == 0) and (not step.new_clips):
+                    early_passthrough += 1
+                    if self.debug and early_passthrough <= 10:
+                        print(f"[Dbg] passthrough f={fn} (no det, no active scenes)")
+                    drain_ready(fn + 1)
+
                 if step.new_clips:
                     # Ensure stable ordering for deterministic composites.
                     clips_sorted = sorted(step.new_clips, key=lambda c: (c.frame_start, c.id))
@@ -461,6 +470,9 @@ class Pipeline:
             else:
                 avg_roi_px = 0.0
                 avg_roi_pct = 0.0
+
+            if early_passthrough:
+                print(f"[Pipeline] early_passthrough_frames={early_passthrough}")
 
             print(
                 f"[DetStats] frames_with_det={frames_with_det}/{frames_done} "
