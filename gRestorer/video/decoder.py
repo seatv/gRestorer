@@ -82,41 +82,67 @@ class Decoder:
         
         self._frames_read = 0
         
+        self._raw_num_frames = self.metadata.num_frames
+        self._trim_prefix = 0
+        self._prefetch: list = []
+        self._trim_negative_pts = True
+
+        if self._trim_negative_pts:
+            self._prime_to_first_nonneg_pts()
+
+        
         print(f"[Decoder] Initialized: {self.metadata.width}x{self.metadata.height}, "
               f"{self.metadata.num_frames} frames, {self.metadata.fps:.2f} fps")
         print(f"[Decoder] Output: RGB [H,W,3] on GPU {self.gpu_id}")
-    
+
     def read_batch(self) -> List:
-        """
-        Read next batch of frames.
-
-        Returns:
-            List of RGB frames as GPU surfaces [H, W, 3].
-            Empty list if no more frames.
-
-        Note:
-            Frames are DLPack-compatible GPU memory that can be wrapped
-            with torch.from_dlpack() for zero-copy access.
-        """
-
-        """Read next batch of frames. Returns [] at EOF."""
-        # If container reports a finite frame count, avoid calling into decoder past EOF.
+        """Read next batch of frames (presented frames only). Returns [] at EOF."""
         n = self.batch_size
-        if self.metadata.num_frames > 0:
-            remaining = self.metadata.num_frames - self._frames_read
-            if remaining <= 0:
-                return []
-            n = min(n, remaining)
 
-        frames = self._decoder.get_batch_frames(n)
-        if frames:
-            self._frames_read += len(frames)
-            return frames
-        return []
+        # Use RAW frame count for decoder EOF protection.
+        if self._raw_num_frames > 0:
+            remaining_raw = self._raw_num_frames - self._frames_read
+            if remaining_raw <= 0 and not self._prefetch:
+                return []
+            n = min(n, max(0, remaining_raw)) if remaining_raw > 0 else n
+
+        out: list = []
+
+        # Serve any prefetched frames first
+        if self._prefetch:
+            take = min(n, len(self._prefetch))
+            out.extend(self._prefetch[:take])
+            self._prefetch = self._prefetch[take:]
+            n -= take
+
+        # Then pull more from NVDEC
+        if n > 0:
+            frames = self._decoder.get_batch_frames(n)
+            if frames:
+                self._frames_read += len(frames)  # RAW frames consumed
+                out.extend(frames)
+
+        if not out:
+            return []
+
+        # Safety: if any negative-PTS frames slip through (shouldn't), drop them.
+        if self._trim_negative_pts:
+            filtered = []
+            for fr in out:
+                pts = self._frame_pts(fr)
+                if pts is None or pts >= 0:
+                    filtered.append(fr)
+            out = filtered
+
+        return out
+
     @property
     def num_frames(self) -> int:
-        """Total number of frames in video."""
+        """Presented frame count (raw minus trimmed negative-PTS prefix)."""
+        if self._raw_num_frames > 0:
+            return max(0, self._raw_num_frames - self._trim_prefix)
         return self.metadata.num_frames
+
 
     @property
     def frames_read(self) -> int:
@@ -126,12 +152,71 @@ class Decoder:
     @property
     def is_complete(self) -> bool:
         """Check if all frames have been read."""
-        return (self.metadata.num_frames > 0) and (self._frames_read >= self.metadata.num_frames)
+        return (self._raw_num_frames > 0) and (self._frames_read >= self._raw_num_frames)
     
     def __repr__(self) -> str:
         return (f"Decoder(path='{self.input_path}', "
                 f"{self.metadata.width}x{self.metadata.height}, "
                 f"{self.metadata.num_frames} frames)")
+
+
+    def _frame_pts(self, fr) -> int | None:
+        try:
+            return int(fr.getPTS())
+        except Exception:
+            try:
+                return int(getattr(fr, "timestamp"))
+            except Exception:
+                return None
+
+    def _prime_to_first_nonneg_pts(self) -> None:
+        """
+        Some files have an edit-list / preroll region with negative PTS.
+        Those frames are not meant to be presented, and encoding them causes
+        duration inflation + audio drift. We trim the negative-PTS prefix.
+        """
+        if self._raw_num_frames <= 0:
+            return
+
+        # Read forward until we hit first frame with PTS >= 0.
+        # Keep the first non-neg batch tail in _prefetch so we don't lose it.
+        scan_batch = max(8, min(128, self.batch_size))
+        while True:
+            remaining = self._raw_num_frames - self._frames_read
+            if remaining <= 0:
+                return
+
+            n = min(scan_batch, remaining)
+            frames = self._decoder.get_batch_frames(n)
+            if not frames:
+                return
+
+            self._frames_read += len(frames)  # RAW frames consumed from decoder
+
+            first_ok = None
+            for i, fr in enumerate(frames):
+                pts = self._frame_pts(fr)
+                if pts is None:
+                    # If PTS is unavailable, we can't trim safely.
+                    return
+                if pts >= 0:
+                    first_ok = i
+                    break
+
+            if first_ok is None:
+                # whole batch is negative PTS
+                self._trim_prefix += len(frames)
+                continue
+
+            # Found first non-negative PTS inside this batch:
+            self._trim_prefix += first_ok
+            self._prefetch = frames[first_ok:]
+
+            if self._trim_prefix > 0:
+                presented = max(0, self._raw_num_frames - self._trim_prefix)
+                print(f"[Decoder] Trimmed {self._trim_prefix} negative-PTS preroll frames (presented={presented})")
+            return
+
 
     def close(self) -> None:
         """

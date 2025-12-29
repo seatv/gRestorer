@@ -14,6 +14,10 @@ from gRestorer.restorer.pseudo_clip_restorer import PseudoClipRestorer
 from gRestorer.restorer.basicvsrpp_clip_restorer import BasicVSRPPClipRestorer
 from gRestorer.utils.config_util import Config
 from gRestorer.video import Decoder, Encoder
+from fractions import Fraction
+from gRestorer.video.video_utils import probe_avg_frame_rate_rational
+
+
 
 from gRestorer.cli.pipeline_utils import (
     _cfg_first,
@@ -121,6 +125,16 @@ class Pipeline:
         height = int(decoder.metadata.height)
         fps = float(decoder.metadata.fps) if decoder.metadata.fps else 30.0
 
+        pbar = None
+        if not self.debug:
+            try:
+                from tqdm import tqdm
+                total = decoder.num_frames
+                if total:
+                    pbar = tqdm(total=int(total), desc="Processing video", unit="f", dynamic_ncols=True)
+            except Exception:
+                pbar = None
+
         # Detection coverage counters (per run)
         frames_with_det = 0
         total_boxes = 0
@@ -132,8 +146,6 @@ class Pipeline:
         enc_preset = str(_cfg_first(self.cfg, [("encoder", "preset"), ("preset",)], default="P7"))
         enc_profile = str(_cfg_first(self.cfg, [("encoder", "profile"), ("profile",)], default="main"))
         enc_qp = int(_cfg_first(self.cfg, [("encoder", "qp"), ("qp",)], default=23))
-        # Encoder always expects BGRA surfaces (ARGB in PyNvVideoCodec terms) in this project.
-        # The Encoder implementation enforces that internally.
         enc_container = _cfg_first(self.cfg, [("encoder", "container"), ("container",)], default=None)
 
         encoder = Encoder(
@@ -309,6 +321,9 @@ class Pipeline:
 
                 frames_done += len(frames)
                 frame_num_base += len(frames)
+                if pbar:
+                    pbar.update(len(frames))
+
                 continue
 
             # --- Clip-mode: buffer frames + track + restore completed clips ---
@@ -391,6 +406,8 @@ class Pipeline:
 
             frames_done += len(frames)
             frame_num_base += len(frames)
+            if pbar:
+                pbar.update(len(frames))
 
             # Drain only frames that are definitely no longer part of any active (unfinished) scene.
             safe_before = tracker.min_active_start()
@@ -433,6 +450,9 @@ class Pipeline:
                 t_restore_total += (tr1 - tr0)
 
             drain_ready(frame_num_base)
+
+            if pbar:
+                pbar.close()
 
         # IMPORTANT: Encoder.close() does not flush tail packets; flush explicitly.
         encoder.flush()

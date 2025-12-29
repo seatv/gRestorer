@@ -24,6 +24,10 @@ from typing import Any, Iterable, Optional
 import subprocess
 
 import PyNvVideoCodec as nvc
+from fractions import Fraction
+
+from gRestorer.video.video_utils import probe_format_duration_seconds
+
 
 
 def _infer_container(output_path: str | Path) -> Optional[str]:
@@ -204,34 +208,46 @@ class Encoder:
 
     def _remux_with_ffmpeg(self, input_path: str | None = None) -> None:
         """
-        Remux raw HEVC bitstream (.hevc) into a playable MP4 container.
-        Optionally copies audio and subtitle tracks from the original input.
+        Remux raw H.264/HEVC elementary stream into MP4/MKV.
+        Copies audio/subs from the original input if provided.
+        Synthesizes CFR timestamps using the input video's avg_frame_rate (rational).
         """
-        import subprocess
         from pathlib import Path
         import shlex
 
-        hevc_path = Path(self.output_path).with_suffix(".mp4.hevc")
-        mp4_path = Path(self.output_path)
+        raw_path = Path(self._raw_path)
+        out_path = Path(self.output_path)
         input_video = Path(input_path) if input_path else None
 
-        if not hevc_path.exists():
-            print(f"[Encoder] Remux skipped: {hevc_path} not found")
+        if not raw_path.exists():
+            print(f"[Encoder] Remux skipped: {raw_path} not found")
             return
 
+        input_fmt = _ffmpeg_input_format(self.codec)
+
+        # CRITICAL: Use exact rational avg_frame_rate from the source container
+        fps_r = f"{self.fps:g}"
+        if input_video and input_video.exists():
+            try:
+                dur = probe_format_duration_seconds(str(input_video))
+                if dur > 0 and self._frames_encoded > 0:
+                    fr = (Fraction(self._frames_encoded, 1) / Fraction.from_float(dur)).limit_denominator(100000)
+                    fps_r = f"{fr.numerator}/{fr.denominator}"
+            except Exception as e:
+                print(f"[Encoder] WARN: duration probe failed; using encoder fps={self.fps:g}: {e}")
+
         cmd = [
-            "ffmpeg",
+            self.ffmpeg_path,
             "-hide_banner",
             "-y",
             "-loglevel", "error",
             "-fflags", "+genpts",
-            "-r", str(self.fps),
-            "-f", "hevc",
-            "-i", str(hevc_path),
+            "-r", str(fps_r),
+            "-f", input_fmt,
+            "-i", str(raw_path),
         ]
 
         if input_video and input_video.exists():
-            # Add original input as second input to copy its audio/subs
             cmd += ["-i", str(input_video)]
             cmd += [
                 "-map", "0:v:0", "-c:v", "copy",
@@ -239,14 +255,13 @@ class Encoder:
                 "-map", "1:s?", "-c:s", "copy",
             ]
         else:
-            # Video-only (no audio input)
             cmd += ["-an", "-c:v", "copy"]
 
-        cmd += [
-            "-movflags", "+faststart",
-            "-video_track_timescale", "90000",
-            str(mp4_path),
-        ]
+        # Container-specific flags
+        if self.container == "mp4":
+            cmd += ["-movflags", "+faststart", "-video_track_timescale", "90000"]
+
+        cmd += [str(out_path)]
 
         print("[Encoder] Remux:", " ".join(shlex.quote(x) for x in cmd))
 
@@ -254,12 +269,13 @@ class Encoder:
             subprocess.run(cmd, check=True)
         except subprocess.CalledProcessError as e:
             print(f"[Encoder] Remux failed: {e}")
-        else:
-            # Clean up the raw HEVC if remux succeeded
-            try:
-                hevc_path.unlink()
-            except OSError:
-                pass
+            return
+
+        # Clean up raw bitstream if remux succeeded
+        try:
+            raw_path.unlink()
+        except OSError:
+            pass
 
     def close(self) -> None:
         # Ensure trailer bytes are written
