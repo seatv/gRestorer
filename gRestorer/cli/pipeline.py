@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -118,6 +119,8 @@ class Pipeline:
     def run(self) -> None:
         #Let us initialize the timer
         t_start = time.perf_counter()
+        start_wall = datetime.now()
+        start_perf = time.perf_counter()
 
         # Decoder
         decoder = Decoder(self.input_path, batch_size=self.batch_size, gpu_id=self.gpu_id)
@@ -484,7 +487,6 @@ class Pipeline:
         mux_time = max(0.0, t_total - t_processing)
         print(f"[Pipeline] Total time (with mux) = {t_total:.2f}s " f"(mux={mux_time:.2f}s)")
         print( f"[Pipeline] DONE: Processed  &  Remuxed {frames_done} frames" )
-
         # --- Detector summary (for tuning sweeps) ---
         if detector is not None:
             frame_area = float(width * height) if frames_done > 0 else 0.0
@@ -503,5 +505,13 @@ class Pipeline:
                 f"total_boxes={total_boxes} "
                 f"avg_roi_area_px={avg_roi_px:.2f} ({avg_roi_pct:.4f}% of frame)"
             )
+        #Output the total duration
+        end_wall = datetime.now()
+        end_perf = time.perf_counter()
+        print(f"[Pipeline] Wall clock: start={start_wall.isoformat(sep=' ', timespec='seconds')} "
+              f"end={end_wall.isoformat(sep=' ', timespec='seconds')} "
+              f"elapsed={(end_wall - start_wall)}")
+        print(f"[Pipeline] perf_counter elapsed = {end_perf - start_perf:.2f}s")
+
 
 
