@@ -1,466 +1,335 @@
-# gRestorer/detector/yolo.py
-# Lada-style YOLO segmentation detector with proper letterbox/unpad handling.
-
-
-# TODO(GPU): Current preprocess path forces CPU:
-#  - frames are converted to CPU uint8
-#  - letterbox uses NumPy
-#  - outputs (boxes/masks) are CPU tensors
-# Later: implement torch-only letterbox on GPU + keep outputs on GPU to remove the CPU hop.
-
-
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+"""
+GPU-first YOLO-seg mosaic detector for Ultralytics 8.3.243+.
 
-import numpy as np
+Pinned API expectations (validated by your probe):
+- non_max_suppression: ultralytics.utils.nms
+- process_mask/scale_boxes: ultralytics.utils.ops
+
+Contract:
+- infer_batch() expects a list of RGB frames:
+    torch.Tensor[H, W, 3], dtype=uint8, values 0..255
+  (float [0,1] accepted, converted on-device)
+- Preprocess + inference + mask generation stay on the inference device
+  (CUDA/XPU preferred). We only copy *small* outputs (boxes/scores/classes) to CPU.
+"""
+
+import os
+import time
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
 import torch
 import torch.nn.functional as F
-from ultralytics import YOLO
-from ultralytics.cfg import get_cfg
-from ultralytics.engine.results import Results
+
 from ultralytics.nn.autobackend import AutoBackend
-from ultralytics.utils import DEFAULT_CFG, nms, ops
 from ultralytics.utils.checks import check_imgsz
-from ultralytics.data.augment import LetterBox
+from ultralytics.utils import ops
+from ultralytics.utils.nms import non_max_suppression  # <- 8.3.243 puts NMS here
 
 
 @dataclass
 class FrameDetections:
+    """Detections for a single frame.
+
+    - boxes/scores/classes are CPU tensors (cheap, small copies)
+    - masks are uint8 [N,H,W] on inference device by default (optional CPU)
     """
-    Per-frame detection results from the mosaic detector.
 
-    All tensors are on CPU.
-
-    boxes_xyxy: [N, 4] float32 (x1, y1, x2, y2) in original image coordinates.
-    scores:     [N]     float32 confidence scores.
-    classes:    [N]     int64 class indices.
-    masks:      [N, H, W] uint8 binary masks in original HxW (0 or 255).
-    """
-    boxes_xyxy: Optional[torch.Tensor]
-    scores: Optional[torch.Tensor]
-    classes: Optional[torch.Tensor]
-    masks: Optional[torch.Tensor]
+    boxes_xyxy: Optional[torch.Tensor] = None  # CPU float32 [N,4] xyxy
+    scores: Optional[torch.Tensor] = None      # CPU float32 [N]
+    classes: Optional[torch.Tensor] = None     # CPU int64   [N]
+    masks: Optional[torch.Tensor] = None       # uint8 [N,H,W] on inference device (or CPU)
+    orig_size: Optional[Tuple[int, int]] = None  # (W,H)
 
 
-def _scale_and_unpad_image(masks: torch.Tensor, im0_shape: Tuple[int, int, int]) -> torch.Tensor:
-    """
-    Port of Lada's scale_and_unpad_image (torch version).
+@dataclass(frozen=True)
+class _LetterboxMeta:
+    orig_hw: Tuple[int, int]                   # (H,W)
+    lb_hw: Tuple[int, int]                     # (H,W) after resize+pad
+    new_unpad_hw: Tuple[int, int]              # (H,W) resized (no pad)
+    pad_tlbr: Tuple[int, int, int, int]        # (top, left, bottom, right)
 
-    masks: [H1, W1, C] uint8/float tensor in letterboxed coordinates
-    im0_shape: original image shape (H0, W0, C0)
-    """
-    h0, w0 = im0_shape[:2]
-    h1, w1, _ = masks.shape
 
-    if h1 == h0 and w1 == w0:
-        return masks
+def _to_u8(frame_rgb: torch.Tensor) -> torch.Tensor:
+    """Convert an RGB frame to uint8 on the same device."""
+    if frame_rgb.dtype == torch.uint8:
+        return frame_rgb
+    if frame_rgb.is_floating_point():
+        # Assume float is [0,1]. Avoid sync-heavy range probes.
+        return (frame_rgb * 255.0).clamp(0, 255).to(torch.uint8)
+    return frame_rgb.to(torch.uint8)
 
-    g = min(h1 / h0, w1 / w0)
-    pw, ph = (w1 - w0 * g) / 2, (h1 - h0 * g) / 2
 
-    # same rounding trick as Lada
-    t = round(ph - 0.1)
-    l = round(pw - 0.1)
-    b = h1 - round(ph + 0.1)
-    r = w1 - round(pw + 0.1)
+def _stride_value(stride) -> int:
+    """AutoBackend.stride can be int, list, tuple, tensor; normalize to int."""
+    try:
+        if isinstance(stride, (list, tuple)):
+            return int(max(stride))
+        if hasattr(stride, "max"):
+            return int(stride.max())
+        return int(stride)
+    except Exception:
+        return 32
 
-    # crop out the letterboxed region
-    x = masks[t:b, l:r].permute(2, 0, 1).unsqueeze(0).float()
-    y = F.interpolate(x, size=(h0, w0), mode="bilinear", align_corners=False)
-    return (
-        y.squeeze(0)
-        .permute(1, 2, 0)
-        .round_()
-        .clamp_(0, 255)
-        .to(masks.dtype)
+
+def _compute_letterbox_meta(
+    orig_hw: Tuple[int, int],
+    new_shape: Tuple[int, int],
+    stride: int = 32,
+) -> _LetterboxMeta:
+    """Ultralytics-style letterbox geometry (auto=True behavior)."""
+    h, w = orig_hw
+    new_h, new_w = new_shape
+
+    r = min(new_h / h, new_w / w)
+    new_unpad_w = int(round(w * r))
+    new_unpad_h = int(round(h * r))
+
+    dw = new_w - new_unpad_w
+    dh = new_h - new_unpad_h
+
+    # Ultralytics letterbox(auto=True) uses mod stride padding.
+    dw = int(dw % stride)
+    dh = int(dh % stride)
+
+    left = dw // 2
+    right = dw - left
+    top = dh // 2
+    bottom = dh - top
+
+    lb_h = new_unpad_h + top + bottom
+    lb_w = new_unpad_w + left + right
+
+    return _LetterboxMeta(
+        orig_hw=(h, w),
+        lb_hw=(lb_h, lb_w),
+        new_unpad_hw=(new_unpad_h, new_unpad_w),
+        pad_tlbr=(top, left, bottom, right),
     )
 
 
-def _to_mask_img_tensor(masks: torch.Tensor, class_val: int = 0, pixel_val: int = 255) -> torch.Tensor:
-    """
-    Port of Lada's _to_mask_img_tensor for a single Ultralytics Masks.data tensor.
+def _letterbox_bchw(img_bchw: torch.Tensor, meta: _LetterboxMeta) -> torch.Tensor:
+    """Resize + pad BCHW float image to letterboxed size."""
+    new_unpad_h, new_unpad_w = meta.new_unpad_hw
+    top, left, bottom, right = meta.pad_tlbr
 
-    masks: [1, H, W] or [H, W] tensor
-    """
-    if masks.ndim == 2:
-        masks_tensor = masks
-    else:
-        # [1, H, W] -> [H, W]
-        masks_tensor = masks[0]
-    masks_tensor = torch.where(masks_tensor != class_val, pixel_val, 0).to(torch.uint8)
-    return masks_tensor
+    if img_bchw.shape[-2:] != (new_unpad_h, new_unpad_w):
+        img_bchw = F.interpolate(
+            img_bchw,
+            size=(new_unpad_h, new_unpad_w),
+            mode="bilinear",
+            align_corners=False,
+        )
 
+    if any((top, left, bottom, right)):
+        pad_val = 114.0 / 255.0
+        img_bchw = F.pad(img_bchw, (left, right, top, bottom), value=pad_val)
 
-def _convert_yolo_mask_tensor(yolo_mask, img_shape: Tuple[int, int, int]) -> torch.Tensor:
-    """
-    Port of Lada's convert_yolo_mask_tensor (torch version),
-    adapted to always return a [H, W, 1] uint8 tensor on CPU.
-
-    yolo_mask: ultralytics.engine.results.Masks (single instance via __getitem__)
-    img_shape: original image shape (H, W, C)
-    """
-    # yolo_mask.data is typically [1, h1, w1]
-    mask_img = _to_mask_img_tensor(yolo_mask.data)
-    if mask_img.ndim == 2:
-        mask_img = mask_img.unsqueeze(-1)  # [H1, W1, 1]
-
-    mask_img = _scale_and_unpad_image(mask_img, img_shape)
-    mask_img = torch.where(mask_img > 127, 255, 0).to(torch.uint8)
-    assert mask_img.ndim == 3 and mask_img.shape[2] == 1
-    return mask_img  # [H, W, 1]
+    return img_bchw
 
 
-def _convert_yolo_box_xyxy(yolo_box, img_shape: Tuple[int, int, int]) -> Tuple[int, int, int, int]:
-    """
-    Lada-style box clipping, but we return XYXY instead of (t,l,b,r).
+def _unletterbox_masks(masks_nhw: torch.Tensor, meta: _LetterboxMeta) -> torch.Tensor:
+    """Crop padding and scale masks back to original H,W (float)."""
+    top, left, bottom, right = meta.pad_tlbr
+    new_unpad_h, new_unpad_w = meta.new_unpad_hw
+    orig_h, orig_w = meta.orig_hw
 
-    yolo_box: an element of res.boxes (Ultralytics Boxes)
-    img_shape: (H, W, C)
-    """
-    h, w = img_shape[0], img_shape[1]
-    _box = yolo_box  # tensor [4]
+    if any((top, left, bottom, right)):
+        masks_nhw = masks_nhw[:, top : top + new_unpad_h, left : left + new_unpad_w]
 
-    x1 = int(torch.clip(_box[0], 0, w).item())
-    y1 = int(torch.clip(_box[1], 0, h).item())
-    x2 = int(torch.clip(_box[2], 0, w).item())
-    y2 = int(torch.clip(_box[3], 0, h).item())
-    return x1, y1, x2, y2
+    if masks_nhw.shape[-2:] != (orig_h, orig_w):
+        # interpolate doesn't support bilinear for uint8/bool; masks should be resized with nearest anyway
+        if masks_nhw.dtype in (torch.uint8, torch.bool):
+            masks_nhw = masks_nhw.to(torch.float32)
+        masks_nhw = F.interpolate(
+            masks_nhw.unsqueeze(1),
+            size=(orig_h, orig_w),
+            mode="nearest",
+        ).squeeze(1)
+
+    return masks_nhw
 
 
-class YoloSegmentationModel:
-    """
-    Port of Lada's Yolo11SegmentationModel, CPU-letterbox + AutoBackend.
-
-    We always do letterboxing on CPU (like Lada's default VideoReader path),
-    but run the network itself on the requested device (CUDA or CPU).
-    """
+class MosaicDetectionModel:
+    """YOLO segmentation wrapper with torch-letterbox + GPU-first behavior."""
 
     def __init__(
         self,
         model_path: str,
         device: str,
         imgsz: int = 640,
-        fp16: bool = False,
+        fp16: bool = True,
         conf: float = 0.25,
         iou: float = 0.45,
-        classes: Optional[Sequence[int]] = None,
-        agnostic_nms: bool = False,
+        classes=None,
         max_det: int = 300,
     ) -> None:
-        yolo_model = YOLO(model_path)
-        assert yolo_model.task == "segment", f"Model '{model_path}' is not a segmentation model"
+        self.device = torch.device(device)
 
-        self.stride = 32
-        self.imgsz = check_imgsz(imgsz, stride=self.stride, min_dim=2)
-        self.letterbox = LetterBox(self.imgsz, auto=True, stride=self.stride)
+        self.fp16 = bool(fp16)
+        self.debug = os.environ.get("GRESTORER_DET_DEBUG", "0") == "1"
+        self.gpu_only = os.environ.get("GRESTORER_DET_GPU_ONLY", "0") == "1"
+        self.output_masks_device = os.environ.get("GRESTORER_DET_MASKS", "gpu").lower().strip()
+        if self.output_masks_device not in ("gpu", "cpu"):
+            self.output_masks_device = "gpu"
 
-        custom = {
-            "conf": conf,
-            "iou": iou,
-            "classes": classes,
-            "agnostic_nms": agnostic_nms,
-            "max_det": max_det,
-            "batch": 1,
-            "save": False,
-            "mode": "predict",
-            "device": device,
-            "half": fp16,
-        }
-        args = {**yolo_model.overrides, **custom}
-        self.args = get_cfg(DEFAULT_CFG, args)
-
-        self.device: torch.device = torch.device(device)
         self.model = AutoBackend(
-            model=yolo_model.model,
+            model=model_path,
             device=self.device,
-            dnn=self.args.dnn,
-            data=self.args.data,
-            fp16=self.args.half,
+            fp16=self.fp16,
             fuse=True,
             verbose=False,
         )
-        self.args.half = self.model.fp16
         self.model.eval()
-        self.model.warmup(imgsz=(1, 3, *self.imgsz))
-        self.dtype = torch.float16 if fp16 else torch.float32
 
-        print(
-            f"[YOLO] Loaded seg model on {self.device}, "
-            f"imgsz={self.imgsz}, conf={conf}, iou={iou}, fp16={fp16}"
-        )
+        self.stride = _stride_value(getattr(self.model, "stride", 32))
+        self.imgsz = check_imgsz(imgsz, stride=self.stride, min_dim=2)
 
-    def preprocess(self, imgs: List[torch.Tensor]) -> torch.Tensor:
-        """
-        imgs: list of [H, W, 3] uint8 CPU tensors, BGR order.
-
-        Returns: [B, 3, H_lb, W_lb] uint8 letterboxed tensor on CPU.
-        """
-        # LetterBox expects numpy HWC uint8
-        im = np.stack([self.letterbox(image=x.numpy()) for x in imgs])
-        im = im.transpose((0, 3, 1, 2))  # BHWC -> BCHW
-        im = np.ascontiguousarray(im)
-        return torch.from_numpy(im)
-
-    def inference_and_postprocess(
-        self,
-        imgs: torch.Tensor,
-        orig_imgs: List[torch.Tensor],
-    ) -> List[Results]:
-        """
-        imgs: [B, 3, H_lb, W_lb] uint8 CPU
-        orig_imgs: list of [H, W, 3] uint8 CPU tensors (BGR)
-        """
-        with torch.inference_mode():
-            x = imgs.to(device=self.device).to(dtype=self.dtype).div_(255.0)
-            preds = self.model(x, augment=False, visualize=False, embed=None)
-            return self._postprocess(preds, x, orig_imgs)
-
-    def _postprocess(
-        self,
-        preds,
-        img: torch.Tensor,
-        orig_imgs: List[torch.Tensor],
-    ) -> List[Results]:
-        # protos: segmentation prototypes
-        protos = preds[1][-1]
-
-        preds = nms.non_max_suppression(
-            preds,
-            self.args.conf,
-            self.args.iou,
-            self.args.classes,
-            self.args.agnostic_nms,
-            max_det=self.args.max_det,
-            nc=len(self.model.names),
-            end2end=getattr(self.model, "end2end", False),
-        )
-
-        return [
-            self._construct_result(pred, img, orig_img, proto)
-            for pred, orig_img, proto in zip(preds, orig_imgs, protos)
-        ]
-
-    def _construct_result(
-        self,
-        preds: torch.Tensor,
-        img: torch.Tensor,
-        orig_img: torch.Tensor,
-        proto: torch.Tensor,
-    ) -> Results:
-        """
-        preds: [N, 6 + num_masks] after NMS
-        img:   network input (BCHW) tensor
-        orig_img: [H, W, 3] uint8 CPU tensor (BGR)
-        proto: prototypes tensor
-        """
-        if not len(preds):  # no detections
-            masks = None
-        else:
-            # HWC masks in letterboxed coordinates
-            masks = ops.process_mask(proto, preds[:, 6:], preds[:, :4], img.shape[2:], upsample=True)
-            # scale boxes back to original image shape
-            preds[:, :4] = ops.scale_boxes(img.shape[2:], preds[:, :4], orig_img.shape)
-
-        if masks is not None:
-            # Drop predictions whose masks are entirely zero
-            keep = masks.sum((-2, -1)) > 0
-            preds, masks = preds[keep], masks[keep]
-
-        # Results will wrap boxes into ultralytics Boxes, masks into Masks, and keep orig_shape.
-        return Results(
-            orig_img,
-            path="",
-            names=self.model.names,
-            boxes=preds[:, :6].cpu(),
-            masks=masks,
-        )
-
-
-class MosaicDetectionModel:
-    """
-    gRestorer-facing detector that wraps the Lada-style YoloSegmentationModel.
-
-    Contract:
-    - Input frames: [H, W, 3] RGB float32 [0,1], typically on CUDA.
-    - Output: FrameDetections with boxes/masks in original frame coordinates on CPU.
-    """
-
-    def __init__(
-        self,
-        model_path: str,
-        device: str = "cuda:0",
-        imgsz: int = 640,
-        conf: float = 0.25,
-        iou: float = 0.45,
-        classes: Optional[Sequence[int]] = None,
-        fp16: bool = True,
-    ) -> None:
-        self.model_path = model_path
-        self.device = device
-        self.imgsz = imgsz
         self.conf = float(conf)
         self.iou = float(iou)
-        self.classes = list(classes) if classes is not None else None
-        self.fp16 = bool(fp16)
+        self.classes = classes
+        self.max_det = int(max_det)
 
-        print(f"[Detector] Initializing YOLO model...")
-        self.seg = YoloSegmentationModel(
-            model_path=model_path,
-            device=device,
-            imgsz=imgsz,
-            fp16=fp16,
-            conf=conf,
-            iou=iou,
-            classes=self.classes,
-        )
-        print("[Detector] Ready!")
+        # names is typically dict[int->str] or list
+        self.nc = len(self.model.names)
 
-    @staticmethod
-    def _to_uint8_cpu(frame: torch.Tensor) -> torch.Tensor:
-        """
-        Convert [H, W, 3] BGR tensor (float [0,1] or uint8) on any device
-        to a CPU uint8 BGR tensor.
-        
-        NOTE: Expects BGR input (no color conversion).
-        """
-        if frame.ndim != 3 or frame.shape[-1] != 3:
-            raise ValueError(f"Expected [H, W, 3] frame, got shape={tuple(frame.shape)}")
+        # dtype: fp16 only on cuda/xpu
+        self.dtype = torch.float16 if (self.fp16 and self.device.type in ("cuda", "xpu")) else torch.float32
 
-        if frame.dtype in (torch.float16, torch.float32):
-            f = frame.clamp(0.0, 1.0).mul(255.0).round()
-            frame_u8 = f.to(torch.uint8)
-        elif frame.dtype == torch.uint8:
-            frame_u8 = frame
-        else:
-            raise TypeError(f"Unsupported frame dtype for detector: {frame.dtype}")
+        # Warmup
+        with torch.inference_mode():
+            _ = self.model(torch.zeros((1, 3, self.imgsz[0], self.imgsz[1]), device=self.device, dtype=self.dtype))
 
-        # Move to CPU
-        if frame_u8.device.type != "cpu":
-            frame_u8 = frame_u8.cpu()
+        if self.debug:
+            print(f"[YOLO] device={self.device} imgsz={self.imgsz} stride={self.stride} fp16={self.fp16} masks={self.output_masks_device}")
 
-        return frame_u8
-
-    @torch.no_grad()
-    def infer_batch(self, frames: List[torch.Tensor]) -> List[FrameDetections]:
-        """
-        frames: list of [H, W, 3] BGR float32 [0,1] tensors (typically on CUDA).
-
-        Returns: list of FrameDetections, one per frame.
-        """
-        if not frames:
+    def infer_batch(self, frames_rgb: List[torch.Tensor]) -> List[FrameDetections]:
+        if not frames_rgb:
             return []
 
-        # Prepare CPU BGR uint8 inputs
-        imgs_bgr: List[torch.Tensor] = []
-        for f in frames:
-            img_bgr = self._to_uint8_cpu(f)
-            imgs_bgr.append(img_bgr)
+        dev_in = frames_rgb[0].device
+        if self.gpu_only and dev_in.type == "cpu":
+            raise RuntimeError("GRESTORER_DET_GPU_ONLY=1 but detector received CPU frames")
 
-        # Preprocess (letterbox) on CPU
-        im_batch = self.seg.preprocess(imgs_bgr)
+        # Convert to uint8 on-device
+        frames_u8 = [_to_u8(f) for f in frames_rgb]
 
-        # Run network on requested device
-        results: List[Results] = self.seg.inference_and_postprocess(im_batch, imgs_bgr)
+        f0 = frames_u8[0]
+        b = len(frames_u8)
 
-        outputs: List[FrameDetections] = []
+        if f0.ndim != 3:
+            raise RuntimeError(f"Expected 3D frame tensor, got shape={tuple(f0.shape)}")
 
-        for idx, res in enumerate(results):
-            # No detections for this frame
-            if res.boxes is None or res.boxes.data.numel() == 0:
-                outputs.append(
-                    FrameDetections(
-                        boxes_xyxy=None,
-                        scores=None,
-                        classes=None,
-                        masks=None,
-                    )
-                )
+        # Accept either HWC (H,W,3) or CHW (3,H,W).
+        if f0.shape[-1] == 3:
+            # HWC
+            h, w = int(f0.shape[0]), int(f0.shape[1])
+            batch = torch.stack(frames_u8, dim=0)  # [B,H,W,3]
+            batch = batch.permute(0, 3, 1, 2).contiguous()  # [B,3,H,W]
+        elif f0.shape[0] == 3:
+            # CHW
+            h, w = int(f0.shape[1]), int(f0.shape[2])
+            batch = torch.stack(frames_u8, dim=0).contiguous()  # [B,3,H,W]
+        else:
+            raise RuntimeError(
+                f"Unsupported frame layout, expected HWC[...,3] or CHW[3,...], got shape={tuple(f0.shape)}"
+            )
+
+        x = batch.to(dtype=self.dtype) / 255.0
+        if self.debug:
+            layout = "HWC" if f0.shape[-1] == 3 else "CHW"
+            print(f"[DetYOLO] input_layout={layout} frame_shape={tuple(f0.shape)}")
+
+        # Move to model device if needed
+        if x.device != self.device:
+            x = x.to(self.device, non_blocking=True)
+
+        meta = _compute_letterbox_meta((h, w), (int(self.imgsz[0]), int(self.imgsz[1])), stride=self.stride)
+        x = _letterbox_bchw(x, meta)
+
+        if self.debug:
+            t0 = time.perf_counter()
+
+        with torch.inference_mode():
+            out = self.model(x)
+
+            # Seg models typically return (pred, proto) or [pred, proto]
+            if isinstance(out, (list, tuple)) and len(out) >= 2:
+                pred_logits = out[0]
+                protos = out[1]
+                if isinstance(protos, (list, tuple)):
+                    protos = protos[-1]
+            else:
+                raise RuntimeError("YOLO model output did not include protos (segmentation). Check weights/model type.")
+
+            # Ultralytics 8.3.243 NMS is in ultralytics.utils.nms and does not take `nm`,
+            # it infers extra dims from `nc` (see docs).
+            preds = non_max_suppression(
+                pred_logits,
+                conf_thres=self.conf,
+                iou_thres=self.iou,
+                classes=self.classes,
+                agnostic=False,
+                max_det=self.max_det,
+                nc=self.nc,
+                end2end=getattr(self.model, "end2end", False),
+            )
+
+        dets: List[FrameDetections] = []
+        for i, pred in enumerate(preds):
+            if pred is None or not len(pred):
+                dets.append(FrameDetections(orig_size=(w, h)))
                 continue
 
-            H0, W0 = res.orig_shape[:2]
+            # Defensive clones: some Ultralytics utilities do in-place ops on their inputs
+            mask_coeff = pred[:, 6:].detach()
+            boxes_for_mask = pred[:, :4].detach().clone()
+            masks_lb = ops.process_mask(protos[i], mask_coeff, boxes_for_mask, x.shape[2:], upsample=True)
 
-            boxes_xyxy_list: List[Tuple[int, int, int, int]] = []
-            scores_list: List[float] = []
-            classes_list: List[int] = []
-            masks_list: List[torch.Tensor] = []
+            # Scale boxes from letterbox to original
+            # ops.scale_boxes() does in-place math; clone to avoid inference-tensor restrictions
+            boxes_in = pred[:, :4].detach().clone()
+            boxes = ops.scale_boxes(x.shape[2:], boxes_in, (h, w, 3))
 
-            num_boxes = len(res.boxes)
-            for i in range(num_boxes):
-                # Box with Lada's clipping logic
-                xyxy = _convert_yolo_box_xyxy(res.boxes[i].xyxy[0], (H0, W0, 3))
-                boxes_xyxy_list.append(xyxy)
+            keep = masks_lb.sum((-2, -1)) > 0
+            if not bool(keep.any()):
+                dets.append(FrameDetections(orig_size=(w, h)))
+                continue
 
-                # Conf / class from Boxes
-                scores_list.append(float(res.boxes.conf[i].item()))
-                classes_list.append(int(res.boxes.cls[i].item()))
+            pred = pred[keep]
+            boxes = boxes[keep]
+            masks_lb = masks_lb[keep]
 
-                # Full-res mask via Lada's scale_and_unpad_image
-                if res.masks is not None:
-                    mask_img = _convert_yolo_mask_tensor(res.masks[i], (H0, W0, 3))
-                    # [H, W, 1] -> [H, W]
-                    masks_list.append(mask_img[..., 0])
+            masks_full = _unletterbox_masks(masks_lb, meta)
+            masks_u8 = (masks_full > 0.5).to(torch.uint8) * 255
 
-            boxes_xyxy = torch.tensor(boxes_xyxy_list, dtype=torch.float32)
-            scores = torch.tensor(scores_list, dtype=torch.float32)
-            classes = torch.tensor(classes_list, dtype=torch.int64)
+            if self.output_masks_device == "cpu":
+                masks_u8 = masks_u8.cpu()
 
-            masks_tensor: Optional[torch.Tensor]
-            if masks_list:
-                masks_tensor = torch.stack(masks_list, dim=0)  # [N, H, W] uint8
-            else:
-                masks_tensor = None
+            # Small outputs to CPU (avoid per-element .item() GPU syncs)
+            boxes_cpu = boxes.detach().to(torch.float32).cpu()
+            scores_cpu = pred[:, 4].detach().to(torch.float32).cpu()
+            classes_cpu = pred[:, 5].detach().to(torch.int64).cpu()
 
-            outputs.append(
+            dets.append(
                 FrameDetections(
-                    boxes_xyxy=boxes_xyxy,
-                    scores=scores,
-                    classes=classes,
-                    masks=masks_tensor,
+                    boxes_xyxy=boxes_cpu,
+                    scores=scores_cpu,
+                    classes=classes_cpu,
+                    masks=masks_u8,
+                    orig_size=(w, h),
                 )
             )
 
-        return outputs
+        if self.debug:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(device=self.device)
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            print(
+                f"[DetYOLO] batch={b} frame={w}x{h} dev_in={dev_in.type} dev_model={self.device.type} "
+                f"lb={meta.lb_hw[1]}x{meta.lb_hw[0]} masks={self.output_masks_device} total={dt_ms:.2f}ms"
+            )
 
-# ---------------------------------------------------------------------------
-# Compatibility wrapper (pipeline expects this symbol)
-# ---------------------------------------------------------------------------
-
-class YoloMosaicDetector:
-    """
-    Backwards/compat wrapper so older/newer pipeline variants can do:
-
-        from gRestorer.detector.yolo import YoloMosaicDetector
-
-    Internally we delegate to gRestorer.detector.core.Detector.
-    Local import avoids circular-import issues (core.py imports yolo.py).
-    """
-
-    def __init__(
-        self,
-        model_path: str,
-        device: str = "cuda:0",
-        debug: bool = False,
-        imgsz: int = 640,
-        conf_thres: float = 0.25,
-        iou_thres: float = 0.45,
-        classes=None,
-        fp16: bool = True,
-        **kwargs,
-    ) -> None:
-        from .core import Detector  # local import to avoid import cycles
-
-        self._impl = Detector(
-            model_path=model_path,
-            device=device,
-            imgsz=imgsz,
-            conf_thres=conf_thres,
-            iou_thres=iou_thres,
-            classes=classes,
-            fp16=fp16,
-        )
-        self.debug = debug  # kept only for signature compatibility
-
-    def detect_batch(self, frames):
-        return self._impl.detect_batch(frames)
+        return dets

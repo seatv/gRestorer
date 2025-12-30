@@ -20,7 +20,7 @@
     "codec": "hevc",
     "preset": "P7",
     "profile": "main",
-    "qp": 23,
+    "qp": 20,
     "format": "ARGB",
     "gpu_id": 0,
 	"sync_before_encode": true

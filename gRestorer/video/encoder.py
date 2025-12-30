@@ -89,7 +89,7 @@ class Encoder:
         codec: str = "hevc",
         preset: str = "P7",
         profile: str = "main",
-        qp: int = 23,
+        qp: int = 20,
         gpu_id: int = 0,
         container: str | None = None,
         bframes: int = 0,

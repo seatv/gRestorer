@@ -294,7 +294,7 @@ class Pipeline:
             detections: Optional[List[Detection]] = None
             if detector is not None:
                 td0 = time.perf_counter()
-                detections = detector.detect_batch(bgr_list)
+                detections = detector.detect_batch(rgb_list)
                 td1 = time.perf_counter()
                 t_det_total += (td1 - td0)
 
