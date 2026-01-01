@@ -2,234 +2,310 @@
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence, Tuple
 
 from gRestorer.utils.config_util import Config
 
 
+def _parse_rgb_triplet(s: str) -> Tuple[int, int, int]:
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("Expected R,G,B (three comma-separated ints)")
+    try:
+        r, g, b = (int(parts[0]), int(parts[1]), int(parts[2]))
+    except Exception as e:
+        raise argparse.ArgumentTypeError(f"Invalid R,G,B triplet: {s!r}") from e
+    for v in (r, g, b):
+        if v < 0 or v > 255:
+            raise argparse.ArgumentTypeError("Color values must be 0..255")
+    return r, g, b
+
+
+def _parse_ext_list(s: str) -> list[str]:
+    # ".mp4,.mkv" -> [".mp4",".mkv"]
+    out: list[str] = []
+    for p in s.split(","):
+        p = p.strip()
+        if not p:
+            continue
+        if not p.startswith("."):
+            p = "." + p
+        out.append(p.lower())
+    return out
+
+
+def _default_config_path() -> Optional[Path]:
+    """
+    Pick a sane default config.json path:
+      1) ./config.json (cwd)
+      2) repo-root-relative to this file: <...>/gRestorer/config.json
+    """
+    cwd = Path.cwd() / "config.json"
+    if cwd.exists():
+        return cwd
+
+    # gRestorer/gRestorer/cli/config.py -> parents[2] is repo root "gRestorer"
+    here = Path(__file__).resolve()
+    for up in (2, 3, 1):
+        try:
+            candidate = here.parents[up] / "config.json"
+            if candidate.exists():
+                return candidate
+        except Exception:
+            pass
+    return None
+
+
 def create_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="gRestorer", description="GPU video pipeline: decode -> detect -> restore -> encode")
+    p = argparse.ArgumentParser(prog="gRestorer", description="GPU-centric video mosaic remover")
 
-    # Core
-    p.add_argument("--input", dest="input_path", required=True, help="Input video path")
-    p.add_argument("--output", dest="output_path", required=True, help="Output video path")
-    default_cfg = Path("config.json")
-    p.add_argument("--config", dest="config_path", default=str(default_cfg) if default_cfg.is_file() else None, help="Config path (defaults to ./config.json if present)")
+    # Required I/O
+    p.add_argument("--input", required=True, help="Input video file")
+    p.add_argument("--output", required=True, help="Output video file")
 
-    # Runtime / perf
-    p.add_argument("--gpu-id", dest="gpu_id", type=int, default=None)
-    p.add_argument("--batch-size", dest="batch_size", type=int, default=None)
-    p.add_argument("--max-frames", dest="max_frames", type=int, default=None)
-    p.add_argument("--debug", dest="debug", action="store_true", default=None)
+    # Config + high-level mode
+    p.add_argument("--config", default=None, help="Path to config.json (defaults to nearest config.json)")
+    p.add_argument(
+        "--mode",
+        choices=["real", "pseudo", "none"],
+        default=None,
+        help="real=restore, pseudo=overlay, none=passthrough",
+    )
+    p.add_argument(
+        "--restorer",
+        choices=["basicvsrpp", "pseudo", "none"],
+        default=None,
+        help="Restorer backend (default: basicvsrpp)",
+    )
 
-    # Timing (ok if pipeline ignores it)
-    p.add_argument("--profile-sync", dest="profile_sync", action="store_true", default=None)
+    p.add_argument("--max-frames", type=int, default=None, help="Process at most N frames (debug)")
 
-    # Scene tracking / clip mask fidelity
+    # GPU selection (applies to decoder/encoder unless overridden)
+    p.add_argument("--gpu-id", type=int, default=None, help="GPU index (decoder/encoder/inference)")
+
+    # --- Root knobs ---
+    p.add_argument("--roi-dilate", type=int, default=None, help="Dilate detected ROIs by N pixels")
+    p.add_argument("--batch-size", type=int, default=None, help="Decode/processing batch size")
     p.add_argument(
         "--use-seg-masks",
-        dest="use_seg_masks",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=None,
-        help="Use detector segmentation masks for clip compositing (LADA-faithful).",
-    )
-    p.add_argument(
-        "--no-seg-masks",
-        dest="use_seg_masks",
-        action="store_false",
-        default=None,
-        help="Disable segmentation masks; use rectangle box masks only.",
+        help="Use segmentation masks when available",
     )
 
-    # Restorer selection
-    p.add_argument("--restorer", dest="restorer", choices=["none", "pseudo", "pseudo_clip", "grestorer", "basicvsrpp"], default=None)
-    # Clip length (temporal window) for clip-based restorers (pseudo_clip/basicvsrpp)
-    p.add_argument(
-        "--max-clip-length",
-        dest="max_clip_length",
-        type=int,
-        default=None,
-        help="Max frames per clip for clip-based restorers. Maps to restoration.max_clip_length.",
-    )
+    # --- Decoder ---
+    p.add_argument("--dec-gpu-id", type=int, default=None)
+    p.add_argument("--dec-output-format", choices=["RGB", "RGBP"], default=None)
 
+    # --- Encoder ---
+    p.add_argument("--enc-codec", choices=["hevc", "h264"], default=None)
+    p.add_argument("--enc-preset", default=None)
+    p.add_argument("--enc-profile", default=None)
+    p.add_argument("--enc-qp", type=int, default=None)
+    p.add_argument("--enc-format", default=None)
+    p.add_argument("--enc-gpu-id", type=int, default=None)
+    p.add_argument("--enc-sync-before-encode", action=argparse.BooleanOptionalAction, default=None)
 
-    # Restorer model
-    p.add_argument(
-        "--rest-model",
-        dest="rest_model_path",
-        default=None,
-        help="Path to BasicVSR++ checkpoint (.pth). Required for --restorer basicvsrpp",
-    )
+    # --- Detection ---
+    p.add_argument("--det-model", default=None)
+    p.add_argument("--det-batch-size", type=int, default=None)
+    p.add_argument("--det-conf", type=float, default=None)
+    p.add_argument("--det-iou", type=float, default=None)
+    p.add_argument("--det-imgsz", type=int, default=None)
+    p.add_argument("--det-fp16", action=argparse.BooleanOptionalAction, default=None)
 
-    # Restorer perf
-    p.add_argument(
-        "--rest-fp16",
-        dest="rest_fp16",
-        action="store_true",
-        default=None,
-        help="Enable FP16 for restoration (CUDA only).",
-    )
-    p.add_argument(
-        "--no-rest-fp16",
-        dest="rest_fp16",
-        action="store_false",
-        default=None,
-        help="Disable FP16 for restoration.",
-    )
+    # --- Restoration ---
+    p.add_argument("--rest-model", default=None)
+    p.add_argument("--rest-fp16", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--rest-max-clip-length", type=int, default=None)
+    p.add_argument("--rest-clip-size", type=int, default=None)
+    p.add_argument("--rest-border-ratio", type=float, default=None)
+    p.add_argument("--rest-pad-mode", default=None)
+    p.add_argument("--rest-feather-radius", type=int, default=None)
 
-    #Restorer knobs
-    p.add_argument(
-        "--roi-dilate",
-        dest="roi_dilate",
-        type=int,
-        default=None,
-        help="Dilate detected ROI boxes by N pixels (expands restored area).",
-    )
+    # --- Scene tracking (kept for config parity) ---
+    p.add_argument("--trk-min-iou", type=float, default=None)
+    p.add_argument("--trk-max-clip-frames", type=int, default=None)
+    p.add_argument("--trk-min-clip-frames", type=int, default=None)
 
-    # Detector
-    p.add_argument("--det-model", dest="det_model_path", default=None)
-    p.add_argument("--det-conf", dest="det_conf", type=float, default=None)
-    p.add_argument("--det-iou", dest="det_iou", type=float, default=None)
-    p.add_argument("--det-imgsz", dest="det_imgsz", type=int, default=None)
-    p.add_argument("--det-fp16", dest="det_fp16", action="store_true", default=None)
+    # --- Visualization (pseudo / debug overlays) ---
+    p.add_argument("--vis-box-color", type=_parse_rgb_triplet, default=None)
+    p.add_argument("--vis-box-thickness", type=int, default=None)
+    p.add_argument("--vis-show-confidence", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--vis-show-class", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--vis-fill-color", type=_parse_rgb_triplet, default=None)
+    p.add_argument("--vis-fill-opacity", type=float, default=None)
 
-    # Visualization overrides (B,G,R)
-    p.add_argument("--box-color", dest="box_color", default=None, help='B,G,R (e.g. "0,255,0")')
-    p.add_argument("--box-thickness", dest="box_thickness", type=int, default=None)
-    p.add_argument("--fill-color", dest="fill_color", default=None, help='B,G,R (e.g. "128,128,128")')
-    p.add_argument("--fill-opacity", dest="fill_opacity", type=float, default=None)
+    # --- Batch processing ---
+    p.add_argument("--batch-video-extensions", type=_parse_ext_list, default=None)
+    p.add_argument("--batch-skip-existing", action=argparse.BooleanOptionalAction, default=None)
 
-    # Encode overrides
-    p.add_argument("--codec", dest="codec", default=None)
-    p.add_argument("--preset", dest="preset", default=None)     # e.g. P7
-    p.add_argument("--profile", dest="profile", default=None)   # e.g. main
-    p.add_argument("--qp", dest="qp", type=int, default=None)
-    p.add_argument("--alpha", dest="alpha", type=int, default=None)
+    # --- Debug section in config.json ---
+    p.add_argument("--debug-save-detection-frames", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--debug-save-detection-json", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--debug-output-dir", default=None)
+
+    # --- SBS ---
+    p.add_argument("--sbs", action="store_true", help="Enable side-by-side (SBS) handling")
+    p.add_argument("--no-sbs", action="store_true", help="Disable SBS handling")
+    p.add_argument("--sbs-layout", choices=["lr", "rl"], default=None, help="SBS layout: lr=left|right, rl=right|left")
+    p.add_argument("--sbs-det-split", action="store_true", help="Run detector per-half (better per-eye)")
+    p.add_argument("--no-sbs-det-split", action="store_true", help="Disable per-half detection")
+
+    # --- Runtime debug flags (not config.json leaf keys) ---
+    p.add_argument("--debug", action="store_true", help="Verbose debug logging")
+    p.add_argument("--profile-sync", action="store_true", help="torch synchronize() around timings")
 
     return p
 
 
-def _apply_if_not_none(cfg: Config, key: str, value: Any) -> None:
-    if value is not None:
-        cfg.data[key] = value
+def _set_if_not_none(cfg: Config, keys: Sequence[str], value: Any) -> None:
+    if value is None:
+        return
+    cfg.set(*keys, value=value)
 
 
-def _apply_visual_if_not_none(cfg: Config, key: str, value: Any) -> None:
-    if value is not None:
-        cfg.set("visualization", key, value=value)
+def _load_config_json(path: Path) -> dict[str, Any]:
+    obj = Config.load_json(path)
+    if not isinstance(obj, dict):
+        raise ValueError("config.json root must be an object/dict")
+    return obj
 
 
-def parse_args(argv=None) -> Config:
-    args = create_parser().parse_args(argv)
+def parse_args(argv: list[str] | None = None) -> Config:
+    p = create_parser()
+    args = p.parse_args(argv)
 
-    # 1) Load base config.json
-    cfg_path = args.config_path or os.environ.get("GRESTORER_CONFIG") or "config.json"
-    base = Config.load_json(cfg_path)
-    cfg = Config(base)
-
-    # 2) Mandatory CLI values always win
-    cfg.data["input_path"] = args.input_path
-    cfg.data["output_path"] = args.output_path
-
-    # 3) Optional overrides (only when specified)
-    _apply_if_not_none(cfg, "gpu_id", args.gpu_id)
-    _apply_if_not_none(cfg, "batch_size", args.batch_size)
-    _apply_if_not_none(cfg, "max_frames", args.max_frames)
-    _apply_if_not_none(cfg, "restorer", args.restorer)
-    if args.max_clip_length is not None:
-        if cfg.get("restoration", default=None) is None:
-            cfg.data["restoration"] = {}
-        cfg.set("restoration", "max_clip_length", value=int(args.max_clip_length))
-
-
-    if args.debug is not None and args.debug:
-        cfg.data["debug_enabled"] = True
-    if args.profile_sync is not None and args.profile_sync:
-        cfg.data["profile_sync"] = True
-
-    # Scene tracking / clip mask fidelity
-    _apply_if_not_none(cfg, "use_seg_masks", args.use_seg_masks)
-
-    # Detector (CLI overrides nested detection.* so it beats config.json)
-    det = cfg.data.setdefault("detection", {})
-
-    if args.det_model_path is not None:
-        det["model_path"] = args.det_model_path
-    if args.det_conf is not None:
-        det["conf_threshold"] = float(args.det_conf)
-    if args.det_iou is not None:
-        det["iou_threshold"] = float(args.det_iou)
-    if args.det_imgsz is not None:
-        det["imgsz"] = int(args.det_imgsz)
-
-    # FP16
-    if args.det_fp16 is not None and args.det_fp16:
-        # legacy (in case anything still reads it)
-        cfg.data["det_fp16"] = True
-        # canonical nested form
-        det["fp16"] = True
-
-    # Visualization (nested)
-    _apply_visual_if_not_none(cfg, "box_color", args.box_color)
-    _apply_visual_if_not_none(cfg, "box_thickness", args.box_thickness)
-    _apply_visual_if_not_none(cfg, "fill_color", args.fill_color)
-    _apply_visual_if_not_none(cfg, "fill_opacity", args.fill_opacity)
-
-    # Encode
-    _apply_if_not_none(cfg, "codec", args.codec)
-    _apply_if_not_none(cfg, "preset", args.preset)
-    _apply_if_not_none(cfg, "profile", args.profile)
-    _apply_if_not_none(cfg, "qp", args.qp)
-    _apply_if_not_none(cfg, "alpha", args.alpha)
-
-    # Detector
-    # Detector (ensure nested detection.* takes precedence)
-    if cfg.get("detection", default=None) is None:
-        cfg.data["detection"] = {}
-
-    # Keep JSON’s nested model_path if present, unless CLI overrides
-    if args.det_model_path is not None:
-        cfg.set("detection", "model_path", value=args.det_model_path)
+    cfg_path: Optional[Path]
+    if args.config:
+        cfg_path = Path(args.config)
     else:
-        # ensure config.json's nested field propagates to det_model_path for backward compatibility
-        model_path = cfg.get("detection", "model_path", default=None)
-        if model_path:
-            cfg.data["det_model_path"] = model_path
+        cfg_path = _default_config_path()
 
-    # Restorer
-    _apply_if_not_none(cfg, "roi_dilate", args.roi_dilate)
+    cfg = Config({})
 
-    # 4) Hard defaults (if neither config nor CLI provided them)
-    cfg.data.setdefault("restorer", "none")
-    cfg.data.setdefault("gpu_id", 0)
-    cfg.data.setdefault("batch_size", 8)
-    cfg.data.setdefault("codec", "hevc")
-    cfg.data.setdefault("preset", "P7")
-    cfg.data.setdefault("profile", "main")
-    cfg.data.setdefault("qp", 23)
-    cfg.data.setdefault("alpha", 255)
+    if cfg_path is not None:
+        if not cfg_path.exists():
+            raise FileNotFoundError(f"Config not found: {cfg_path}")
+        cfg.merge_dict(_load_config_json(cfg_path))
 
-    # Detector defaults (nested)
-    if cfg.get("detection", default=None) is None: cfg.data["detection"] = {}
-    cfg.set("detection", "conf_threshold", value=cfg.get("detection", "conf_threshold", default=0.25))
-    cfg.set("detection", "iou_threshold",  value=cfg.get("detection", "iou_threshold",  default=0.45))
-    cfg.set("detection", "imgsz",         value=cfg.get("detection", "imgsz",         default=640))
+    # Required basics (always override config)
+    cfg.set("input", value=str(args.input))
+    cfg.set("output", value=str(args.output))
+    _set_if_not_none(cfg, ("max_frames",), args.max_frames)
 
-    # Restoration defaults (nested)
-    if cfg.get("restoration", default=None) is None:
-        cfg.data["restoration"] = {}
-    cfg.set("restoration", "max_clip_length", value=cfg.get("restoration", "max_clip_length", default=30))
+    # Defaults (so `gRestorer --input ... --output ...` works)
+    if cfg.get("mode", default=None) is None:
+        cfg.set("mode", value="real")
+    if cfg.get("restorer", default=None) is None:
+        cfg.set("restorer", value="basicvsrpp")
 
+    # High-level overrides
+    _set_if_not_none(cfg, ("mode",), args.mode)
+    _set_if_not_none(cfg, ("restorer",), args.restorer)
 
-    # Visualization defaults
-    if cfg.get("visualization", default=None) is None:
-        cfg.data["visualization"] = {}
-    cfg.set("visualization", "box_color", value=cfg.get("visualization", "box_color", default="0,255,0"))
-    cfg.set("visualization", "box_thickness", value=cfg.get("visualization", "box_thickness", default=2))
-    # fill_color default: None (outline-only unless set)
-    if cfg.get("visualization", "fill_opacity", default=None) is None:
-        cfg.set("visualization", "fill_opacity", value=0.5)
+    # Global GPU id (fan out unless more specific overrides exist)
+    if args.gpu_id is not None:
+        cfg.set("decoder", "gpu_id", value=int(args.gpu_id))
+        cfg.set("encoder", "gpu_id", value=int(args.gpu_id))
+
+    # Root knobs
+    _set_if_not_none(cfg, ("roi_dilate",), args.roi_dilate)
+    _set_if_not_none(cfg, ("batch_size",), args.batch_size)
+    _set_if_not_none(cfg, ("use_seg_masks",), args.use_seg_masks)
+
+    # Decoder
+    _set_if_not_none(cfg, ("decoder", "gpu_id"), args.dec_gpu_id)
+    _set_if_not_none(cfg, ("decoder", "output_format"), args.dec_output_format)
+
+    # Encoder
+    _set_if_not_none(cfg, ("encoder", "codec"), args.enc_codec)
+    _set_if_not_none(cfg, ("encoder", "preset"), args.enc_preset)
+    _set_if_not_none(cfg, ("encoder", "profile"), args.enc_profile)
+    _set_if_not_none(cfg, ("encoder", "qp"), args.enc_qp)
+    _set_if_not_none(cfg, ("encoder", "format"), args.enc_format)
+    _set_if_not_none(cfg, ("encoder", "gpu_id"), args.enc_gpu_id)
+    _set_if_not_none(cfg, ("encoder", "sync_before_encode"), args.enc_sync_before_encode)
+
+    # Detection
+    _set_if_not_none(cfg, ("detection", "model_path"), args.det_model)
+    _set_if_not_none(cfg, ("detection", "batch_size"), args.det_batch_size)
+    _set_if_not_none(cfg, ("detection", "conf_threshold"), args.det_conf)
+    _set_if_not_none(cfg, ("detection", "iou_threshold"), args.det_iou)
+    _set_if_not_none(cfg, ("detection", "imgsz"), args.det_imgsz)
+    _set_if_not_none(cfg, ("detection", "fp16"), args.det_fp16)
+
+    # Restoration
+    _set_if_not_none(cfg, ("restoration", "rest_model_path"), args.rest_model)
+    _set_if_not_none(cfg, ("restoration", "fp16"), args.rest_fp16)
+    _set_if_not_none(cfg, ("restoration", "max_clip_length"), args.rest_max_clip_length)
+    _set_if_not_none(cfg, ("restoration", "clip_size"), args.rest_clip_size)
+    _set_if_not_none(cfg, ("restoration", "border_ratio"), args.rest_border_ratio)
+    _set_if_not_none(cfg, ("restoration", "pad_mode"), args.rest_pad_mode)
+    _set_if_not_none(cfg, ("restoration", "feather_radius"), args.rest_feather_radius)
+
+    # Scene tracking (kept for config parity)
+    _set_if_not_none(cfg, ("scene_tracking", "min_iou"), args.trk_min_iou)
+    _set_if_not_none(cfg, ("scene_tracking", "max_clip_frames"), args.trk_max_clip_frames)
+    _set_if_not_none(cfg, ("scene_tracking", "min_clip_frames"), args.trk_min_clip_frames)
+
+    # Visualization
+    _set_if_not_none(cfg, ("visualization", "box_color"), list(args.vis_box_color) if args.vis_box_color is not None else None)
+    _set_if_not_none(cfg, ("visualization", "box_thickness"), args.vis_box_thickness)
+    _set_if_not_none(cfg, ("visualization", "show_confidence"), args.vis_show_confidence)
+    _set_if_not_none(cfg, ("visualization", "show_class"), args.vis_show_class)
+    _set_if_not_none(cfg, ("visualization", "fill_color"), list(args.vis_fill_color) if args.vis_fill_color is not None else None)
+    _set_if_not_none(cfg, ("visualization", "fill_opacity"), args.vis_fill_opacity)
+
+    # Batch processing
+    _set_if_not_none(cfg, ("batch_processing", "video_extensions"), args.batch_video_extensions)
+    _set_if_not_none(cfg, ("batch_processing", "skip_existing"), args.batch_skip_existing)
+
+    # Debug section
+    _set_if_not_none(cfg, ("debug", "save_detection_frames"), args.debug_save_detection_frames)
+    _set_if_not_none(cfg, ("debug", "save_detection_json"), args.debug_save_detection_json)
+    _set_if_not_none(cfg, ("debug", "output_dir"), args.debug_output_dir)
+
+    # SBS
+    if args.sbs:
+        cfg.set("sbs_enabled", value=True)
+    if args.no_sbs:
+        cfg.set("sbs_enabled", value=False)
+    _set_if_not_none(cfg, ("sbs_layout",), args.sbs_layout)
+    if args.sbs_det_split:
+        cfg.set("sbs_det_split", value=True)
+    if args.no_sbs_det_split:
+        cfg.set("sbs_det_split", value=False)
+
+    # Runtime-only toggles
+    if args.debug:
+        cfg.set("debug_enabled", value=True)
+    if args.profile_sync:
+        cfg.set("profile_sync", value=True)
+
+    # --- Validation (after config merge + CLI overrides) ---
+    inp = Path(str(cfg.get("input", default="")))
+    if not inp.exists():
+        raise FileNotFoundError(f"Input not found: {inp}")
+
+    mode = str(cfg.get("mode", default="real")).lower()
+    restorer = str(cfg.get("restorer", default="basicvsrpp")).lower()
+
+    if mode in ("real", "pseudo"):
+        det_s = str(cfg.get("detection", "model_path", default="") or "").strip()
+        if not det_s:
+            raise FileNotFoundError("Detector model path is empty (check config.json or --det-model)")
+        det_path = Path(det_s)
+        if not det_path.exists():
+            raise FileNotFoundError(f"Detector model not found: {det_path}")
+
+    if mode == "real" and restorer in ("basicvsrpp", "real_basicvsrpp"):
+        rest_s = str(cfg.get("restoration", "rest_model_path", default="") or "").strip()
+        if not rest_s:
+            raise FileNotFoundError("Restoration model path is empty (check config.json or --rest-model)")
+        rest_path = Path(rest_s)
+        if not rest_path.exists():
+            raise FileNotFoundError(f"Restoration model not found: {rest_path}")
 
     return cfg
