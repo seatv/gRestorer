@@ -189,14 +189,58 @@ To avoid this, gRestorer can enforce **seam-safe ROIs**:
 gRestorer --input Mosaic.ts --output Restored.mp4 --det-model D:\Models\lada\lada_vr_mosaic_detection_model_1.0.pt --sbs --sbs-layout lr
 ```
 
+
+
 ### Troubleshooting SBS errors
-If an SBS file fails:
-1) Confirm ffprobe can read it and that the frame rate is sane.
-2) Try a short cut (1–2 seconds) to reproduce quickly:
+
+**High-res decode limits (NVDEC):** Some SBS sources are **4320×2160** (5K). On some NVIDIA NVDEC generations, the max supported decode dimension is **4096 px** per side. In that case PyNvVideoCodec will fail with an error like:
+   - `Error code : 801` / `Resolution not supported on this GPU`
+   gRestorer will fall back to **CPU decode** so the run can continue, but throughput will be slower.
+
+
+### High-resolution inputs and NVDEC limits (automatic CPU decode fallback)
+
+Some videos exceed the NVDEC decode limits of certain GPUs (common threshold: **4096 px** max in width/height). Example: **4320×2160**.
+
+Symptoms:
+- PyNvVideoCodec error like `Error code : 801` / `Resolution not supported on this GPU`
+- Decode fails immediately (often on the first batch)
+
+Behavior:
+- gRestorer will automatically fall back to **CPU decode** to keep the pipeline running.
+- Expect lower throughput due to CPU decode + GPU upload.
+
+Workarounds:
+- Use a GPU/NVDEC generation that supports the input resolution, or
+- Downscale to ≤4096 width, or
+- Pre-remux/convert problematic containers before processing.
+
+### MP4 + HEVC playback compatibility (hvc1 vs hev1)
+
+Some players (including certain Quest playback stacks) are picky about the MP4 video sample entry for HEVC:
+- `hev1` can cause **jerky / broken** playback in some players
+- `hvc1` is often the more compatible tag for MP4+HEVC
+
+gRestorer now remuxes MP4 outputs with the correct tag:
+- MP4 + HEVC ⇒ `-tag:v hvc1`
+- MP4 + H.264 ⇒ `-tag:v avc1`
+
+Quick check:
 ```powershell
-ffmpeg -ss 0 -to 2 -i "INPUT.mp4" -c copy "SBS_short.mp4"
+ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,codec_tag_string,width,height -of default=nw=1 "VIDEO.mp4"
 ```
-3) Re-run gRestorer on the short clip with `--debug` and capture stderr output.
+
+How to fix a older file:
+```PowerShell
+ffmpeg -hide_banner -y -i "in.mp4" -c copy -tag:v hvc1 "out.mp4"
+```
+
+### TS/MPEG-TS inputs (recommended remux before processing)
+
+Transport streams can carry odd timestamp behavior and are more likely to trip up tooling. If you hit weird decode behavior, remux first (no re-encode):
+```PowerShell
+ffmpeg -hide_banner -y -fflags +genpts -i "in.ts" -map 0 -c copy "in.mp4"
+```
 
 ---
 

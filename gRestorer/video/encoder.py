@@ -224,6 +224,15 @@ class Encoder:
             return
 
         input_fmt = _ffmpeg_input_format(self.codec)
+        # Some players (Quest stacks, PotPlayer, etc.) are picky:
+        # MP4+HEVC often needs hvc1 (not hev1) to avoid jerky / broken playback.
+        mp4_vtag: list[str] = []
+        if self.container == "mp4":
+            if self.codec in ("hevc", "h265"):
+                mp4_vtag = ["-tag:v", "hvc1"]
+            elif self.codec in ("h264", "avc"):
+                mp4_vtag = ["-tag:v", "avc1"]
+
 
         # CRITICAL: Use exact rational avg_frame_rate from the source container
         fps_r = f"{self.fps:g}"
@@ -250,12 +259,12 @@ class Encoder:
         if input_video and input_video.exists():
             cmd += ["-i", str(input_video)]
             cmd += [
-                "-map", "0:v:0", "-c:v", "copy",
+                "-map", "0:v:0", "-c:v", "copy", *mp4_vtag,
                 "-map", "1:a?", "-c:a", "copy",
                 "-map", "1:s?", "-c:s", "copy",
             ]
         else:
-            cmd += ["-an", "-c:v", "copy"]
+            cmd += ["-an", "-c:v", "copy", *mp4_vtag]
 
         # Container-specific flags
         if self.container == "mp4":

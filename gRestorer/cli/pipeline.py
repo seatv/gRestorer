@@ -278,7 +278,7 @@ class Pipeline:
 
         store = FrameStore()
 
-        pbar_total = total_frames if total_frames > 0 else None
+        pbar_total = (self.max_frames if self.max_frames is not None else (total_frames if total_frames > 0 else None))
         pbar = tqdm(total=pbar_total, disable=self.debug)
 
         frame_num = 0
@@ -298,8 +298,22 @@ class Pipeline:
 
                 batch_rgb: List[torch.Tensor] = []
                 for surf in batch:
-                    t = wrap_surface_as_tensor(surf)
-                    rgb = rgbp_chw_to_rgb_hwc_u8(t)
+                    # NVDEC backend yields PyNvVideoCodec surfaces (RGBP on GPU).
+                    # ffmpeg CPU fallback yields torch.Tensor frames (RGB HWC uint8 on CPU).
+                    if isinstance(surf, torch.Tensor):
+                        rgb = surf
+                    else:
+                        t = wrap_surface_as_tensor(surf)
+                        # Be tolerant: if upstream gives HWC already, keep it.
+                        if t.ndim == 3 and t.shape[-1] == 3:
+                            rgb = t
+                        else:
+                            rgb = rgbp_chw_to_rgb_hwc_u8(t)
+
+                    # Ensure frames live on the pipeline device (no-op if already there).
+                    if self.device.type != "cpu":
+                        rgb = rgb.to(self.device, non_blocking=True)
+
                     batch_rgb.append(rgb)
 
                 detections: List[Detection] = []
@@ -372,8 +386,7 @@ class Pipeline:
                         metrics.t_encode += (time.perf_counter() - t0)
                         frame_num += 1
                         metrics.processed_frames += 1
-                        if pbar_total is not None:
-                            pbar.update(1)
+                        pbar.update(1)
                         continue
 
                     boxes = _tensor_boxes_to_list_xyxy(det.boxes)
@@ -432,10 +445,14 @@ class Pipeline:
                     frame_num += 1
                     metrics.processed_frames += 1
 
-                    if pbar_total is not None:
-                        pbar.update(1)
+                    pbar.update(1)
 
         finally:
+            try:
+                decoder.close()
+            except Exception:
+                pass
+
             if tracker is not None and restorer is not None:
                 for clip in tracker.flush_eof():
                     restored = restorer.restore_clip(clip)
