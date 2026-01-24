@@ -186,13 +186,7 @@ To avoid this, gRestorer can enforce **seam-safe ROIs**:
 
 ### SBS example
 ```powershell
-grestorer `
-  --input  "D:\\Videos\\SBS\\clip.mp4" `
-  --output "D:\\Videos\\SBS\\clip_restored.mp4" `
-  --restorer basicvsrpp `
-  --det-model  "D:\\Models\\lada\\lada_mosaic_detection_model_v4.pt" `
-  --rest-model "D:\\Models\\lada\\lada_mosaic_restoration_model_generic_v1.2.pth" `
-  --debug
+gRestorer --input Mosaic.ts --output Restored.mp4 --det-model D:\Models\lada\lada_vr_mosaic_detection_model_1.0.pt --sbs --sbs-layout lr
 ```
 
 ### Troubleshooting SBS errors
