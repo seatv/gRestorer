@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from gRestorer.core.scene import Clip
+from gRestorer.utils.mask_utils import create_blend_mask
 
 
 def _unpad_hwc(x: torch.Tensor, pad: Tuple[int, int, int, int]) -> torch.Tensor:
@@ -85,7 +86,10 @@ def _composite_clip_into_store(
         patch = _resize_hwc_float(frm_u, (crop_h, crop_w))
         mask_rs = _resize_hw_mask_u8(m_u, (crop_h, crop_w))
 
-        alpha = (mask_rs.to(dtype=torch.float32) / 255.0).clamp(0.0, 1.0)
+        # LADA-style blend mask to reduce visible paste-back boundaries.
+        # It creates a soft transition band near the crop edge while keeping the ROI interior strong.
+        alpha = create_blend_mask(mask_rs.to(dtype=torch.float32) / 255.0).clamp(0.0, 1.0)
+        # Optional extra feathering knob (usually keep 0 once blend mask is enabled).
         alpha = _feather_alpha(alpha, radius=feather_radius)
         a3 = alpha.unsqueeze(-1)
 
@@ -95,6 +99,5 @@ def _composite_clip_into_store(
         # Blend in float on the (cropped) ROI, then write back to the uint8 buffer.
         region_f = region_u8.to(dtype=torch.float32) / 255.0
         out_f = region_f * (1.0 - a3) + patch * a3
-        region_u8.copy_(out_f.mul(255.0).clamp(0.0, 255.0).to(dtype=torch.uint8))
-
-
+        region_u8.copy_(out_f.mul(255.0).round().clamp(0.0, 255.0).to(dtype=torch.uint8))
+        #region_u8.copy_(out_f.mul(255.0).clamp(0.0, 255.0).to(dtype=torch.uint8))
