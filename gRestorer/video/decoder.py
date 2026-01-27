@@ -49,6 +49,14 @@ class Decoder:
         self.input_path = str(Path(input_path))
         self.gpu_id = int(gpu_id)
         self.batch_size = int(batch_size)
+        
+        # Probe once up front (improves progress totals + avoids duplicate ffprobe calls)
+        self._probe_meta: VideoMetadata | None = None
+        try:
+            self._probe_meta = self._ffprobe()
+        except Exception:
+            self._probe_meta = None
+       
 
         # Allow an escape hatch for debugging / flaky sources.
         # (No CLI flag required; set env var to force CPU decode.)
@@ -109,6 +117,17 @@ class Decoder:
                 bitrate=float(getattr(meta, "bitrate", 0) or 0) or None,
                 codec_name=getattr(meta, "codec_name", None),
             )
+            if self._probe_meta:
+                pm = self._probe_meta
+                # Prefer NVDEC values when present; otherwise use ffprobe
+                if not self.metadata.width:  self.metadata.width = pm.width
+                if not self.metadata.height: self.metadata.height = pm.height
+                if not self.metadata.fps:    self.metadata.fps = pm.fps
+                if not self.metadata.duration: self.metadata.duration = pm.duration
+                if not self.metadata.bitrate:  self.metadata.bitrate = pm.bitrate
+                if not self.metadata.codec_name: self.metadata.codec_name = pm.codec_name
+                if not self.metadata.num_frames:
+                    self.metadata.num_frames = pm.num_frames
         else:
             # _init_ffmpeg_cpu_backend() fills self.metadata
             pass
@@ -290,7 +309,8 @@ class Decoder:
             for i, fr in enumerate(frames):
                 pts = self._frame_pts(fr)
                 if pts is None:
-                    # If PTS is unavailable, we can't trim safely.
+                    # Can't trim safely, but MUST NOT drop already-decoded frames.
+                    self._prefetch = frames
                     return
                 if pts >= 0:
                     first_ok = i
@@ -314,67 +334,95 @@ class Decoder:
     # ffmpeg CPU fallback backend
     # -------------------------
     def _ffprobe(self) -> VideoMetadata:
-        """Probe basic video metadata using ffprobe."""
+        """Probe basic video metadata using ffprobe (cheap, best-effort)."""
+        import json
+
         cmd = [
             "ffprobe", "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,avg_frame_rate,codec_name,bit_rate",
-            "-of", "default=nw=1",
+            "-show_entries", "stream=width,height,avg_frame_rate,codec_name,bit_rate,nb_frames",
+            "-show_entries", "format=duration",
+            "-of", "json",
             self.input_path,
         ]
         p = subprocess.run(cmd, capture_output=True, text=True)
         if p.returncode != 0:
             raise RuntimeError(f"ffprobe failed:\n{p.stderr}")
 
-        kv: dict[str, str] = {}
-        for ln in p.stdout.splitlines():
-            if "=" in ln:
-                k, v = ln.strip().split("=", 1)
-                kv[k] = v
+        j = json.loads(p.stdout or "{}")
+        s = (j.get("streams") or [{}])[0]
+        f = j.get("format") or {}
 
-        w = int(kv.get("width", "0") or 0)
-        h = int(kv.get("height", "0") or 0)
+        w = int(s.get("width") or 0)
+        h = int(s.get("height") or 0)
 
         fps = None
-        afr = kv.get("avg_frame_rate")
+        afr = s.get("avg_frame_rate")
         if afr and afr != "0/0":
             try:
                 fps = float(Fraction(afr))
             except Exception:
                 fps = None
 
-        codec = kv.get("codec_name") or None
+        codec = s.get("codec_name") or None
 
         bitrate = None
         try:
-            bitrate = float(kv.get("bit_rate")) if kv.get("bit_rate") else None
+            bitrate = float(s.get("bit_rate")) if s.get("bit_rate") else None
         except Exception:
             bitrate = None
+
+        duration = None
+        try:
+            duration = float(f.get("duration")) if f.get("duration") else None
+        except Exception:
+            duration = None
+
+        num_frames = 0
+        try:
+            if s.get("nb_frames"):
+                num_frames = int(s["nb_frames"])
+        except Exception:
+            num_frames = 0
+
+        # Best-effort fallback if container didn't provide nb_frames
+        if (not num_frames) and duration and fps:
+            num_frames = int(round(duration * fps))
 
         return VideoMetadata(
             width=w,
             height=h,
             bit_depth=8,
-            num_frames=0,  # unknown without costly count_frames
+            num_frames=num_frames,
             fps=fps,
-            duration=None,
+            duration=duration,
             bitrate=bitrate,
             codec_name=codec,
         )
 
+
+
     def _init_ffmpeg_cpu_backend(self) -> None:
-        """Start an ffmpeg process that outputs raw RGB24 frames on stdout."""
-        self.metadata = self._ffprobe()
+        """Start an ffmpeg process that outputs raw NV12 frames on stdout."""
+        self.metadata = self._probe_meta or self._ffprobe()
         if not self.metadata.width or not self.metadata.height:
             raise RuntimeError("ffprobe did not return width/height; cannot CPU-decode")
 
         w = int(self.metadata.width)
         h = int(self.metadata.height)
-        self._ffmpeg_frame_size = w * h * 3  # rgb24
 
-        print(f"[Decoder] Backend: ffmpeg-cpu  output=RGB24(HWC,u8)  {w}x{h}")
+        force_rgb24 = os.getenv("GR_CPU_DECODE_RGB24", "0").strip().lower() in {"1", "true", "yes"}
+        if force_rgb24:
+            self._ffmpeg_frame_size = w * h * 3
+            self.ffmpeg_pix_fmt = "rgb24"
+            print(f"[Decoder] Backend: ffmpeg-cpu  output=RGB24(HWC,u8)  {w}x{h}  (GR_CPU_DECODE_RGB24=1)")
+        else:
+            self._ffmpeg_frame_size = w * h * 3 // 2
+            self.ffmpeg_pix_fmt = "nv12"
+            print(f"[Decoder] Backend: ffmpeg-cpu  output=NV12(Y+UV,u8)  {w}x{h}")
 
-        # -vsync 0 avoids frame duplication/drop when dumping rawvideo
+        self.output_pix_fmt = self.ffmpeg_pix_fmt
+
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-fflags", "+genpts",
@@ -382,7 +430,7 @@ class Decoder:
             "-an", "-sn", "-dn",
             "-vsync", "0",
             "-f", "rawvideo",
-            "-pix_fmt", "rgb24",
+            "-pix_fmt", self.ffmpeg_pix_fmt,
             "pipe:1",
         ]
         self._ffmpeg_proc = subprocess.Popen(
@@ -393,22 +441,21 @@ class Decoder:
         )
 
     def _ffmpeg_read_frame(self) -> torch.Tensor | None:
-        """Read one RGB24 frame from ffmpeg stdout.
+        """Read one raw frame from ffmpeg stdout.
 
         Returns:
-          HWC uint8 CPU tensor (shares memory with a per-frame bytearray), or None at EOF.
-
-        Note:
-          We intentionally avoid np.frombuffer(bytes) -> non-writable NumPy arrays, which triggers
-          a PyTorch warning. Using a per-frame bytearray keeps the buffer writable without adding
-          an extra full-frame copy.
+          - NV12: uint8 CPU tensor shaped [H*3/2, W]
+          - RGB24: uint8 CPU tensor shaped [H, W, 3]
         """
         if self._ffmpeg_proc is None or self._ffmpeg_proc.stdout is None:
             return None
 
-        # Read exactly one frame into a writable buffer.
-        buf = bytearray(self._ffmpeg_frame_size)
-        view = memoryview(buf)
+        try:
+            buf_t = torch.empty((self._ffmpeg_frame_size,), dtype=torch.uint8, pin_memory=True)
+        except Exception:
+            buf_t = torch.empty((self._ffmpeg_frame_size,), dtype=torch.uint8)
+
+        view = memoryview(buf_t.numpy())
         got = 0
         while got < self._ffmpeg_frame_size:
             n = self._ffmpeg_proc.stdout.readinto(view[got:])
@@ -416,7 +463,8 @@ class Decoder:
                 return None
             got += int(n)
 
-        arr = np.frombuffer(buf, dtype=np.uint8).reshape(
-            (int(self.metadata.height), int(self.metadata.width), 3)
-        )
-        return torch.from_numpy(arr)
+        h = int(self.metadata.height)
+        w = int(self.metadata.width)
+        if getattr(self, "ffmpeg_pix_fmt", "nv12") == "rgb24":
+            return buf_t.view(h, w, 3)
+        return buf_t.view(h * 3 // 2, w)
