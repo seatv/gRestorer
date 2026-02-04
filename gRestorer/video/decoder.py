@@ -1,14 +1,16 @@
+# gRestorer/video/decoder.py
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, List, Optional
 
+import json
 import os
+import shlex
 import subprocess
-from fractions import Fraction
 
-import numpy as np
 import torch
 import PyNvVideoCodec as nvc
 
@@ -29,14 +31,11 @@ class Decoder:
     """
     GPU-first video decoder.
 
-    - Primary backend: PyNvVideoCodec (NVDEC) outputting RGBP in device memory.
-    - Fallback backend: ffmpeg CPU decode to raw RGB24 (HWC uint8).
+    - Primary backend: PyNvVideoCodec (NVDEC) outputting RGBP (planar) or RGB (packed) in device memory.
+    - Fallback backend: ffmpeg CPU decode to raw NV12 (default) or RGB24 (env override).
 
-    Why the fallback matters:
-      Some NVDEC-capable GPUs (e.g., Tesla P4) cannot decode frames wider than 4096px.
-      Many VR SBS sources are 4320x2160. NVDEC will fail with:
-        "Resolution not supported on this GPU ... Max Supported 4096x4096"
-      In that case we transparently fall back to ffmpeg CPU decode so the pipeline can proceed.
+    Extra:
+    - ffmpeg_input_args can be provided to tune CPU fallback (must not include -i).
     """
 
     def __init__(
@@ -45,21 +44,23 @@ class Decoder:
         gpu_id: int = 0,
         batch_size: int = 80,
         trim_negative_pts: bool = True,
+        output_format: str = "RGBP",          # "RGBP" or "RGB"
+        ffmpeg_input_args: str = "",          # injected BEFORE -i (CPU fallback)
     ) -> None:
         self.input_path = str(Path(input_path))
         self.gpu_id = int(gpu_id)
         self.batch_size = int(batch_size)
-        
-        # Probe once up front (improves progress totals + avoids duplicate ffprobe calls)
+        self.output_format = str(output_format or "RGBP").upper()
+        self.ffmpeg_input_args = str(ffmpeg_input_args or "")
+
+        # Probe once up front
         self._probe_meta: VideoMetadata | None = None
         try:
             self._probe_meta = self._ffprobe()
         except Exception:
             self._probe_meta = None
-       
 
-        # Allow an escape hatch for debugging / flaky sources.
-        # (No CLI flag required; set env var to force CPU decode.)
+        # Escape hatch (force CPU decode)
         self._force_cpu = os.environ.get("GR_FORCE_CPU_DECODE", "").strip() in ("1", "true", "True", "YES", "yes")
 
         self.backend: str = "nvdec"
@@ -69,7 +70,6 @@ class Decoder:
         self._ffmpeg_proc: subprocess.Popen | None = None
         self._ffmpeg_frame_size: int = 0
 
-        # Accounting for trimming / prefetch
         self._raw_num_frames: int = 0
         self._frames_read: int = 0
         self._prefetch: List[Any] = []
@@ -82,11 +82,14 @@ class Decoder:
             self._init_ffmpeg_cpu_backend()
         else:
             try:
-                # Output RGBP (planar RGB) for fast GPU interop (we convert to HWC later)
+                out_color = nvc.OutputColorType.RGBP
+                if self.output_format == "RGB":
+                    out_color = nvc.OutputColorType.RGB
+
                 self._decoder = nvc.SimpleDecoder(
                     enc_file_path=self.input_path,
                     gpu_id=self.gpu_id,
-                    output_color_type=nvc.OutputColorType.RGBP,
+                    output_color_type=out_color,
                     use_device_memory=True,
                     decoder_cache_size=self.batch_size,
                     need_scanned_stream_metadata=False,
@@ -119,13 +122,18 @@ class Decoder:
             )
             if self._probe_meta:
                 pm = self._probe_meta
-                # Prefer NVDEC values when present; otherwise use ffprobe
-                if not self.metadata.width:  self.metadata.width = pm.width
-                if not self.metadata.height: self.metadata.height = pm.height
-                if not self.metadata.fps:    self.metadata.fps = pm.fps
-                if not self.metadata.duration: self.metadata.duration = pm.duration
-                if not self.metadata.bitrate:  self.metadata.bitrate = pm.bitrate
-                if not self.metadata.codec_name: self.metadata.codec_name = pm.codec_name
+                if not self.metadata.width:
+                    self.metadata.width = pm.width
+                if not self.metadata.height:
+                    self.metadata.height = pm.height
+                if not self.metadata.fps:
+                    self.metadata.fps = pm.fps
+                if not self.metadata.duration:
+                    self.metadata.duration = pm.duration
+                if not self.metadata.bitrate:
+                    self.metadata.bitrate = pm.bitrate
+                if not self.metadata.codec_name:
+                    self.metadata.codec_name = pm.codec_name
                 if not self.metadata.num_frames:
                     self.metadata.num_frames = pm.num_frames
         else:
@@ -136,8 +144,6 @@ class Decoder:
 
         # Optional: trim negative-PTS preroll for NVDEC backend
         if self._trim_negative_pts and self.backend == "nvdec":
-            # NOTE: This can throw on some streams; if it does and it's an unsupported-res issue,
-            # fall back to CPU decode.
             try:
                 self._prime_to_first_nonneg_pts()
             except Exception as e:
@@ -152,18 +158,14 @@ class Decoder:
                 else:
                     raise
 
-        # Status
         fps_s = f"{self.metadata.fps:.2f}" if self.metadata.fps else "?"
         nf_s = str(self.metadata.num_frames) if self.metadata.num_frames else "?"
         print(f"[Decoder] Initialized ({self.backend}): {self.metadata.width}x{self.metadata.height}, {nf_s} frames, {fps_s} fps")
         if self.backend == "nvdec":
-            print(f"[Decoder] Output: RGB [H,W,3] on GPU {self.gpu_id}")
+            print(f"[Decoder] Output: {self.output_format} on GPU {self.gpu_id}")
         else:
-            print(f"[Decoder] Output: RGB [H,W,3] on CPU (ffmpeg)")
+            print(f"[Decoder] Output: {self.output_pix_fmt} on CPU (ffmpeg)")
 
-    # -------------------------
-    # Public API used by pipeline
-    # -------------------------
     @property
     def num_frames(self) -> int:
         if self._raw_num_frames <= 0:
@@ -172,30 +174,25 @@ class Decoder:
 
     def is_complete(self) -> bool:
         if self.backend != "nvdec":
-            # ffmpeg: complete when process ended and no more stdout
             return self._ffmpeg_proc is None
         if self._raw_num_frames <= 0:
             return False
         return self._frames_read >= self._raw_num_frames
 
     def read_batch(self) -> List[Any]:
-        """Read next batch of frames (surfaces or tensors depending on backend)."""
         if self.backend != "nvdec":
             n = self.batch_size
             out: List[torch.Tensor] = []
             for _ in range(n):
                 fr = self._ffmpeg_read_frame()
                 if fr is None:
-                    # EOF: shut down proc deterministically
                     self.close()
                     break
                 self._frames_read += 1
                 out.append(fr)
             return out
 
-        # NVDEC path: get_batch_frames (GPU surfaces)
         n = self.batch_size
-
         if self._raw_num_frames > 0:
             remaining_raw = self._raw_num_frames - self._frames_read
             if remaining_raw <= 0 and not self._prefetch:
@@ -219,8 +216,6 @@ class Decoder:
         return frames
 
     def close(self) -> None:
-        """Explicitly release decoder resources."""
-        # ffmpeg backend
         if self.backend != "nvdec":
             try:
                 if self._ffmpeg_proc is not None:
@@ -246,7 +241,6 @@ class Decoder:
                 self._ffmpeg_proc = None
             return
 
-        # NVDEC backend: drop references so Python can destroy underlying objects
         for attr in ("_decoder", "_demuxer", "_reader", "_ctx", "_stream"):
             if hasattr(self, attr):
                 try:
@@ -260,9 +254,6 @@ class Decoder:
         except Exception:
             pass
 
-    # -------------------------
-    # NVDEC helpers
-    # -------------------------
     @staticmethod
     def _looks_like_nvdec_unsupported(e: Exception) -> bool:
         msg = str(e)
@@ -284,11 +275,6 @@ class Decoder:
             return None
 
     def _prime_to_first_nonneg_pts(self) -> None:
-        """
-        Some files have an edit-list / preroll region with negative PTS.
-        Those frames are not meant to be presented, and encoding them causes
-        duration inflation + audio drift. We trim the negative-PTS prefix.
-        """
         if self._raw_num_frames <= 0:
             return
 
@@ -303,13 +289,12 @@ class Decoder:
             if not frames:
                 return
 
-            self._frames_read += len(frames)  # RAW frames consumed from decoder
+            self._frames_read += len(frames)
 
             first_ok = None
             for i, fr in enumerate(frames):
                 pts = self._frame_pts(fr)
                 if pts is None:
-                    # Can't trim safely, but MUST NOT drop already-decoded frames.
                     self._prefetch = frames
                     return
                 if pts >= 0:
@@ -317,11 +302,9 @@ class Decoder:
                     break
 
             if first_ok is None:
-                # whole batch is negative PTS
                 self._trim_prefix += len(frames)
                 continue
 
-            # Found first non-negative PTS inside this batch:
             self._trim_prefix += first_ok
             self._prefetch = frames[first_ok:]
 
@@ -330,13 +313,7 @@ class Decoder:
                 print(f"[Decoder] Trimmed {self._trim_prefix} negative-PTS preroll frames (presented={presented})")
             return
 
-    # -------------------------
-    # ffmpeg CPU fallback backend
-    # -------------------------
     def _ffprobe(self) -> VideoMetadata:
-        """Probe basic video metadata using ffprobe (cheap, best-effort)."""
-        import json
-
         cmd = [
             "ffprobe", "-v", "error",
             "-select_streams", "v:0",
@@ -385,7 +362,6 @@ class Decoder:
         except Exception:
             num_frames = 0
 
-        # Best-effort fallback if container didn't provide nb_frames
         if (not num_frames) and duration and fps:
             num_frames = int(round(duration * fps))
 
@@ -400,10 +376,7 @@ class Decoder:
             codec_name=codec,
         )
 
-
-
     def _init_ffmpeg_cpu_backend(self) -> None:
-        """Start an ffmpeg process that outputs raw NV12 frames on stdout."""
         self.metadata = self._probe_meta or self._ffprobe()
         if not self.metadata.width or not self.metadata.height:
             raise RuntimeError("ffprobe did not return width/height; cannot CPU-decode")
@@ -423,9 +396,18 @@ class Decoder:
 
         self.output_pix_fmt = self.ffmpeg_pix_fmt
 
+        extra = self.ffmpeg_input_args.strip()
+        extra_tokens: List[str] = []
+        if extra:
+            extra_tokens = shlex.split(extra)
+            for t in extra_tokens:
+                if t == "-i" or t.startswith("-i"):
+                    raise ValueError("dec-ffmpeg-input-args must not include -i")
+
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-fflags", "+genpts",
+            *extra_tokens,
             "-i", self.input_path,
             "-an", "-sn", "-dn",
             "-vsync", "0",
@@ -441,12 +423,6 @@ class Decoder:
         )
 
     def _ffmpeg_read_frame(self) -> torch.Tensor | None:
-        """Read one raw frame from ffmpeg stdout.
-
-        Returns:
-          - NV12: uint8 CPU tensor shaped [H*3/2, W]
-          - RGB24: uint8 CPU tensor shaped [H, W, 3]
-        """
         if self._ffmpeg_proc is None or self._ffmpeg_proc.stdout is None:
             return None
 
