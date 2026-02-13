@@ -15,7 +15,7 @@ from tqdm import tqdm
 from gRestorer.core.scene_tracker import SceneTracker, TrackerConfig
 from gRestorer.detector.core import Detection, Detector as YoloDetector
 from gRestorer.restorer.basicvsrpp_clip_restorer import BasicVSRPPClipRestorer
-from gRestorer.restorer.compositor import composite_clip_into_store, CompositeParams
+from gRestorer.restorer.compositor import _composite_clip_into_store
 from gRestorer.restorer.pseudo_clip_restorer import PseudoClipRestorer
 from gRestorer.utils.config_util import Config
 from gRestorer.video.decoder import Decoder
@@ -153,10 +153,6 @@ class Pipeline:
         self.mode: str = str(self.cfg.get("mode", default="real")).lower()
         self.restorer_name: str = str(self.cfg.get("restorer", default="basicvsrpp")).lower()
 
-        # Decoder extra knobs
-        self.dec_output_format: str = str(self.cfg.get("decoder", "output_format", default="RGBP")).upper()
-        self.dec_ffmpeg_input_args: str = str(self.cfg.get("decoder", "ffmpeg_input_args", default="") or "")
-
         self.det_model: str = cfg_path(self.cfg, ("detection", "model_path"), default="")
         self.det_imgsz: int = int(self.cfg.get("detection", "imgsz", default=640))
         self.det_conf: float = float(self.cfg.get("detection", "conf_threshold", default=0.30))
@@ -176,29 +172,13 @@ class Pipeline:
         self.rest_clip_size: int = int(self.cfg.get("restoration", "clip_size", default=256))
         self.rest_border_ratio: float = float(self.cfg.get("restoration", "border_ratio", default=0.06))
         self.rest_pad_mode: str = str(self.cfg.get("restoration", "pad_mode", default="reflect"))
-        self.lada_parity: bool = bool(self.cfg.get("restoration", "lada_parity", default=True))
         self.feather_radius: int = int(self.cfg.get("restoration", "feather_radius", default=0))
 
-        # Encoder base
         self.enc_codec: str = str(self.cfg.get("encoder", "codec", default="hevc")).lower()
         self.enc_preset: str = str(self.cfg.get("encoder", "preset", default="P6"))
         self.enc_profile: str = str(self.cfg.get("encoder", "profile", default="main"))
         self.enc_qp: int = int(self.cfg.get("encoder", "qp", default=20))
         self.enc_sync_before_encode: bool = bool(self.cfg.get("encoder", "sync_before_encode", default=True))
-
-        # Encoder advanced
-        self.enc_mode: str = str(self.cfg.get("encoder", "mode", default="hq") or "hq").lower()
-        self.enc_options_str: str = str(self.cfg.get("encoder", "options", default="") or "")
-        self.enc_opt_dict = self.cfg.get("encoder", "opt", default={}) or {}
-        if not isinstance(self.enc_opt_dict, dict):
-            self.enc_opt_dict = {}
-        self.enc_allow_unknown: bool = bool(self.cfg.get("encoder", "allow_unknown", default=False))
-
-        # Mux/remux
-        self.mux_audio: str = str(self.cfg.get("encoder", "mux_audio", default="auto") or "auto").lower()
-        self.mux_keep_subs: bool = bool(self.cfg.get("encoder", "mux_keep_subs", default=False))
-        self.mux_extra_args: str = str(self.cfg.get("encoder", "mux_extra_args", default="") or "")
-        self.mp4_faststart: bool = bool(self.cfg.get("encoder", "mp4_faststart", default=True))
 
     def _build_detector(self) -> Optional[YoloDetector]:
         if self.mode == "none":
@@ -221,7 +201,7 @@ class Pipeline:
         if self.mode == "pseudo" or self.restorer_name == "pseudo":
             fill = self.cfg.get("visualization", "fill_color", default=[255, 0, 255])
             op = float(self.cfg.get("visualization", "fill_opacity", default=0.70))
-            r, g, b = [int(x) for x in fill]
+            r, g, b = [int(x) for x in fill]  # config is RGB
             return PseudoClipRestorer(device=self.device, fill_color_bgr=(b, g, r), fill_opacity=op)
 
         if self.restorer_name in ("none", "noop"):
@@ -249,8 +229,6 @@ class Pipeline:
             input_path=str(inp),
             gpu_id=self.dec_gpu_id,
             batch_size=self.batch_size,
-            output_format=self.dec_output_format,
-            ffmpeg_input_args=self.dec_ffmpeg_input_args,
         )
 
         w = int(decoder.metadata.width)
@@ -275,15 +253,6 @@ class Pipeline:
             qp=self.enc_qp,
             gpu_id=self.enc_gpu_id,
             input_path=str(inp),
-            mode=self.enc_mode,
-            nvenc_options_str=self.enc_options_str,
-            nvenc_options=self.enc_opt_dict,
-            nvenc_allow_unknown=self.enc_allow_unknown,
-            mux_audio=self.mux_audio,
-            mux_keep_subs=self.mux_keep_subs,
-            mux_extra_args=self.mux_extra_args,
-            mp4_faststart=self.mp4_faststart,
-            max_frames=self.max_frames,
         )
 
         detector = self._build_detector()
@@ -298,7 +267,6 @@ class Pipeline:
                 border_size=self.rest_border_ratio,
                 debug=self.debug,
                 use_seg_masks=self.use_seg_masks,
-                lada_parity=self.lada_parity,
             )
             tracker = SceneTracker(cfg=tracker_cfg)
 
@@ -309,6 +277,8 @@ class Pipeline:
 
         frame_num = 0
 
+        # Prefetch threading is only safe/valuable for ffmpeg-cpu lane.
+        # NVDEC/PyNvVideoCodec decode is not reliably thread-safe across threads.
         use_thread_prefetch = getattr(decoder, "_ffmpeg_proc", None) is not None
 
         stop = _threading.Event()
@@ -319,6 +289,7 @@ class Pipeline:
         def consume_batch(batch: List[object]) -> None:
             nonlocal frame_num
 
+            # If we're stopping early, trim batch to remaining frames.
             if self.max_frames is not None:
                 remaining = self.max_frames - frame_num
                 if remaining <= 0:
@@ -326,12 +297,19 @@ class Pipeline:
                 if len(batch) > remaining:
                     batch = batch[:remaining]
 
+            # -----------------------------
+            # Prepare: surface/tensor -> RGB HWC u8 on pipeline device
+            # + NV12 CPU lane support
+            # -----------------------------
             t0_prep = time.perf_counter()
             batch_rgb: List[torch.Tensor] = []
 
             for item in batch:
+                # CPU lane returns torch.Tensor (either NV12 2D or RGB HWC 3D)
                 if isinstance(item, torch.Tensor):
                     t_cpu = item
+
+                    # NV12 heuristic: [H*3/2, W] uint8
                     is_nv12 = (
                         t_cpu.ndim == 2
                         and t_cpu.dtype == torch.uint8
@@ -340,6 +318,7 @@ class Pipeline:
                     )
 
                     if is_nv12:
+                        # Upload NV12 then CSC on device
                         if self.device.type != "cpu":
                             t0_up = time.perf_counter()
                             nv12_dev = t_cpu.to(self.device, non_blocking=True)
@@ -351,6 +330,7 @@ class Pipeline:
                         rgb = nv12_to_rgb_hwc_u8(nv12_dev, width=w, height=h)
                         metrics.t_csc += (time.perf_counter() - t0_csc)
                     else:
+                        # Assume RGB HWC u8
                         rgb = t_cpu
                         if self.device.type != "cpu":
                             t0_up = time.perf_counter()
@@ -360,12 +340,15 @@ class Pipeline:
                     batch_rgb.append(rgb.contiguous())
                     continue
 
+                # NVDEC lane returns a PyNvVideoCodec surface (dlpack)
                 t = wrap_surface_as_tensor(item)
+                # t is usually RGBP CHW u8 on GPU; convert to RGB HWC u8
                 if t.ndim == 3 and t.shape[-1] == 3:
                     rgb = t
                 else:
                     rgb = rgbp_chw_to_rgb_hwc_u8(t)
 
+                # Ensure on pipeline device (normally already correct for cuda)
                 if self.device.type != "cpu" and rgb.device != self.device:
                     rgb = rgb.to(self.device, non_blocking=True)
 
@@ -373,6 +356,9 @@ class Pipeline:
 
             metrics.t_prepare += (time.perf_counter() - t0_prep)
 
+            # -----------------------------
+            # Detect (optional)
+            # -----------------------------
             detections: List[Detection] = []
             if detector is not None:
                 if self.sbs_enabled and self.sbs_det_split:
@@ -431,7 +417,12 @@ class Pipeline:
             else:
                 detections = [Detection(boxes=None, scores=None, classes=None, masks=None) for _ in batch_rgb]
 
+            # -----------------------------
+            # Consumer: track/restore/composite/encode
+            # Drain encode ONCE per batch.
+            # -----------------------------
             if tracker is None or self.mode == "none":
+                # No tracker: encode directly, but sync once per batch (not per frame).
                 if self.enc_sync_before_encode:
                     sync_device(self.device)
                 t0 = time.perf_counter()
@@ -444,7 +435,7 @@ class Pipeline:
                 metrics.t_encode += (time.perf_counter() - t0)
                 return
 
-            safe_before_batch: int = frame_num
+            safe_before_batch: int = frame_num  # will advance as we process frames
 
             for i, rgb in enumerate(batch_rgb):
                 if self.max_frames is not None and frame_num >= self.max_frames:
@@ -481,13 +472,11 @@ class Pipeline:
                     for clip in step.new_clips:
                         t0 = time.perf_counter()
                         restored = restorer.restore_clip(clip)
-                        composite_clip_into_store(
+                        _composite_clip_into_store(
                             clip=clip,
                             restored_frames=restored,
                             store_bgr_u8=store.frames_bgr_u8,
-                            restorer_dtype=getattr(restorer, "dtype", torch.float32),
-                            lada_parity=self.lada_parity,
-                            params=CompositeParams(feather_radius=self.feather_radius),
+                            feather_radius=self.feather_radius,
                         )
                         metrics.t_restore += (time.perf_counter() - t0)
 
@@ -502,6 +491,7 @@ class Pipeline:
                 metrics.processed_frames += 1
                 pbar.update(1)
 
+            # Drain once per batch (sync once per drain happens inside drain_store_to_encoder)
             t0 = time.perf_counter()
             drain_store_to_encoder(
                 store=store,
@@ -514,6 +504,9 @@ class Pipeline:
 
         try:
             if use_thread_prefetch:
+                # -----------------------------
+                # 2-batch producer/consumer (ffmpeg-cpu only)
+                # -----------------------------
                 q = _queue.Queue(maxsize=2)
 
                 def _q_put(item: Optional[List[object]]) -> bool:
@@ -561,6 +554,9 @@ class Pipeline:
                     consume_batch(batch)
 
             else:
+                # -----------------------------
+                # NVDEC path: decode on main thread (fast + correct)
+                # -----------------------------
                 while True:
                     if self.max_frames is not None and frame_num >= self.max_frames:
                         break
@@ -575,6 +571,7 @@ class Pipeline:
                     consume_batch(list(batch0))
 
         finally:
+            # Stop producer safely and avoid deadlock if it is blocked on a full queue.
             stop.set()
             if prod is not None:
                 try:
@@ -587,19 +584,18 @@ class Pipeline:
             except Exception:
                 pass
 
+            # If producer failed, surface it now.
             if "e" in prod_exc:
                 raise prod_exc["e"]
 
             if tracker is not None and restorer is not None:
                 for clip in tracker.flush_eof():
                     restored = restorer.restore_clip(clip)
-                    composite_clip_into_store(
+                    _composite_clip_into_store(
                         clip=clip,
                         restored_frames=restored,
                         store_bgr_u8=store.frames_bgr_u8,
-                        restorer_dtype=getattr(restorer, "dtype", torch.float32),
-                        lada_parity=self.lada_parity,
-                        params=CompositeParams(feather_radius=self.feather_radius),
+                        feather_radius=self.feather_radius,
                     )
 
             drain_store_to_encoder(

@@ -450,18 +450,7 @@ class Scene:
 
 @dataclass
 class Clip:
-    """A normalized clip built from a Scene.
-
-    LADA parity behavior:
-      - Each stored crop is resized *independently* (not based on max crop in scene)
-        using scale_factor = min(1, clip_size/width, clip_size/height).
-      - Images are padded to (clip_size, clip_size) using pad_mode.
-      - Masks are padded with zeros (always), matching LADA.
-
-    Data conventions:
-      - frames: list of HWC uint8 (0..255) tensors on the decode device
-      - masks:  list of HW  uint8 (0..255) tensors on the decode device
-    """
+    """A normalized clip built from a Scene."""
 
     id: int
     frame_start: int
@@ -476,60 +465,47 @@ class Clip:
     pad_mode: str
 
     def __init__(self, *, scene: Scene, clip_id: int, clip_size: int, pad_mode: str = "reflect") -> None:
-        from gRestorer.utils.image_utils import pad_image, resize
-        import cv2
-
         if len(scene) == 0:
             raise ValueError("Cannot build clip from empty scene")
-
         self.id = int(clip_id)
+        self.frame_start = int(scene.frame_nums[0])
+        self.frame_end = int(scene.frame_nums[-1])
         self.frame_nums = list(scene.frame_nums)
-        self.frame_start = int(self.frame_nums[0])
-        self.frame_end = int(self.frame_nums[-1])
         self.clip_size = int(clip_size)
         self.pad_mode = str(pad_mode)
-
-        # IMPORTANT: LADA uses the *crop boxes* (expanded-to-target) as the paste-back box.
         self.boxes = list(scene.crop_boxes)
         self.crop_shapes = [(int(x.shape[0]), int(x.shape[1])) for x in scene.crops]
+
+        max_h, max_w = scene.max_crop_hw()
+        if max_h <= 0 or max_w <= 0:
+            raise ValueError("Invalid max crop size")
+
+        scale_h = self.clip_size / float(max_h)
+        scale_w = self.clip_size / float(max_w)
 
         self.frames = []
         self.masks = []
         self.pad_after_resizes = []
 
-        # LADA: normalize apparent scale across the whole clip using the
-        # largest *crop box* in the scene. This keeps the ROI geometry stable
-        # frame-to-frame (less jitter / "ice slab" artifacts).
-        max_h = 1
-        max_w = 1
-        for (t, l, b, r) in self.boxes:
-            max_h = max(max_h, int(b - t + 1))
-            max_w = max(max_w, int(r - l + 1))
-
-        scale_h = float(self.clip_size) / float(max_h)
-        scale_w = float(self.clip_size) / float(max_w)
-
         for i, crop_u8 in enumerate(scene.crops):
-            if crop_u8.dtype != torch.uint8 or crop_u8.ndim != 3 or crop_u8.shape[2] != 3:
-                raise ValueError(f"Expected HWC uint8 crop, got {tuple(crop_u8.shape)} {crop_u8.dtype}")
-
             ch, cw = self.crop_shapes[i]
-
-            # LADA uses int() truncation here (not ceil). Clamp to >=1.
             out_h = max(1, int(ch * scale_h))
             out_w = max(1, int(cw * scale_w))
 
-            # Resize crop and pad to clip_size.
-            img_rs = resize(crop_u8, (out_h, out_w), interpolation=cv2.INTER_LINEAR)
-            img_pd, pad = pad_image(img_rs, self.clip_size, self.clip_size, mode=self.pad_mode)
+            img_f = crop_u8.to(torch.float32) / 255.0
+            img_rs = resize_hwc(img_f, (out_h, out_w), mode="bilinear")
+            img_pd, pad = pad_image_hwc(
+                img_rs, (self.clip_size, self.clip_size), pad_mode=self.pad_mode, pad_value=0.0
+            )
 
-            # Build / normalize mask in crop coordinates (HW uint8).
             m = scene.masks[i]
             if m is None:
-                # Fallback: rectangle mask derived from roi_box (full-frame) intersected with crop_box.
-                roi_t, roi_l, roi_b, roi_r = scene.roi_boxes[i]
-                crop_t, crop_l, crop_b, crop_r = scene.crop_boxes[i]
+                # Build a per-frame ROI mask from the ROI box, in *crop coordinates*.
+                # This prevents "mask = full crop" which causes alpha to affect huge areas.
+                roi_t, roi_l, roi_b, roi_r = scene.roi_boxes[i]  # full-frame coords (tlbr, inclusive)
+                crop_t, crop_l, crop_b, crop_r = scene.crop_boxes[i]  # full-frame coords (tlbr, inclusive)
 
+                # Convert ROI box into crop-local coordinates.
                 mt = max(0, roi_t - crop_t)
                 ml = max(0, roi_l - crop_l)
                 mb = min(ch - 1, roi_b - crop_t)
@@ -539,21 +515,17 @@ class Clip:
                 if mb >= mt and mr >= ml:
                     m[mt: mb + 1, ml: mr + 1] = 255
             else:
-                if m.ndim == 3 and m.shape[-1] == 1:
-                    m = m[..., 0]
+                # Optional safety: ensure mask is HW and uint8.
                 if m.ndim != 2:
                     raise ValueError(f"Expected HW mask, got {tuple(m.shape)}")
                 if m.dtype != torch.uint8:
                     m = (m > 0).to(torch.uint8) * 255
 
-            # Resize + pad mask (LADA pads mask with zeros regardless of pad_mode).
-            m_hwc1 = m.unsqueeze(-1)
-            m_rs = resize(m_hwc1, (out_h, out_w), interpolation=cv2.INTER_NEAREST)
-            m_pd, _ = pad_image(m_rs, self.clip_size, self.clip_size, mode="zero")
-            m_pd_hw = m_pd[..., 0].contiguous()
+            m_rs = resize_hw_mask(m, (out_h, out_w))
+            m_pd, _ = pad_mask_hw(m_rs, (self.clip_size, self.clip_size))
 
-            self.frames.append(img_pd.contiguous())
-            self.masks.append(m_pd_hw)
+            self.frames.append(img_pd)
+            self.masks.append(m_pd)
             self.pad_after_resizes.append(pad)
 
     def __len__(self) -> int:
@@ -565,10 +537,10 @@ class Clip:
         return self.boxes
 
     def pop(self) -> Tuple[torch.Tensor, torch.Tensor, Box, Tuple[int, int], Pad]:
-        """Pop the earliest clip element (LADA-style).
+        """Pop the earliest clip element.
 
-        We advance frame_start as frames are popped so a clip can be applied by matching
-        `clip.frame_start == frame_num` and popping once per frame.
+        LADA-faithful behavior: advance frame_start as frames are popped so a clip can be
+        applied by matching `clip.frame_start == frame_num` and popping once per frame.
         """
         frame = self.frames.pop(0)
         mask = self.masks.pop(0)
@@ -576,6 +548,7 @@ class Clip:
         crop_shape = self.crop_shapes.pop(0)
         pad = self.pad_after_resizes.pop(0)
 
+        # Keep frame_nums/frame_start in sync with pops (LADA-style).
         if self.frame_nums:
             self.frame_nums.pop(0)
 
@@ -583,6 +556,7 @@ class Clip:
             self.frame_start = int(self.frame_nums[0])
             self.frame_end = int(self.frame_nums[-1])
         else:
+            # Mark empty: keep invariant frame_start > frame_end
             old_end = int(self.frame_end)
             self.frame_start = old_end + 1
             self.frame_end = old_end

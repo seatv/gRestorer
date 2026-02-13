@@ -23,6 +23,7 @@ def _parse_rgb_triplet(s: str) -> Tuple[int, int, int]:
 
 
 def _parse_ext_list(s: str) -> list[str]:
+    # ".mp4,.mkv" -> [".mp4",".mkv"]
     out: list[str] = []
     for p in s.split(","):
         p = p.strip()
@@ -35,10 +36,16 @@ def _parse_ext_list(s: str) -> list[str]:
 
 
 def _default_config_path() -> Optional[Path]:
+    """
+    Pick a sane default config.json path:
+      1) ./config.json (cwd)
+      2) repo-root-relative to this file: <...>/gRestorer/config.json
+    """
     cwd = Path.cwd() / "config.json"
     if cwd.exists():
         return cwd
 
+    # gRestorer/gRestorer/cli/config.py -> parents[2] is repo root "gRestorer"
     here = Path(__file__).resolve()
     for up in (2, 3, 1):
         try:
@@ -90,9 +97,8 @@ def create_parser() -> argparse.ArgumentParser:
     # --- Decoder ---
     p.add_argument("--dec-gpu-id", type=int, default=None)
     p.add_argument("--dec-output-format", choices=["RGB", "RGBP"], default=None)
-    p.add_argument("--dec-ffmpeg-input-args", default=None, help="Extra ffmpeg input args for CPU decode fallback (inserted before -i; must not contain -i)")
 
-    # --- Encoder base ---
+    # --- Encoder ---
     p.add_argument("--enc-codec", choices=["hevc", "h264"], default=None)
     p.add_argument("--enc-preset", default=None)
     p.add_argument("--enc-profile", default=None)
@@ -100,18 +106,6 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--enc-format", default=None)
     p.add_argument("--enc-gpu-id", type=int, default=None)
     p.add_argument("--enc-sync-before-encode", action=argparse.BooleanOptionalAction, default=None)
-
-    # --- Encoder advanced (NVENC knobs) ---
-    p.add_argument("--enc-mode", choices=["hq", "preview", "archive", "custom"], default=None, help="Encoder preset mode")
-    p.add_argument("--enc-options", default=None, help="FFmpeg-style NVENC options string (e.g. \"-rc constqp -qp 18 -spatial_aq 1\")")
-    p.add_argument("--enc-opt", action="append", default=None, help="NVENC option KEY=VALUE (repeatable)")
-    p.add_argument("--enc-allow-unknown", action=argparse.BooleanOptionalAction, default=None, help="Allow passing unknown NVENC option keys (best-effort)")
-
-    # --- Remux / muxing ---
-    p.add_argument("--mux-audio", choices=["auto", "copy", "aac", "none"], default=None, help="Audio mux policy")
-    p.add_argument("--mux-keep-subs", action=argparse.BooleanOptionalAction, default=None, help="Keep subtitles (mkv: copy; mp4: mov_text)")
-    p.add_argument("--mux-extra-args", default=None, help="Extra ffmpeg args appended to remux step (must not include -i)")
-    p.add_argument("--mp4-fast-start", action=argparse.BooleanOptionalAction, default=None, help="MP4 faststart (+faststart)")
 
     # --- Detection ---
     p.add_argument("--det-model", default=None)
@@ -196,12 +190,12 @@ def parse_args(argv: list[str] | None = None) -> Config:
             raise FileNotFoundError(f"Config not found: {cfg_path}")
         cfg.merge_dict(_load_config_json(cfg_path))
 
-    # Required basics
+    # Required basics (always override config)
     cfg.set("input", value=str(args.input))
     cfg.set("output", value=str(args.output))
     _set_if_not_none(cfg, ("max_frames",), args.max_frames)
 
-    # Defaults
+    # Defaults (so `gRestorer --input ... --output ...` works)
     if cfg.get("mode", default=None) is None:
         cfg.set("mode", value="real")
     if cfg.get("restorer", default=None) is None:
@@ -211,7 +205,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("mode",), args.mode)
     _set_if_not_none(cfg, ("restorer",), args.restorer)
 
-    # Global GPU id
+    # Global GPU id (fan out unless more specific overrides exist)
     if args.gpu_id is not None:
         cfg.set("decoder", "gpu_id", value=int(args.gpu_id))
         cfg.set("encoder", "gpu_id", value=int(args.gpu_id))
@@ -224,9 +218,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
     # Decoder
     _set_if_not_none(cfg, ("decoder", "gpu_id"), args.dec_gpu_id)
     _set_if_not_none(cfg, ("decoder", "output_format"), args.dec_output_format)
-    _set_if_not_none(cfg, ("decoder", "ffmpeg_input_args"), args.dec_ffmpeg_input_args)
 
-    # Encoder base
+    # Encoder
     _set_if_not_none(cfg, ("encoder", "codec"), args.enc_codec)
     _set_if_not_none(cfg, ("encoder", "preset"), args.enc_preset)
     _set_if_not_none(cfg, ("encoder", "profile"), args.enc_profile)
@@ -234,34 +227,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("encoder", "format"), args.enc_format)
     _set_if_not_none(cfg, ("encoder", "gpu_id"), args.enc_gpu_id)
     _set_if_not_none(cfg, ("encoder", "sync_before_encode"), args.enc_sync_before_encode)
-
-    # Encoder advanced
-    _set_if_not_none(cfg, ("encoder", "mode"), args.enc_mode)
-    _set_if_not_none(cfg, ("encoder", "options"), args.enc_options)
-    _set_if_not_none(cfg, ("encoder", "allow_unknown"), args.enc_allow_unknown)
-
-    if args.enc_opt:
-        # Merge into existing encoder.opt dict
-        cur = cfg.get("encoder", "opt", default={}) or {}
-        if not isinstance(cur, dict):
-            cur = {}
-        merged = dict(cur)
-        for item in args.enc_opt:
-            if "=" not in item:
-                raise ValueError(f"--enc-opt expects KEY=VALUE, got: {item!r}")
-            k, v = item.split("=", 1)
-            k = k.strip()
-            v = v.strip()
-            if not k:
-                raise ValueError(f"--enc-opt invalid key in: {item!r}")
-            merged[k] = v
-        cfg.set("encoder", "opt", value=merged)
-
-    # Remux / muxing
-    _set_if_not_none(cfg, ("encoder", "mux_audio"), args.mux_audio)
-    _set_if_not_none(cfg, ("encoder", "mux_keep_subs"), args.mux_keep_subs)
-    _set_if_not_none(cfg, ("encoder", "mux_extra_args"), args.mux_extra_args)
-    _set_if_not_none(cfg, ("encoder", "mp4_faststart"), args.mp4_fast_start)
 
     # Detection
     _set_if_not_none(cfg, ("detection", "model_path"), args.det_model)
@@ -280,7 +245,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("restoration", "pad_mode"), args.rest_pad_mode)
     _set_if_not_none(cfg, ("restoration", "feather_radius"), args.rest_feather_radius)
 
-    # Scene tracking
+    # Scene tracking (kept for config parity)
     _set_if_not_none(cfg, ("scene_tracking", "min_iou"), args.trk_min_iou)
     _set_if_not_none(cfg, ("scene_tracking", "max_clip_frames"), args.trk_max_clip_frames)
     _set_if_not_none(cfg, ("scene_tracking", "min_clip_frames"), args.trk_min_clip_frames)
@@ -319,7 +284,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     if args.profile_sync:
         cfg.set("profile_sync", value=True)
 
-    # Validation
+    # --- Validation (after config merge + CLI overrides) ---
     inp = Path(str(cfg.get("input", default="")))
     if not inp.exists():
         raise FileNotFoundError(f"Input not found: {inp}")

@@ -1,45 +1,30 @@
 {
-  "lada_parity": true,
   "roi_dilate": 4,
   "use_seg_masks": true,
   "batch_size": 8,
   "debug": false,
 
   "synth_mosaic": {
-    "block_size": 40,
-    "rois": [
-      [240, 260, 820, 980],
-      [920, 1520, 1500, 2240],
-      [1460, 2480, 2060, 3340]
-    ]
+  "block_size": 40,
+  "rois": [
+    [240,260,820,980],
+    [920,1520,1500,2240],
+    [1460,2480,2060,3340]
+   ]
   },
-
   "decoder": {
-    "output_format": "RGBP",
-    "gpu_id": 0,
-    "ffmpeg_input_args": ""
+    "output_format": "RGB",
+    "gpu_id": 0
   },
-
   "encoder": {
     "codec": "hevc",
-    "mode": "hq",
     "preset": "P7",
     "profile": "main",
     "qp": 20,
     "format": "ARGB",
     "gpu_id": 0,
-    "sync_before_encode": true,
-
-    "options": "",
-    "opt": {},
-    "allow_unknown": false,
-
-    "mux_audio": "auto",
-    "mux_keep_subs": false,
-    "mux_extra_args": "",
-    "mp4_faststart": true
+	"sync_before_encode": true
   },
-
   "detection": {
     "model_path": "D:\\Models\\lada\\lada_mosaic_detection_model_v3.1_accurate.pt",
     "batch_size": 8,
@@ -48,37 +33,32 @@
     "imgsz": 960,
     "fp16": true
   },
-
   "restoration": {
     "rest_model_path": "D:\\Models\\lada\\lada_mosaic_restoration_model_generic_v1.2.pth",
     "fp16": true,
     "max_clip_length": 9,
     "clip_size": 256,
     "border_ratio": 0.06,
-    "pad_mode": "zero",
+    "pad_mode": "reflect",
     "feather_radius": 0
   },
-
   "scene_tracking": {
     "min_iou": 0.3,
     "max_clip_frames": 120,
     "min_clip_frames": 5
   },
-
   "visualization": {
     "box_color": [0, 255, 0],
     "box_thickness": 5,
     "show_confidence": true,
     "show_class": true,
-    "fill_color": [128, 128, 128],
+    "fill_color": [128,128,128],
     "fill_opacity": 0.5
   },
-
   "batch_processing": {
     "video_extensions": [".mp4", ".mkv", ".avi", ".mov"],
     "skip_existing": false
   },
-
   "debug": {
     "save_detection_frames": false,
     "save_detection_json": false,

@@ -1,24 +1,21 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 import torch
 
 from gRestorer.core.scene import Clip
 from gRestorer.restorer.clip_restorer import BaseClipRestorer
+
 from gRestorer.models.basicvsrpp.inference import load_model
 
 
 class BasicVSRPPClipRestorer(BaseClipRestorer):
-    """
-    Robust BasicVSR++ clip restorer.
+    """LADA-faithful BasicVSR++ clip restorer.
 
-    Accepts Clip.frames as:
-      - HWC uint8 [0..255], or
-      - HWC float [0..1], or
-      - HWC float [0..255] (we'll auto-normalize)
-
-    Produces restored frames as HWC float in [0..1] on device.
+    - Operates on Clip.frames (HWC float32 in [0,1], BGR order) already on device.
+    - Produces restored clip frames (HWC float32 in [0,1], BGR order) on device.
+    - No CPU round-trips inside the hot path.
     """
 
     def __init__(
@@ -31,48 +28,34 @@ class BasicVSRPPClipRestorer(BaseClipRestorer):
     ) -> None:
         super().__init__(device=device)
         self.checkpoint_path = str(checkpoint_path)
-        self.fp16 = bool(fp16) and (device.type == "cuda")  # keep conservative
+        self.fp16 = bool(fp16) and device.type == "cuda"
+
+        # Build + load model (once).
+        # Note: mmengine loads ckpt on CPU then moves to device; that cost is paid once.
         self.model = load_model(config, self.checkpoint_path, device=self.device, fp16=self.fp16)
         self.model.eval()
 
-    @staticmethod
-    def _to_float01_hwc(x: torch.Tensor) -> torch.Tensor:
-        if x.dtype == torch.uint8:
-            return x.to(dtype=torch.float32) / 255.0
-        xf = x.to(dtype=torch.float32)
-        # If values look like 0..255, normalize.
-        # (We treat >1.5 as "probably 0..255".)
-        try:
-            vmax = float(xf.max().item())
-        except Exception:
-            vmax = 0.0
-        if vmax > 1.5:
-            xf = xf / 255.0
-        return xf
-
     @torch.inference_mode()
     def restore_clip(self, clip: Clip) -> List[torch.Tensor]:
+        # Clip.frames: list[T] of HWC float in [0,1] on self.device.
         frames = clip.frames
         if not frames:
             return []
 
-        # Normalize to float [0..1] HWC
-        frames01 = [self._to_float01_hwc(f) for f in frames]
-
-        # Stack to BTCHW (BGR order preserved)
-        tchw = torch.stack([f.permute(2, 0, 1).contiguous() for f in frames01], dim=0)  # TCHW
+        # Stack to BTCHW without changing channel order (BGR is kept as-is, matching LADA bgr2rgb=False path).
+        tchw = torch.stack([f.permute(2, 0, 1).contiguous() for f in frames], dim=0)  # TCHW
         btchw = tchw.unsqueeze(0)  # 1,T,C,H,W
 
-        btchw = btchw.to(dtype=torch.float16 if self.fp16 else torch.float32)
+        if self.fp16:
+            btchw = btchw.to(dtype=torch.float16)
+        else:
+            btchw = btchw.to(dtype=torch.float32)
 
-        out = self.model(inputs=btchw)          # BTCHW
-        out_tchw = out.squeeze(0)               # TCHW
+        out = self.model(inputs=btchw)  # -> BTCHW
+        out_tchw = out.squeeze(0)       # -> TCHW
 
-        out_frames: List[torch.Tensor] = []
-        for x in out_tchw:
-            hwc = x.permute(1, 2, 0).contiguous()
-            # Keep it sane
-            out_frames.append(hwc.clamp(0.0, 1.0))
+        # Back to list of HWC floats in [0,1]
+        out_frames: List[torch.Tensor] = [x.permute(1, 2, 0).contiguous() for x in out_tchw]
         return out_frames
 
 
