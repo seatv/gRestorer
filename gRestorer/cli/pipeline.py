@@ -1,16 +1,16 @@
 # gRestorer/cli/pipeline.py
 from __future__ import annotations
 
+import datetime as _dt
+import queue as _queue
+import threading as _threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
 import torch
 from tqdm import tqdm
-
-from dataclasses import dataclass, field
-
 
 from gRestorer.core.scene_tracker import SceneTracker, TrackerConfig
 from gRestorer.detector.core import Detection, Detector as YoloDetector
@@ -29,6 +29,7 @@ from .pipeline_utils import (
     cfg_first,
     cfg_path,
     drain_store_to_encoder,
+    nv12_to_rgb_hwc_u8,
     rgb_hwc_to_bgr_hwc_u8,
     rgbp_chw_to_rgb_hwc_u8,
     seam_split_boxes,
@@ -39,34 +40,25 @@ from .pipeline_utils import (
     wrap_surface_as_tensor,
 )
 
-import datetime as _dt
-from dataclasses import dataclass
-
-# Box = (t,l,b,r) inclusive (matches your pipeline_utils.Box)
-# If Box isn't in scope here, import it:
-# from .pipeline_utils import Box
-
 
 @dataclass
 class DetStats:
     frames_total: int = 0
     frames_with_det: int = 0
     total_boxes: int = 0
-    total_roi_area_px: float = 0.0  # sum of box areas (not union), accumulated over frames with det
+    total_roi_area_px: float = 0.0
     frame_area_px: int = 0
 
     def add(self, boxes, w: int, h: int) -> None:
         self.frames_total += 1
         if self.frame_area_px == 0:
             self.frame_area_px = int(w) * int(h)
-
         if not boxes:
             return
 
         self.frames_with_det += 1
         self.total_boxes += len(boxes)
 
-        # area = sum of box areas (ignores overlap; fast + stable)
         a = 0.0
         for (t, l, b, r) in boxes:
             ww = max(0, int(r) - int(l) + 1)
@@ -92,6 +84,11 @@ class PipelineMetrics:
     t_encode: float = 0.0
     t_mux: float = 0.0
 
+    t_queue_wait: float = 0.0
+    t_prepare: float = 0.0
+    t_upload: float = 0.0
+    t_csc: float = 0.0
+
     wall_start: _dt.datetime | None = None
     wall_end: _dt.datetime | None = None
 
@@ -99,7 +96,6 @@ class PipelineMetrics:
 
     def sum_parts(self) -> float:
         return self.t_decode + self.t_det + self.t_track + self.t_restore + self.t_encode
-
 
 
 def _pick_device(gpu_id: int) -> torch.device:
@@ -157,12 +153,15 @@ class Pipeline:
         self.mode: str = str(self.cfg.get("mode", default="real")).lower()
         self.restorer_name: str = str(self.cfg.get("restorer", default="basicvsrpp")).lower()
 
+        # Decoder extra knobs
+        self.dec_output_format: str = str(self.cfg.get("decoder", "output_format", default="RGBP")).upper()
+        self.dec_ffmpeg_input_args: str = str(self.cfg.get("decoder", "ffmpeg_input_args", default="") or "")
+
         self.det_model: str = cfg_path(self.cfg, ("detection", "model_path"), default="")
         self.det_imgsz: int = int(self.cfg.get("detection", "imgsz", default=640))
         self.det_conf: float = float(self.cfg.get("detection", "conf_threshold", default=0.30))
         self.det_iou: float = float(self.cfg.get("detection", "iou_threshold", default=0.70))
         self.det_fp16: bool = bool(self.cfg.get("detection", "fp16", default=True))
-        self.det_batch_size: int = int(self.cfg.get("detection", "batch_size", default=self.batch_size))
 
         self.roi_dilate: int = int(self.cfg.get("roi_dilate", default=0))
         self.use_seg_masks: bool = bool(self.cfg.get("use_seg_masks", default=True))
@@ -179,11 +178,26 @@ class Pipeline:
         self.rest_pad_mode: str = str(self.cfg.get("restoration", "pad_mode", default="reflect"))
         self.feather_radius: int = int(self.cfg.get("restoration", "feather_radius", default=0))
 
+        # Encoder base
         self.enc_codec: str = str(self.cfg.get("encoder", "codec", default="hevc")).lower()
         self.enc_preset: str = str(self.cfg.get("encoder", "preset", default="P6"))
         self.enc_profile: str = str(self.cfg.get("encoder", "profile", default="main"))
         self.enc_qp: int = int(self.cfg.get("encoder", "qp", default=20))
         self.enc_sync_before_encode: bool = bool(self.cfg.get("encoder", "sync_before_encode", default=True))
+
+        # Encoder advanced
+        self.enc_mode: str = str(self.cfg.get("encoder", "mode", default="hq") or "hq").lower()
+        self.enc_options_str: str = str(self.cfg.get("encoder", "options", default="") or "")
+        self.enc_opt_dict = self.cfg.get("encoder", "opt", default={}) or {}
+        if not isinstance(self.enc_opt_dict, dict):
+            self.enc_opt_dict = {}
+        self.enc_allow_unknown: bool = bool(self.cfg.get("encoder", "allow_unknown", default=False))
+
+        # Mux/remux
+        self.mux_audio: str = str(self.cfg.get("encoder", "mux_audio", default="auto") or "auto").lower()
+        self.mux_keep_subs: bool = bool(self.cfg.get("encoder", "mux_keep_subs", default=False))
+        self.mux_extra_args: str = str(self.cfg.get("encoder", "mux_extra_args", default="") or "")
+        self.mp4_faststart: bool = bool(self.cfg.get("encoder", "mp4_faststart", default=True))
 
     def _build_detector(self) -> Optional[YoloDetector]:
         if self.mode == "none":
@@ -226,20 +240,21 @@ class Pipeline:
         out = Path(self.output_path)
         out.parent.mkdir(parents=True, exist_ok=True)
 
-        # Init timers
         metrics = PipelineMetrics()
         metrics.wall_start = _dt.datetime.now()
-        t0_all = time.perf_counter()  # overall wall time (no mux)
+        t0_all = time.perf_counter()
 
         decoder = Decoder(
             input_path=str(inp),
             gpu_id=self.dec_gpu_id,
             batch_size=self.batch_size,
+            output_format=self.dec_output_format,
+            ffmpeg_input_args=self.dec_ffmpeg_input_args,
         )
 
         w = int(decoder.metadata.width)
         h = int(decoder.metadata.height)
-        fps = float(decoder.metadata.fps)
+        fps = float(decoder.metadata.fps or 0.0) or 0.0
         total_frames = int(decoder.metadata.num_frames or 0)
 
         if self.sbs_enabled:
@@ -259,6 +274,15 @@ class Pipeline:
             qp=self.enc_qp,
             gpu_id=self.enc_gpu_id,
             input_path=str(inp),
+            mode=self.enc_mode,
+            nvenc_options_str=self.enc_options_str,
+            nvenc_options=self.enc_opt_dict,
+            nvenc_allow_unknown=self.enc_allow_unknown,
+            mux_audio=self.mux_audio,
+            mux_keep_subs=self.mux_keep_subs,
+            mux_extra_args=self.mux_extra_args,
+            mp4_faststart=self.mp4_faststart,
+            max_frames=self.max_frames,
         )
 
         detector = self._build_detector()
@@ -282,176 +306,317 @@ class Pipeline:
         pbar = tqdm(total=pbar_total, disable=self.debug)
 
         frame_num = 0
-        t0_all = time.perf_counter()
 
-        try:
-            while True:
+        # Prefetch threading is only safe/valuable for ffmpeg-cpu lane.
+        # NVDEC/PyNvVideoCodec decode is not reliably thread-safe across threads.
+        use_thread_prefetch = getattr(decoder, "_ffmpeg_proc", None) is not None
+
+        stop = _threading.Event()
+        prod_exc: dict[str, BaseException] = {}
+        prod: Optional[_threading.Thread] = None
+        q: Optional[_queue.Queue[Optional[List[object]]]] = None
+
+        def consume_batch(batch: List[object]) -> None:
+            nonlocal frame_num
+
+            # If we're stopping early, trim batch to remaining frames.
+            if self.max_frames is not None:
+                remaining = self.max_frames - frame_num
+                if remaining <= 0:
+                    return
+                if len(batch) > remaining:
+                    batch = batch[:remaining]
+
+            # -----------------------------
+            # Prepare: surface/tensor -> RGB HWC u8 on pipeline device
+            # + NV12 CPU lane support
+            # -----------------------------
+            t0_prep = time.perf_counter()
+            batch_rgb: List[torch.Tensor] = []
+
+            for item in batch:
+                # CPU lane returns torch.Tensor (either NV12 2D or RGB HWC 3D)
+                if isinstance(item, torch.Tensor):
+                    t_cpu = item
+
+                    # NV12 heuristic: [H*3/2, W] uint8
+                    is_nv12 = (
+                        t_cpu.ndim == 2
+                        and t_cpu.dtype == torch.uint8
+                        and int(t_cpu.shape[0]) == (h * 3 // 2)
+                        and int(t_cpu.shape[1]) == w
+                    )
+
+                    if is_nv12:
+                        # Upload NV12 then CSC on device
+                        if self.device.type != "cpu":
+                            t0_up = time.perf_counter()
+                            nv12_dev = t_cpu.to(self.device, non_blocking=True)
+                            metrics.t_upload += (time.perf_counter() - t0_up)
+                        else:
+                            nv12_dev = t_cpu
+
+                        t0_csc = time.perf_counter()
+                        rgb = nv12_to_rgb_hwc_u8(nv12_dev, width=w, height=h)
+                        metrics.t_csc += (time.perf_counter() - t0_csc)
+                    else:
+                        # Assume RGB HWC u8
+                        rgb = t_cpu
+                        if self.device.type != "cpu":
+                            t0_up = time.perf_counter()
+                            rgb = rgb.to(self.device, non_blocking=True)
+                            metrics.t_upload += (time.perf_counter() - t0_up)
+
+                    batch_rgb.append(rgb.contiguous())
+                    continue
+
+                # NVDEC lane returns a PyNvVideoCodec surface (dlpack)
+                t = wrap_surface_as_tensor(item)
+                # t is usually RGBP CHW u8 on GPU; convert to RGB HWC u8
+                if t.ndim == 3 and t.shape[-1] == 3:
+                    rgb = t
+                else:
+                    rgb = rgbp_chw_to_rgb_hwc_u8(t)
+
+                # Ensure on pipeline device (normally already correct for cuda)
+                if self.device.type != "cpu" and rgb.device != self.device:
+                    rgb = rgb.to(self.device, non_blocking=True)
+
+                batch_rgb.append(rgb.contiguous())
+
+            metrics.t_prepare += (time.perf_counter() - t0_prep)
+
+            # -----------------------------
+            # Detect (optional)
+            # -----------------------------
+            detections: List[Detection] = []
+            if detector is not None:
+                if self.sbs_enabled and self.sbs_det_split:
+                    left_frames: List[torch.Tensor] = []
+                    right_frames: List[torch.Tensor] = []
+                    half_w = w // 2
+                    for rgb in batch_rgb:
+                        l, r = split_frame_lr(rgb, layout=self.sbs_layout)
+                        left_frames.append(l.contiguous())
+                        right_frames.append(r.contiguous())
+
+                    t0 = time.perf_counter()
+                    det_l = detector.detect_batch(left_frames)
+                    det_r = detector.detect_batch(right_frames)
+                    metrics.t_det += (time.perf_counter() - t0)
+
+                    for dl, dr in zip(det_l, det_r):
+                        boxes_l = _tensor_boxes_to_list_xyxy(dl.boxes)
+                        boxes_r = _tensor_boxes_to_list_xyxy(dr.boxes)
+                        masks_l = _extract_masks_list(dl) if self.use_seg_masks else None
+                        masks_r = _extract_masks_list(dr) if self.use_seg_masks else None
+
+                        merged_boxes = unsplit_boxes_layout(
+                            boxes_l, boxes_r, half_w=half_w, layout=self.sbs_layout
+                        )
+                        merged_masks = unsplit_masks_layout(
+                            masks_l, masks_r, full_w=w, half_w=half_w, layout=self.sbs_layout
+                        )
+
+                        det = Detection(
+                            boxes=torch.tensor(
+                                [[b[1], b[0], b[3], b[2]] for b in merged_boxes],
+                                dtype=torch.float32,
+                                device="cpu",
+                            )
+                            if merged_boxes
+                            else None,
+                            scores=None,
+                            classes=None,
+                            masks=None,
+                        )
+
+                        if merged_masks is not None:
+                            try:
+                                mm = [m for m in merged_masks if m is not None]
+                                if len(mm) == len(merged_masks) and len(mm) > 0:
+                                    det.masks = torch.stack(mm, dim=0)
+                            except Exception:
+                                det.masks = None
+
+                        detections.append(det)
+                else:
+                    t0 = time.perf_counter()
+                    detections = detector.detect_batch(batch_rgb)
+                    metrics.t_det += (time.perf_counter() - t0)
+            else:
+                detections = [Detection(boxes=None, scores=None, classes=None, masks=None) for _ in batch_rgb]
+
+            # -----------------------------
+            # Consumer: track/restore/composite/encode
+            # Drain encode ONCE per batch.
+            # -----------------------------
+            if tracker is None or self.mode == "none":
+                # No tracker: encode directly, but sync once per batch (not per frame).
+                if self.enc_sync_before_encode:
+                    sync_device(self.device)
+                t0 = time.perf_counter()
+                for rgb in batch_rgb:
+                    bgr_u8 = rgb_hwc_to_bgr_hwc_u8(rgb)
+                    encoder.encode_frame(bgr_u8_to_bgra_u8(bgr_u8))
+                    frame_num += 1
+                    metrics.processed_frames += 1
+                    pbar.update(1)
+                metrics.t_encode += (time.perf_counter() - t0)
+                return
+
+            safe_before_batch: int = frame_num  # will advance as we process frames
+
+            for i, rgb in enumerate(batch_rgb):
                 if self.max_frames is not None and frame_num >= self.max_frames:
                     break
 
+                det = detections[i] if i < len(detections) else Detection(boxes=None, scores=None, classes=None, masks=None)
+                bgr_u8 = rgb_hwc_to_bgr_hwc_u8(rgb)
+
+                boxes = _tensor_boxes_to_list_xyxy(det.boxes)
+                masks_list = _extract_masks_list(det) if (self.use_seg_masks and det.masks is not None) else None
+
+                if self.roi_dilate > 0 and boxes:
+                    dil = self.roi_dilate
+                    boxes = [(t - dil, l - dil, b + dil, r + dil) for (t, l, b, r) in boxes]
+
+                if boxes:
+                    boxes = [clip_box_to_bounds(bx, w=w, h=h) for bx in boxes]
+
+                if self.sbs_enabled and boxes:
+                    seam_x = w // 2
+                    boxes, masks_list = seam_split_boxes(
+                        boxes, seam_x=seam_x, full_w=w, full_h=h, masks=masks_list
+                    )
+
+                metrics.det_stats.add(boxes, w=w, h=h)
+
+                store.put(frame_num, bgr_u8)
+
                 t0 = time.perf_counter()
-                batch = decoder.read_batch()
-                metrics.t_decode += (time.perf_counter() - t0)
+                step = tracker.step_frame(frame_num, bgr_u8, boxes, masks_list)
+                metrics.t_track += (time.perf_counter() - t0)
 
-                if not batch:
-                    break
-
-                batch_rgb: List[torch.Tensor] = []
-                for surf in batch:
-                    # NVDEC backend yields PyNvVideoCodec surfaces (RGBP on GPU).
-                    # ffmpeg CPU fallback yields torch.Tensor frames (RGB HWC uint8 on CPU).
-                    if isinstance(surf, torch.Tensor):
-                        rgb = surf
-                    else:
-                        t = wrap_surface_as_tensor(surf)
-                        # Be tolerant: if upstream gives HWC already, keep it.
-                        if t.ndim == 3 and t.shape[-1] == 3:
-                            rgb = t
-                        else:
-                            rgb = rgbp_chw_to_rgb_hwc_u8(t)
-
-                    # Ensure frames live on the pipeline device (no-op if already there).
-                    if self.device.type != "cpu":
-                        rgb = rgb.to(self.device, non_blocking=True)
-
-                    batch_rgb.append(rgb)
-
-                detections: List[Detection] = []
-                if detector is not None:
-                    if self.sbs_enabled and self.sbs_det_split:
-                        left_frames: List[torch.Tensor] = []
-                        right_frames: List[torch.Tensor] = []
-                        half_w = w // 2
-                        for rgb in batch_rgb:
-                            l, r = split_frame_lr(rgb, layout=self.sbs_layout)
-                            left_frames.append(l.contiguous())
-                            right_frames.append(r.contiguous())
-
+                if step.new_clips and restorer is not None:
+                    for clip in step.new_clips:
                         t0 = time.perf_counter()
-                        det_l = detector.detect_batch(left_frames)
-                        det_r = detector.detect_batch(right_frames)
-                        metrics.t_det += (time.perf_counter() - t0)
+                        restored = restorer.restore_clip(clip)
+                        _composite_clip_into_store(
+                            clip=clip,
+                            restored_frames=restored,
+                            store_bgr_u8=store.frames_bgr_u8,
+                            feather_radius=self.feather_radius,
+                        )
+                        metrics.t_restore += (time.perf_counter() - t0)
 
-                        for dl, dr in zip(det_l, det_r):
-                            boxes_l = _tensor_boxes_to_list_xyxy(dl.boxes)
-                            boxes_r = _tensor_boxes_to_list_xyxy(dr.boxes)
-                            masks_l = _extract_masks_list(dl) if self.use_seg_masks else None
-                            masks_r = _extract_masks_list(dr) if self.use_seg_masks else None
+                min_start = tracker.min_active_start()
+                safe_before = int(min_start) if min_start is not None else int(frame_num + 1)
+                safe_before_batch = safe_before
 
-                            merged_boxes = unsplit_boxes_layout(boxes_l, boxes_r, half_w=half_w, layout=self.sbs_layout)
-                            merged_masks = unsplit_masks_layout(masks_l, masks_r, full_w=w, half_w=half_w, layout=self.sbs_layout)
+                if (len(boxes) == 0) and (min_start is None) and (not step.new_clips):
+                    metrics.early_passthrough_frames += 1
 
-                            det = Detection(
-                                boxes=torch.tensor(
-                                    [[b[1], b[0], b[3], b[2]] for b in merged_boxes],
-                                    dtype=torch.float32,
-                                    device="cpu",
-                                )
-                                if merged_boxes
-                                else None,
-                                scores=None,
-                                classes=None,
-                                masks=None,
-                            )
+                frame_num += 1
+                metrics.processed_frames += 1
+                pbar.update(1)
 
-                            if merged_masks is not None:
-                                try:
-                                    mm = [m for m in merged_masks if m is not None]
-                                    if len(mm) == len(merged_masks) and len(mm) > 0:
-                                        det.masks = torch.stack(mm, dim=0)
-                                except Exception:
-                                    det.masks = None
+            # Drain once per batch (sync once per drain happens inside drain_store_to_encoder)
+            t0 = time.perf_counter()
+            drain_store_to_encoder(
+                store=store,
+                safe_before=int(safe_before_batch),
+                encoder=encoder,
+                device=self.device,
+                sync_before_encode=self.enc_sync_before_encode,
+            )
+            metrics.t_encode += (time.perf_counter() - t0)
 
-                            detections.append(det)
-                    else:
-                        t0 = time.perf_counter()
-                        detections = detector.detect_batch(batch_rgb)
-                        metrics.t_det += (time.perf_counter() - t0)
-                else:
-                    detections = [Detection(boxes=None, scores=None, classes=None, masks=None) for _ in batch_rgb]
+        try:
+            if use_thread_prefetch:
+                # -----------------------------
+                # 2-batch producer/consumer (ffmpeg-cpu only)
+                # -----------------------------
+                q = _queue.Queue(maxsize=2)
 
-                for i, rgb in enumerate(batch_rgb):
+                def _q_put(item: Optional[List[object]]) -> bool:
+                    assert q is not None
+                    while True:
+                        if stop.is_set():
+                            return False
+                        try:
+                            q.put(item, timeout=0.10)
+                            return True
+                        except _queue.Full:
+                            continue
+
+                def producer() -> None:
+                    try:
+                        while not stop.is_set():
+                            t0 = time.perf_counter()
+                            batch0 = decoder.read_batch()
+                            metrics.t_decode += (time.perf_counter() - t0)
+
+                            if not batch0:
+                                _q_put(None)
+                                return
+
+                            if not _q_put(list(batch0)):
+                                return
+                    except BaseException as e:
+                        prod_exc["e"] = e
+                        _q_put(None)
+
+                prod = _threading.Thread(target=producer, name="decode-producer", daemon=True)
+                prod.start()
+
+                while True:
                     if self.max_frames is not None and frame_num >= self.max_frames:
                         break
 
-                    det = detections[i] if i < len(detections) else Detection(boxes=None, scores=None, classes=None, masks=None)
+                    t0 = time.perf_counter()
+                    batch = q.get()
+                    metrics.t_queue_wait += (time.perf_counter() - t0)
 
-                    bgr_u8 = rgb_hwc_to_bgr_hwc_u8(rgb)
+                    if batch is None:
+                        break
 
-                    if tracker is None or self.mode == "none":
-                        if self.enc_sync_before_encode:
-                            sync_device(self.device)
-                        t0 = time.perf_counter()
-                        encoder.encode_frame(bgr_u8_to_bgra_u8(bgr_u8))
-                        metrics.t_encode += (time.perf_counter() - t0)
-                        frame_num += 1
-                        metrics.processed_frames += 1
-                        pbar.update(1)
-                        continue
+                    consume_batch(batch)
 
-                    boxes = _tensor_boxes_to_list_xyxy(det.boxes)
-                    masks_list = _extract_masks_list(det) if (self.use_seg_masks and det.masks is not None) else None
-
-                    if self.roi_dilate > 0 and boxes:
-                        dil = self.roi_dilate
-                        boxes = [(t - dil, l - dil, b + dil, r + dil) for (t, l, b, r) in boxes]
-
-                    if boxes:
-                        boxes = [clip_box_to_bounds(bx, w=w, h=h) for bx in boxes]
-
-                    if self.sbs_enabled and boxes:
-                        seam_x = w // 2
-                        boxes, masks_list = seam_split_boxes(boxes, seam_x=seam_x, full_w=w, full_h=h, masks=masks_list)
-
-                    metrics.det_stats.add(boxes, w=w, h=h)
-
-                    store.put(frame_num, bgr_u8)
+            else:
+                # -----------------------------
+                # NVDEC path: decode on main thread (fast + correct)
+                # -----------------------------
+                while True:
+                    if self.max_frames is not None and frame_num >= self.max_frames:
+                        break
 
                     t0 = time.perf_counter()
-                    step = tracker.step_frame(frame_num, bgr_u8, boxes, masks_list)
-                    metrics.t_track += (time.perf_counter() - t0)
+                    batch0 = decoder.read_batch()
+                    metrics.t_decode += (time.perf_counter() - t0)
 
-                    if step.new_clips and restorer is not None:
-                        for clip in step.new_clips:
-                            t0 = time.perf_counter()
-                            restored = restorer.restore_clip(clip)
-                            _composite_clip_into_store(
-                                clip=clip,
-                                restored_frames=restored,
-                                store_bgr_u8=store.frames_bgr_u8,
-                                feather_radius=self.feather_radius,
-                            )
-                            metrics.t_restore += (time.perf_counter() - t0)
+                    if not batch0:
+                        break
 
-                    safe_before = tracker.min_active_start()
-                    if safe_before is None:
-                        safe_before = frame_num + 1
-
-                    # "early passthrough" heuristic: no active scenes (min_active_start None) AND no detections on this frame
-                    # => current frame becomes safe immediately (safe_before == frame_num+1).
-                    if (len(boxes) == 0) and (tracker.min_active_start() is None) and (not step.new_clips):
-                        metrics.early_passthrough_frames += 1
-
-                    t0 = time.perf_counter()
-                    drain_store_to_encoder(
-                        store=store,
-                        safe_before=int(safe_before),
-                        encoder=encoder,
-                        device=self.device,
-                        sync_before_encode=self.enc_sync_before_encode,
-                    )
-                    metrics.t_encode += (time.perf_counter() - t0)
-
-                    frame_num += 1
-                    metrics.processed_frames += 1
-
-                    pbar.update(1)
+                    consume_batch(list(batch0))
 
         finally:
+            # Stop producer safely and avoid deadlock if it is blocked on a full queue.
+            stop.set()
+            if prod is not None:
+                try:
+                    prod.join(timeout=2.0)
+                except Exception:
+                    pass
+
             try:
                 decoder.close()
             except Exception:
                 pass
+
+            # If producer failed, surface it now.
+            if "e" in prod_exc:
+                raise prod_exc["e"]
 
             if tracker is not None and restorer is not None:
                 for clip in tracker.flush_eof():
@@ -471,12 +636,17 @@ class Pipeline:
                 sync_before_encode=self.enc_sync_before_encode,
             )
 
-            # --- measure processing time (no mux) before close() ---
             t_total_no_mux = time.perf_counter() - t0_all
 
-            # Close does audio remux by calling an internal subprocess and cleans up
             t0 = time.perf_counter()
+            try:
+                pbar.refresh()
+                pbar.close()
+            except Exception:
+                pass
+
             encoder.close()
+
             metrics.t_mux += (time.perf_counter() - t0)
 
             metrics.wall_end = _dt.datetime.now()
@@ -490,6 +660,11 @@ class Pipeline:
                 f"t_decode={metrics.t_decode:.2f}s t_det={metrics.t_det:.2f}s "
                 f"t_track={metrics.t_track:.2f}s t_restore={metrics.t_restore:.2f}s "
                 f"t_encode={metrics.t_encode:.2f}s"
+            )
+            print(
+                f"[Pipeline] Prefetch stats: "
+                f"t_queue_wait={metrics.t_queue_wait:.2f}s t_prepare={metrics.t_prepare:.2f}s "
+                f"t_upload={metrics.t_upload:.2f}s t_csc={metrics.t_csc:.2f}s"
             )
             print(
                 f"[Pipeline] Processing time (no mux) = {t_total_no_mux:.2f}s "
@@ -514,7 +689,3 @@ class Pipeline:
                 pbar.close()
             except Exception:
                 pass
-
-        dt = time.perf_counter() - t0_all
-        if self.debug:
-            print(f"[Pipeline] Done. Frames={frame_num}, wall={dt:.2f}s")

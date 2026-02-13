@@ -500,27 +500,7 @@ class Clip:
 
             m = scene.masks[i]
             if m is None:
-                # Build a per-frame ROI mask from the ROI box, in *crop coordinates*.
-                # This prevents "mask = full crop" which causes alpha to affect huge areas.
-                roi_t, roi_l, roi_b, roi_r = scene.roi_boxes[i]  # full-frame coords (tlbr, inclusive)
-                crop_t, crop_l, crop_b, crop_r = scene.crop_boxes[i]  # full-frame coords (tlbr, inclusive)
-
-                # Convert ROI box into crop-local coordinates.
-                mt = max(0, roi_t - crop_t)
-                ml = max(0, roi_l - crop_l)
-                mb = min(ch - 1, roi_b - crop_t)
-                mr = min(cw - 1, roi_r - crop_l)
-
-                m = torch.zeros((ch, cw), dtype=torch.uint8, device=crop_u8.device)
-                if mb >= mt and mr >= ml:
-                    m[mt: mb + 1, ml: mr + 1] = 255
-            else:
-                # Optional safety: ensure mask is HW and uint8.
-                if m.ndim != 2:
-                    raise ValueError(f"Expected HW mask, got {tuple(m.shape)}")
-                if m.dtype != torch.uint8:
-                    m = (m > 0).to(torch.uint8) * 255
-
+                m = torch.ones((ch, cw), dtype=torch.uint8, device=crop_u8.device) * 255
             m_rs = resize_hw_mask(m, (out_h, out_w))
             m_pd, _ = pad_mask_hw(m_rs, (self.clip_size, self.clip_size))
 

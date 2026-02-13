@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import os
-from pathlib import Path
-import torch.nn.functional as F
-
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Dict
@@ -50,92 +46,6 @@ def _union_box(a: Box, b: Box) -> Box:
         max(a[3], b[3]),
     )
 
-import math
-import torch
-import torch.nn.functional as F
-
-def _env_int(name: str, default: int) -> int:
-    s = os.environ.get(name, "")
-    s = s.strip().strip('"').strip("'").strip()
-    if not s:
-        return default
-    try:
-        return int(s)
-    except Exception:
-        return default
-
-def _next_pow2(n: int) -> int:
-    if n <= 1:
-        return 1
-    return 1 << (n - 1).bit_length()
-
-def _dominant_period(sig: torch.Tensor, min_px: int, max_px: int) -> int:
-    """
-    sig: 1D float tensor on CPU. Returns dominant period (lag) in [min_px, max_px], or 0 if unknown.
-    """
-    sig = sig.float()
-    sig = sig - sig.mean()
-    L = int(sig.numel())
-    if L < (max_px * 2):
-        return 0
-
-    n = _next_pow2(L * 2)
-    Fsig = torch.fft.rfft(sig, n=n)
-    ac = torch.fft.irfft(Fsig * torch.conj(Fsig), n=n).real
-    ac = ac[: max_px + 1]
-
-    k0 = int(min_px)
-    k1 = int(min(max_px, ac.numel() - 1))
-    if k1 <= k0:
-        return 0
-
-    # best peak
-    rel = ac[k0 : k1 + 1]
-    k = int(torch.argmax(rel).item() + k0)
-
-    # small “fundamental” heuristic: prefer k/2 if nearly as good
-    if k % 2 == 0 and (k // 2) >= k0:
-        if ac[k // 2] > 0.88 * ac[k]:
-            k = k // 2
-
-    return k
-
-def _estimate_tile_px_from_crop_cpu(bgr_u8_cpu: torch.Tensor, mask_u8_cpu: torch.Tensor,
-                                   min_px: int, max_px: int) -> int:
-    """
-    bgr_u8_cpu: (H,W,3) uint8 on CPU
-    mask_u8_cpu: (H,W) uint8 on CPU, 255 inside mosaic support
-    """
-    # Luma (rough Rec.601)
-    b = bgr_u8_cpu[..., 0].float()
-    g = bgr_u8_cpu[..., 1].float()
-    r = bgr_u8_cpu[..., 2].float()
-    y = 0.114 * b + 0.587 * g + 0.299 * r
-
-    m = (mask_u8_cpu > 0).float()
-
-    # Edge energy along X/Y, weighted by mask overlap
-    dx = (y[:, 1:] - y[:, :-1]).abs() * (m[:, 1:] * m[:, :-1])
-    dy = (y[1:, :] - y[:-1, :]).abs() * (m[1:, :] * m[:-1, :])
-
-    gx = dx.sum(dim=0)  # (W-1,)
-    gy = dy.sum(dim=1)  # (H-1,)
-
-    # light smoothing to stabilize peaks
-    if gx.numel() >= 9:
-        gx = F.avg_pool1d(gx.view(1, 1, -1), kernel_size=9, stride=1, padding=4).view(-1)
-    if gy.numel() >= 9:
-        gy = F.avg_pool1d(gy.view(1, 1, -1), kernel_size=9, stride=1, padding=4).view(-1)
-
-    px_x = _dominant_period(gx, min_px=min_px, max_px=max_px)
-    px_y = _dominant_period(gy, min_px=min_px, max_px=max_px)
-
-    cand = [p for p in (px_x, px_y) if p > 0]
-    if not cand:
-        return 0
-    cand.sort()
-    return int(cand[len(cand)//2])  # median
-
 
 class SceneTracker:
     """Track per-frame detections into LADA-style Scenes, then emit Clips."""
@@ -145,9 +55,6 @@ class SceneTracker:
         self._scenes: List[Scene] = []
         self._scene_counter: int = 0
         self._clip_counter: int = 0
-        # Auto-estimated mosaic tile size (pixels), cached once per run.
-        self._tile_px_cached: Optional[int] = None
-
 
     def reset(self) -> None:
         self._scenes.clear()
@@ -179,7 +86,6 @@ class SceneTracker:
 
     def _compute_crop(
             self,
-            frame_num: int,
             frame_bgr_u8: torch.Tensor,
             roi_box: Box,
             roi_mask: Optional[torch.Tensor] = None,
@@ -207,12 +113,11 @@ class SceneTracker:
         crop_img = frame_bgr_u8[t: b + 1, l: r + 1, :].clone()
 
         # Mask generation (seam-sensitive)
-        # Mask generation (seam-sensitive)
         crop_h = int(b - t + 1)
         crop_w = int(r - l + 1)
 
-        # Rectangle mask: used as fallback and as a limiter for seg masks
-        rect_mask = torch.zeros((crop_h, crop_w), device=frame_bgr_u8.device, dtype=torch.uint8)
+        # 1) Rectangle base mask (always)
+        crop_mask_out = torch.zeros((crop_h, crop_w), device=frame_bgr_u8.device, dtype=torch.uint8)
 
         rt, rl, rb, rr = roi_box
         it = max(t, rt)
@@ -220,14 +125,13 @@ class SceneTracker:
         ib = min(b, rb)
         ir = min(r, rr)
         if ib >= it and ir >= il:
-            rect_mask[it - t: ib - t + 1, il - l: ir - l + 1] = 255
+            crop_mask_out[it - t: ib - t + 1, il - l: ir - l + 1] = 255
 
-        crop_mask_out = rect_mask  # default fallback
-
-        # If we have a seg mask, USE IT (limited to rect), don't OR with rect.
+        # 2) Optional seg mask: OR it in (never replace rectangle)
         if roi_mask is not None and self.cfg.use_seg_masks:
             try:
                 def _mask_u8(m: torch.Tensor) -> torch.Tensor:
+                    # Normalize to uint8 {0,255} without device-sync (no .item()).
                     if m.dtype == torch.bool:
                         return m.to(dtype=torch.uint8) * 255
                     if m.is_floating_point():
@@ -247,79 +151,13 @@ class SceneTracker:
                         seg_crop = roi_mask.to(device=frame_bgr_u8.device)
 
                 if seg_crop is not None:
-                    seg_u8 = _mask_u8(seg_crop)
-
-                    # Auto-estimate once (cached) if GR_AUTO_TILE=1, else fallback to GR_MOSAIC_TILE_PX
-                    pad_px = self._get_tile_pad_px(crop_img, seg_u8)
-                    pad_px = max(0, int(pad_px))
-
-                    # Dilate segmentation so tiny misses (like 1 block row) get covered
-                    seg_u8 = _dilate_u8_mask(seg_u8, pad_px)
-
-                    # Also dilate the ROI rectangle so we don't clip off the newly-covered strip
-                    rect_support = _dilate_u8_mask(rect_mask, pad_px)
-
-                    # Final: seg (grown) but bounded to expanded ROI support
-                    crop_mask_out = torch.where(rect_support > 0, seg_u8, torch.zeros_like(seg_u8))
+                    crop_mask_out = torch.maximum(crop_mask_out, _mask_u8(seg_crop))
 
             except Exception:
-                # best-effort fallback
-                crop_mask_out = rect_mask
+                # Best-effort: don't crash the pipeline on mask oddities.
+                pass
 
         return crop_box, crop_img, crop_mask_out
-
-    def _get_tile_pad_px(self, crop_bgr_u8: torch.Tensor, base_mask_u8: torch.Tensor) -> int:
-        """
-        Returns pad in pixels. If GR_AUTO_TILE=1, estimate once (cached).
-        Falls back to GR_MOSAIC_TILE_PX (or 40 default).
-        """
-        fallback = _env_int("GR_MOSAIC_TILE_PX", 40)
-        if _env_int("GR_AUTO_TILE", 0) != 1:
-            return fallback
-
-        if self._tile_px_cached is not None:
-            return int(self._tile_px_cached)
-
-        # Only estimate when mask area is meaningful
-        mask01 = (base_mask_u8 > 0)
-        area = int(mask01.sum().item())
-        if area < _env_int("GR_AUTO_TILE_MIN_AREA", 2048):
-            return fallback
-
-        # Downsample to reduce work + transfer (estimate only needs rough periodicity)
-        max_side = _env_int("GR_AUTO_TILE_MAX_SIDE", 512)
-        h, w = int(crop_bgr_u8.shape[0]), int(crop_bgr_u8.shape[1])
-        scale = min(1.0, float(max_side) / float(max(h, w)))
-        if scale < 1.0:
-            oh = max(8, int(h * scale))
-            ow = max(8, int(w * scale))
-            # resize image (bilinear) and mask (nearest)
-            img = crop_bgr_u8.permute(2, 0, 1).unsqueeze(0).float()  # 1x3xHxW
-            img = F.interpolate(img, size=(oh, ow), mode="bilinear", align_corners=False)
-            img_u8 = img.round().clamp(0, 255).to(torch.uint8)[0].permute(1, 2, 0).contiguous()
-
-            m = base_mask_u8.unsqueeze(0).unsqueeze(0).float()
-            m = F.interpolate(m, size=(oh, ow), mode="nearest")
-            m_u8 = (m[0, 0] > 0).to(torch.uint8) * 255
-        else:
-            img_u8 = crop_bgr_u8
-            m_u8 = base_mask_u8
-
-        # move to CPU once (cached result)
-        img_cpu = img_u8.detach().cpu()
-        m_cpu = m_u8.detach().cpu()
-
-        min_px = _env_int("GR_AUTO_TILE_MIN_PX", 6)
-        max_px = _env_int("GR_AUTO_TILE_MAX_PX", 96)
-
-        est = _estimate_tile_px_from_crop_cpu(img_cpu, m_cpu, min_px=min_px, max_px=max_px)
-        if est <= 0:
-            return fallback
-
-        # cache + log once
-        self._tile_px_cached = int(est)
-        print(f"[Tracker] Auto tile size estimated: {self._tile_px_cached}px (cached)")
-        return int(self._tile_px_cached)
 
     def step_frame(
             self,
@@ -356,7 +194,7 @@ class SceneTracker:
 
                 # Re-crop from union ROI. IMPORTANT: pass current detection mask (if any),
                 # then union it with the previous crop-mask by mapping old->new crop coords.
-                crop_box, crop_img, cur_mask = self._compute_crop(frame_num, frame_bgr_u8, union_roi, mask)
+                crop_box, crop_img, cur_mask = self._compute_crop(frame_bgr_u8, union_roi, mask)
 
                 prev_mask = matched.masks[-1] if matched.masks else None
                 prev_crop_box = matched.crop_boxes[-1] if matched.crop_boxes else None
@@ -394,16 +232,8 @@ class SceneTracker:
                     crop_img=crop_img,
                     crop_mask=crop_mask,
                 )
-                dump_one = os.environ.get("GR_DUMP_FULLMASK_FRAME", "").strip().strip('"').strip("'").strip()
-                if dump_one.isdigit() and int(dump_one) == int(frame_num):
-                    _dump_full_frame_mask_overlay(frame_bgr_u8, crop_box, cur_mask, frame_num, suffix=f"roi{i}_merge")
-
             else:
-                crop_box, crop_img, crop_mask = self._compute_crop(frame_num, frame_bgr_u8, box, mask)
-                dump_one = os.environ.get("GR_DUMP_FULLMASK_FRAME", "").strip().strip('"').strip("'").strip()
-                if dump_one.isdigit() and int(dump_one) == int(frame_num):
-                    _dump_full_frame_mask_overlay(frame_bgr_u8, crop_box, crop_mask, frame_num, suffix=f"roi{i}")
-
+                crop_box, crop_img, crop_mask = self._compute_crop(frame_bgr_u8, box, mask)
                 matched.add_frame(
                     frame_num=frame_num,
                     roi_box=box,
@@ -506,8 +336,6 @@ class SceneTracker:
         """Flush all remaining scenes at end-of-file."""
         clips: List[Clip] = []
         for s in self._scenes:
-            if len(s) == 0:
-                continue
             clips.append(
                 s.to_clip(
                     clip_id=self._clip_counter,
@@ -540,67 +368,3 @@ __all__ = [
     "TrackerStepResult",
     "SceneTracker",
 ]
-
-
-def _dilate_u8_mask(seg_u8: torch.Tensor, pad: int) -> torch.Tensor:
-    if pad <= 0:
-        return seg_u8
-    m = (seg_u8 > 0).to(torch.float32)[None, None, :, :]
-    m = F.max_pool2d(m, kernel_size=2 * pad + 1, stride=1, padding=pad)
-    return (m[0, 0] > 0).to(torch.uint8) * 255
-
-
-def _dump_full_frame_mask_overlay(
-    frame_bgr_u8: torch.Tensor,
-    crop_box: Box,
-    crop_mask_u8: torch.Tensor,
-    frame_num: int,
-    suffix: str = "",
-) -> None:
-    raw_dir = os.environ.get("GR_DUMP_FULLMASK_DIR", r"D:\Results\mask_overlay_dump")
-    raw_dir = raw_dir.strip().strip('"').strip("'").strip()
-    out_dir = Path(raw_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    suf = f"_{suffix}" if suffix else ""
-    mask_path = out_dir / f"dbg_f{frame_num:06d}_fullmask{suf}.png"
-    ov_path   = out_dir / f"dbg_f{frame_num:06d}_overlay{suf}.png"
-
-    h, w = int(frame_bgr_u8.shape[0]), int(frame_bgr_u8.shape[1])
-    t, l, b, r = crop_box
-
-    # Full-frame mask (same device as frame)
-    full_mask = torch.zeros((h, w), dtype=torch.uint8, device=frame_bgr_u8.device)
-    full_mask[t : b + 1, l : r + 1] = crop_mask_u8.to(dtype=torch.uint8)
-
-    # Overlay (tint green where mask>0). frame is BGR uint8.
-    frm_f = frame_bgr_u8.to(torch.float32)
-    m3 = (full_mask > 0).unsqueeze(-1)
-
-    # green in BGR
-    color = torch.tensor([0.0, 255.0, 0.0], device=frame_bgr_u8.device).view(1, 1, 3)
-    a = 0.5
-    ov_f = torch.where(m3, frm_f * (1.0 - a) + color * a, frm_f)
-    ov_u8 = ov_f.round().clamp(0, 255).to(torch.uint8)
-
-    # Move to CPU for writing
-    if full_mask.device.type != "cpu":
-        full_mask_cpu = full_mask.detach().cpu()
-        ov_cpu = ov_u8.detach().cpu()
-    else:
-        full_mask_cpu = full_mask.detach()
-        ov_cpu = ov_u8.detach()
-
-    # Convert BGR->RGB for file viewing
-    ov_rgb = ov_cpu[:, :, [2, 1, 0]].numpy()
-
-    try:
-        import imageio.v2 as imageio
-        imageio.imwrite(str(mask_path), full_mask_cpu.numpy())
-        imageio.imwrite(str(ov_path), ov_rgb)
-    except Exception:
-        from PIL import Image
-        Image.fromarray(full_mask_cpu.numpy(), mode="L").save(str(mask_path))
-        Image.fromarray(ov_rgb, mode="RGB").save(str(ov_path))
-
-
