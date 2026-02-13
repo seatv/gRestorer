@@ -187,19 +187,17 @@ class Encoder:
     def encode_frame(self, frame: Any) -> None:
         if frame is None:
             return
-
-        # Count frames submitted (1:1 with input frames), NOT only immediately-emitted packets.
-        self._frames_encoded += 1
-
         bitstream = self._encoder.Encode(frame)
         if bitstream:
             self._file.write(bytearray(bitstream))
+            self._frames_encoded += 1
 
     def encode_frames(self, frames: Iterable[Any]) -> None:
         for fr in frames:
             self.encode_frame(fr)
 
     def flush(self) -> None:
+        print(f"[Encoder] Flushing... ({self._frames_encoded} frames encoded)")
         try:
             tail = self._encoder.EndEncode()
         except Exception as e:
@@ -207,7 +205,6 @@ class Encoder:
             return
         if tail:
             self._file.write(bytearray(tail))
-        print(f"[Encoder] Flushing... ({self._frames_encoded} frames submitted)")
 
     def _remux_with_ffmpeg(self, input_path: str | None = None) -> None:
         """

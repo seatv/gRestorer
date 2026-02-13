@@ -300,82 +300,13 @@ def drain_store_to_encoder(
     Encode and remove all frames with frame_num < safe_before.
     Returns number of frames encoded.
     """
-    keys = store.keys_sorted()
-    drain_keys = [k for k in keys if k < safe_before]
-    if not drain_keys:
-        return 0
-
-    # IMPORTANT: sync once per drain, not per-frame.
-    # This reduces CPU-side stalls and improves overlap between GPU compute and encode.
-    if sync_before_encode:
-        sync_device(device)
-
     count = 0
-    for k in drain_keys:
+    for k in store.keys_sorted():
+        if k >= safe_before:
+            break
         frm_bgr = store.pop(k)
+        if sync_before_encode:
+            sync_device(device)
         encoder.encode_frame(bgr_u8_to_bgra_u8(frm_bgr))
         count += 1
     return count
-
-
-
-def nv12_to_rgb_hwc_u8(
-    nv12: torch.Tensor,
-    *,
-    width: int,
-    height: int,
-    matrix: str = "auto",
-    full_range: bool = False,
-) -> torch.Tensor:
-    """Convert an NV12 frame to RGB HWC uint8.
-
-    nv12 is expected to be uint8 shaped [H*3/2, W] (or flattenable to that).
-    Conversion runs on nv12.device (CPU/CUDA/XPU).
-
-    Notes:
-      - Default assumes limited-range YUV (typical video). Set full_range=True if needed.
-      - matrix="auto" picks bt709 for HD-ish frames, else bt601.
-    """
-    h = int(height)
-    w = int(width)
-    if nv12.dtype != torch.uint8:
-        raise TypeError(f"nv12 must be uint8, got {nv12.dtype}")
-
-    if nv12.ndim == 1:
-        nv12 = nv12.view(h * 3 // 2, w)
-    elif nv12.ndim != 2:
-        raise ValueError(f"nv12 must be 1D or 2D, got shape={tuple(nv12.shape)}")
-
-    y = nv12[:h, :].to(torch.float32)
-    uv = nv12[h:, :].contiguous().view(h // 2, w // 2, 2).to(torch.float32)
-    u = uv[..., 0]
-    v = uv[..., 1]
-
-    # Nearest upsample to full res
-    u = u.repeat_interleave(2, dim=0).repeat_interleave(2, dim=1)
-    v = v.repeat_interleave(2, dim=0).repeat_interleave(2, dim=1)
-
-    if matrix == "auto":
-        matrix = "bt709" if (w >= 1280 or h >= 720) else "bt601"
-
-    if full_range:
-        c = y
-    else:
-        # limited-range luma: [16..235] -> scale by 1.164...
-        c = (y - 16.0) * 1.164383
-
-    d = u - 128.0
-    e = v - 128.0
-
-    if matrix == "bt709":
-        r = c + 1.792741 * e
-        g = c - 0.213249 * d - 0.532909 * e
-        b = c + 2.112402 * d
-    else:
-        # bt601
-        r = c + 1.402000 * e
-        g = c - 0.344136 * d - 0.714136 * e
-        b = c + 1.772000 * d
-
-    rgb = torch.stack([r, g, b], dim=-1)
-    return rgb.round().clamp(0, 255).to(torch.uint8)
