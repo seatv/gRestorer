@@ -67,7 +67,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--restorer",
-        choices=["basicvsrpp", "pseudo", "none"],
+        choices=["basicvsrpp", "lada", "pseudo", "none"],
         default=None,
         help="Restorer backend (default: basicvsrpp)",
     )

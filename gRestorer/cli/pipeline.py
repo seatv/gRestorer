@@ -17,6 +17,12 @@ from gRestorer.detector.core import Detection, Detector as YoloDetector
 from gRestorer.restorer.basicvsrpp_clip_restorer import BasicVSRPPClipRestorer
 from gRestorer.restorer.compositor import _composite_clip_into_store
 from gRestorer.restorer.pseudo_clip_restorer import PseudoClipRestorer
+
+from gRestorer.core.lada_clip import LadaClip
+from gRestorer.restorer.lada_basicvsrpp_clip_restorer import LadaBasicVSRPPClipRestorer
+from gRestorer.restorer.lada_compositor import composite_lada_clip_into_store
+
+
 from gRestorer.utils.config_util import Config
 from gRestorer.video.decoder import Decoder
 from gRestorer.video.encoder import Encoder
@@ -269,6 +275,15 @@ class Pipeline:
 
         if not self.rest_model:
             raise FileNotFoundError("Restoration model path is empty (check config.json or --rest-model)")
+
+        if self.restorer_name in ("lada", "lada-basicvsrpp", "lada_basicvsrpp"):
+            return LadaBasicVSRPPClipRestorer(
+                model_path=self.rest_model,
+                device=self.device,
+                fp16=self.rest_fp16,
+                max_frames=32,
+            )
+
         return BasicVSRPPClipRestorer(
             device=self.device,
             checkpoint_path=self.rest_model,
@@ -328,6 +343,7 @@ class Pipeline:
 
         detector = self._build_detector()
         restorer = self._build_restorer()
+        use_lada_restoration = isinstance(restorer, LadaBasicVSRPPClipRestorer)
 
         tracker = None
         if self.mode != "none":
@@ -339,7 +355,12 @@ class Pipeline:
                 debug=self.debug,
                 use_seg_masks=self.use_seg_masks,
             )
-            tracker = SceneTracker(cfg=tracker_cfg)
+
+            if use_lada_restoration:
+                tracker = SceneTracker(cfg=tracker_cfg, clip_cls=LadaClip, seg_mask_only=True)
+                print("[Tracker] LADA clip+mask semantics enabled")
+            else:
+                tracker = SceneTracker(cfg=tracker_cfg)
 
         store = FrameStore()
 
@@ -544,12 +565,22 @@ class Pipeline:
                     for clip in step.new_clips:
                         t0 = time.perf_counter()
                         restored = restorer.restore_clip(clip)
-                        _composite_clip_into_store(
-                            clip=clip,
-                            restored_frames=restored,
-                            store_bgr_u8=store.frames_bgr_u8,
-                            feather_radius=self.feather_radius,
-                        )
+
+                        if use_lada_restoration:
+                            composite_lada_clip_into_store(
+                                clip=clip,
+                                restored_frames_u8=restored,
+                                store_bgr_u8=store.frames_bgr_u8,
+                                model_dtype=restorer.model_dtype,
+                            )
+                        else:
+                            _composite_clip_into_store(
+                                clip=clip,
+                                restored_frames=restored,
+                                store_bgr_u8=store.frames_bgr_u8,
+                                feather_radius=int(self.feather_radius),
+                            )
+
                         metrics.t_restore += (time.perf_counter() - t0)
 
                 min_start = tracker.min_active_start()
@@ -663,12 +694,20 @@ class Pipeline:
             if tracker is not None and restorer is not None:
                 for clip in tracker.flush_eof():
                     restored = restorer.restore_clip(clip)
-                    _composite_clip_into_store(
-                        clip=clip,
-                        restored_frames=restored,
-                        store_bgr_u8=store.frames_bgr_u8,
-                        feather_radius=self.feather_radius,
-                    )
+                    if use_lada_restoration:
+                        composite_lada_clip_into_store(
+                            clip=clip,
+                            restored_frames_u8=restored,
+                            store_bgr_u8=store.frames_bgr_u8,
+                            model_dtype=restorer.model_dtype,
+                        )
+                    else:
+                        _composite_clip_into_store(
+                            clip=clip,
+                            restored_frames=restored,
+                            store_bgr_u8=store.frames_bgr_u8,
+                            feather_radius=int(self.feather_radius),
+                        )
 
             drain_store_to_encoder(
                 store=store,

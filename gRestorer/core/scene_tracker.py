@@ -129,11 +129,34 @@ def _quantize_crop_box(crop: Box, img_h: int, img_w: int, q: int) -> Box:
 class SceneTracker:
     """Track per-frame detections into LADA-style Scenes, then emit Clips."""
 
-    def __init__(self, cfg: TrackerConfig) -> None:
+    def __init__(self, cfg: TrackerConfig, *, clip_cls=Clip, seg_mask_only: bool = False) -> None:
         self.cfg = cfg
+        self._clip_cls = clip_cls
+        self._seg_mask_only = bool(seg_mask_only)
+
         self._scenes: List[Scene] = []
         self._scene_counter: int = 0
         self._clip_counter: int = 0
+
+    def _scene_to_clip(self, s: Scene):
+        if len(s) == 0:
+            return None
+
+        # Default path (existing behavior)
+        if self._clip_cls is Clip:
+            return s.to_clip(
+                clip_id=self._clip_counter,
+                clip_size=self.cfg.clip_size,
+                pad_mode=self.cfg.pad_mode,
+            )
+
+        # LADA clip path (expects clip_cls.from_scene)
+        return self._clip_cls.from_scene(
+            scene=s,
+            clip_id=self._clip_counter,
+            clip_size=self.cfg.clip_size,
+            pad_mode=self.cfg.pad_mode,
+        )
 
     def _belongs_scene(self, s: Scene, roi_box: Box) -> bool:
         """Scene membership with optional padding to reduce jitter-induced fragmentation."""
@@ -255,13 +278,55 @@ class SceneTracker:
         # 1) Rectangle base mask (always)
         crop_mask_out = torch.zeros((crop_h, crop_w), device=frame_bgr_u8.device, dtype=torch.uint8)
 
-        rt, rl, rb, rr = roi_box
-        it = max(t, rt)
-        il = max(l, rl)
-        ib = min(b, rb)
-        ir = min(r, rr)
-        if ib >= it and ir >= il:
-            crop_mask_out[it - t: ib - t + 1, il - l: ir - l + 1] = 255
+        # If we have a seg mask and seg-only is enabled (LADA parity), use seg only.
+        if roi_mask is not None and self.cfg.use_seg_masks and self._seg_mask_only:
+            seg = roi_mask[t: b + 1, l: r + 1]
+
+            # seg may be CPU (lada-yolo returns CPU masks); crop_mask_out is on frame device (cuda)
+            if isinstance(seg, torch.Tensor):
+                if seg.ndim == 3 and seg.shape[-1] == 1:
+                    seg = seg[:, :, 0]
+                if seg.dtype != torch.uint8:
+                    seg = seg.to(torch.uint8)
+                if seg.device != crop_mask_out.device:
+                    seg = seg.to(device=crop_mask_out.device, non_blocking=(crop_mask_out.device.type == "cuda"))
+            else:
+                # if somehow seg is numpy, convert then move
+                seg = torch.as_tensor(seg, dtype=torch.uint8, device=crop_mask_out.device)
+
+            crop_mask_out = torch.maximum(crop_mask_out, seg)
+
+        else:
+            # Rectangle base mask (gRestorer default)
+            rt, rl, rb, rr = roi_box
+            it = max(t, rt)
+            il = max(l, rl)
+            ib = min(b, rb)
+            ir = min(r, rr)
+            if ib >= it and ir >= il:
+                crop_mask_out[it - t: ib - t + 1, il - l: ir - l + 1] = 255
+
+            # Union-in segmentation mask if present
+            if roi_mask is not None and self.cfg.use_seg_masks:
+                seg = roi_mask[t: b + 1, l: r + 1]
+
+                # If mask is HWC(1), squeeze to HW
+                if isinstance(seg, torch.Tensor) and seg.ndim == 3 and seg.shape[-1] == 1:
+                    seg = seg[:, :, 0]
+
+                # seg may be CPU (lada-yolo returns CPU masks); crop_mask_out is on frame device (cuda)
+                if isinstance(seg, torch.Tensor):
+                    if seg.ndim == 3 and seg.shape[-1] == 1:
+                        seg = seg[:, :, 0]
+                    if seg.dtype != torch.uint8:
+                        seg = seg.to(torch.uint8)
+                    if seg.device != crop_mask_out.device:
+                        seg = seg.to(device=crop_mask_out.device, non_blocking=(crop_mask_out.device.type == "cuda"))
+                else:
+                    # if somehow seg is numpy, convert then move
+                    seg = torch.as_tensor(seg, dtype=torch.uint8, device=crop_mask_out.device)
+
+                crop_mask_out = torch.maximum(crop_mask_out, seg)
 
         # 2) Optional seg mask: OR it in (never replace rectangle)
         if roi_mask is not None and self.cfg.use_seg_masks:
@@ -471,13 +536,19 @@ class SceneTracker:
         t_clip_build = 0.0
         for s in completed_unique:
             tb0 = time.perf_counter()
-            new_clips.append(
-                s.to_clip(
-                    clip_id=self._clip_counter,
-                    clip_size=self.cfg.clip_size,
-                    pad_mode=self.cfg.pad_mode,
-                )
-            )
+            clip = self._scene_to_clip(s)
+            if clip is not None:
+                new_clips.append(clip)
+
+                if self.cfg.debug:
+                    why = reason_by_scene_id.get(s.id, "?")
+                    roi_xyxy = s.roi_boxes[-1] if s.roi_boxes else (0, 0, 0, 0)
+                    print(
+                        f"[Clip] clip_id={self._clip_counter:5d} scene_id={s.id:4d} why={why:10s} "
+                        f"frames={s.frame_start:5d}-{s.frame_end:5d} len={len(s):3d} roi_xyxy={roi_xyxy}"
+                    )
+
+                self._clip_counter += 1
 
             if self.cfg.debug:
                 why = reason_by_scene_id.get(s.id, "?")
@@ -486,7 +557,6 @@ class SceneTracker:
                     f"[Clip] clip_id={self._clip_counter:5d} scene_id={s.id:4d} why={why:10s} "
                     f"frames={s.frame_start:5d}-{s.frame_end:5d} len={len(s):3d} roi_xyxy={roi_xyxy}"
                 )
-            self._clip_counter += 1
             tb1 = time.perf_counter()
             t_clip_build += (tb1 - tb0)
 
@@ -511,13 +581,10 @@ class SceneTracker:
         """Flush all remaining scenes at end-of-file."""
         clips: List[Clip] = []
         for s in self._scenes:
-            clips.append(
-                s.to_clip(
-                    clip_id=self._clip_counter,
-                    clip_size=self.cfg.clip_size,
-                    pad_mode=self.cfg.pad_mode,
-                )
-            )
+            clip = self._scene_to_clip(s)
+            if clip is None:
+                continue
+            clips.append(clip)
             self._clip_counter += 1
 
         self._scenes.clear()
