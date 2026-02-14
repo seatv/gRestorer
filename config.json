@@ -26,6 +26,7 @@
 	"sync_before_encode": true
   },
   "detection": {
+    "det_type": "yolo",
     "model_path": "D:\\Models\\lada\\lada_mosaic_detection_model_v3.1_accurate.pt",
     "batch_size": 8,
     "conf_threshold": 0.5,

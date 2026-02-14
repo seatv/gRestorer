@@ -21,6 +21,7 @@ dist/
 # IDE
 .idea/
 .vscode/
+.idea*
 
 # OS
 .DS_Store

@@ -23,6 +23,23 @@ class TrackerConfig:
     # be simple rectangle-box masks.
     use_seg_masks: bool = True
 
+    # --- Crop stabilization (addresses ROI wobble/breathing) ---
+    # Quantize crop boxes to a pixel grid (e.g. 8px) to eliminate 0.5/1px jitter.
+    # This is applied to the *crop box* (not the detector ROI), so it doesn't change
+    # detection semantics; it only stabilizes the region we feed the restorer.
+    crop_quant_px: int = 8
+
+    # If True, keep the previous crop box when the new crop would only move a small amount
+    # and the current ROI still fits inside the previous crop.
+    crop_sticky: bool = True
+
+    # Maximum allowed per-edge movement (pixels) for sticky to keep the previous crop.
+    crop_sticky_pad_px: int = 8
+
+    # Expand the previous ROI box by this pad when deciding scene membership. This reduces
+    # scene fragmentation when a box 'jitters' by a few pixels and barely loses overlap.
+    match_pad_px: int = 8
+
     # NOTE: LADA unions multiple detections for the same scene in the same frame.
     # This can occasionally create a single larger ROI if two boxes briefly overlap.
     # TODO: consider adding a *debug-only* metric for "weak overlap" merges so we can
@@ -47,6 +64,68 @@ def _union_box(a: Box, b: Box) -> Box:
     )
 
 
+def _box_overlap_strict(a: Box, b: Box) -> bool:
+    """Strict overlap: touching edges is NOT overlap (matches LADA semantics)."""
+    at, al, ab, ar = a
+    bt, bl, bb, br = b
+    if ar <= bl or br <= al:
+        return False
+    if ab <= bt or bb <= at:
+        return False
+    return True
+
+
+def _box_overlap_pad(a: Box, b: Box, pad: int) -> bool:
+    """Strict overlap after expanding both boxes by `pad` pixels."""
+    if pad <= 0:
+        return _box_overlap_strict(a, b)
+    at, al, ab, ar = a
+    bt, bl, bb, br = b
+    a2 = (at - pad, al - pad, ab + pad, ar + pad)
+    b2 = (bt - pad, bl - pad, bb + pad, br + pad)
+    return _box_overlap_strict(a2, b2)
+
+
+def _roi_inside_crop(roi: Box, crop: Box) -> bool:
+    rt, rl, rb, rr = roi
+    ct, cl, cb, cr = crop
+    return (rt >= ct) and (rl >= cl) and (rb <= cb) and (rr <= cr)
+
+
+def _quantize_crop_box(crop: Box, img_h: int, img_w: int, q: int) -> Box:
+    """Quantize crop edges to a q-pixel grid.
+    - top/left are floored
+    - bottom/right are ceiled
+    This tends to slightly expand crops, trading a bit of compute for stability.
+    """
+    if q <= 1:
+        t, l, b, r = crop
+        return (max(0, t), max(0, l), min(img_h - 1, b), min(img_w - 1, r))
+
+    t, l, b, r = crop
+
+    t2 = (t // q) * q
+    l2 = (l // q) * q
+
+    # Inclusive bottom/right: quantize (b+1) and subtract 1.
+    b2 = (((b + 1 + q - 1) // q) * q) - 1
+    r2 = (((r + 1 + q - 1) // q) * q) - 1
+
+    # Clamp within bounds
+    t2 = max(0, t2)
+    l2 = max(0, l2)
+    b2 = min(img_h - 1, b2)
+    r2 = min(img_w - 1, r2)
+
+    # Ensure valid box
+    if b2 < t2:
+        b2 = min(img_h - 1, t2)
+    if r2 < l2:
+        r2 = min(img_w - 1, l2)
+
+    return (int(t2), int(l2), int(b2), int(r2))
+
+
 class SceneTracker:
     """Track per-frame detections into LADA-style Scenes, then emit Clips."""
 
@@ -55,6 +134,56 @@ class SceneTracker:
         self._scenes: List[Scene] = []
         self._scene_counter: int = 0
         self._clip_counter: int = 0
+
+    def _belongs_scene(self, s: Scene, roi_box: Box) -> bool:
+        """Scene membership with optional padding to reduce jitter-induced fragmentation."""
+        if not s.roi_boxes:
+            return False
+        pad = int(getattr(self.cfg, "match_pad_px", 0) or 0)
+        if pad > 0:
+            return _box_overlap_pad(s.roi_boxes[-1], roi_box, pad)
+        return s.belongs(roi_box)
+
+    def _stabilize_crop_box(
+            self,
+            *,
+            roi_box: Box,
+            base_crop_box: Box,
+            prev_crop_box: Optional[Box],
+            img_h: int,
+            img_w: int,
+    ) -> Box:
+        """Apply quantization + sticky crop stabilization.
+
+        Order:
+          1) Quantize crop to a pixel grid (crop_quant_px).
+          2) If sticky enabled and ROI still fits inside prev crop, keep prev crop when
+             the new crop differs only slightly (crop_sticky_pad_px).
+        """
+        q = int(getattr(self.cfg, "crop_quant_px", 0) or 0)
+        crop = _quantize_crop_box(base_crop_box, img_h=img_h, img_w=img_w, q=q) if q > 1 else base_crop_box
+
+        if not bool(getattr(self.cfg, "crop_sticky", False)):
+            return crop
+        if prev_crop_box is None:
+            return crop
+
+        # Only keep the old crop if the current ROI is still fully inside it.
+        if not _roi_inside_crop(roi_box, prev_crop_box):
+            return crop
+
+        pad = int(getattr(self.cfg, "crop_sticky_pad_px", 0) or 0)
+        if pad <= 0:
+            return crop
+
+        dt = abs(int(crop[0]) - int(prev_crop_box[0]))
+        dl = abs(int(crop[1]) - int(prev_crop_box[1]))
+        db = abs(int(crop[2]) - int(prev_crop_box[2]))
+        dr = abs(int(crop[3]) - int(prev_crop_box[3]))
+        if max(dt, dl, db, dr) <= pad:
+            return prev_crop_box
+
+        return crop
 
     def reset(self) -> None:
         self._scenes.clear()
@@ -89,6 +218,8 @@ class SceneTracker:
             frame_bgr_u8: torch.Tensor,
             roi_box: Box,
             roi_mask: Optional[torch.Tensor] = None,
+            *,
+            force_crop_box: Optional[Box] = None,
     ) -> Tuple[Box, torch.Tensor, torch.Tensor]:
         """Compute LADA crop_to_box_v3 crop box and slice crop from the frame.
 
@@ -101,14 +232,19 @@ class SceneTracker:
         - Otherwise we fall back to a rectangle mask derived from roi_box.
         """
         h, w = int(frame_bgr_u8.shape[0]), int(frame_bgr_u8.shape[1])
-        crop_box, _scale = crop_box_to_target_v3(
-            roi_box,
-            img_h=h,
-            img_w=w,
-            target_hw=(self.cfg.clip_size, self.cfg.clip_size),
-            max_box_expansion_factor=self.cfg.max_box_expansion_factor,
-            border_size=float(self.cfg.border_size),
-        )
+
+        if force_crop_box is None:
+            crop_box, _scale = crop_box_to_target_v3(
+                roi_box,
+                img_h=h,
+                img_w=w,
+                target_hw=(self.cfg.clip_size, self.cfg.clip_size),
+                max_box_expansion_factor=self.cfg.max_box_expansion_factor,
+                border_size=float(self.cfg.border_size),
+            )
+        else:
+            crop_box = force_crop_box
+
         t, l, b, r = crop_box
         crop_img = frame_bgr_u8[t: b + 1, l: r + 1, :].clone()
 
@@ -180,7 +316,7 @@ class SceneTracker:
 
             matched: Optional[Scene] = None
             for s in self._scenes:
-                if s.belongs(box):
+                if self._belongs_scene(s, box):
                     matched = s
                     break
 
@@ -192,10 +328,34 @@ class SceneTracker:
                 # Same-frame merge: union ROI and recompute crop from union.
                 union_roi = _union_box(matched.roi_boxes[-1], box)
 
+                h, w = int(frame_bgr_u8.shape[0]), int(frame_bgr_u8.shape[1])
+                base_crop_box, _ = crop_box_to_target_v3(
+                    union_roi,
+                    img_h=h,
+                    img_w=w,
+                    target_hw=(self.cfg.clip_size, self.cfg.clip_size),
+                    max_box_expansion_factor=self.cfg.max_box_expansion_factor,
+                    border_size=float(self.cfg.border_size),
+                )
+
+                prev_crop_box = matched.crop_boxes[-1] if matched.crop_boxes else None
+                stable_crop_box = self._stabilize_crop_box(
+                    roi_box=union_roi,
+                    base_crop_box=base_crop_box,
+                    prev_crop_box=prev_crop_box,
+                    img_h=h,
+                    img_w=w,
+                )
+
+                crop_box, crop_img, cur_mask = self._compute_crop(
+                    frame_bgr_u8,
+                    union_roi,
+                    mask,
+                    force_crop_box=stable_crop_box,
+                )
+
                 # Re-crop from union ROI. IMPORTANT: pass current detection mask (if any),
                 # then union it with the previous crop-mask by mapping old->new crop coords.
-                crop_box, crop_img, cur_mask = self._compute_crop(frame_bgr_u8, union_roi, mask)
-
                 prev_mask = matched.masks[-1] if matched.masks else None
                 prev_crop_box = matched.crop_boxes[-1] if matched.crop_boxes else None
 
@@ -217,9 +377,9 @@ class SceneTracker:
                         ox0 = int(il - ol)
                         ny0 = int(it - nt)
                         nx0 = int(il - nl)
-                        merged[ny0 : ny0 + h_int, nx0 : nx0 + w_int] = torch.maximum(
-                            merged[ny0 : ny0 + h_int, nx0 : nx0 + w_int],
-                            prev_mask[oy0 : oy0 + h_int, ox0 : ox0 + w_int].to(dtype=torch.uint8),
+                        merged[ny0: ny0 + h_int, nx0: nx0 + w_int] = torch.maximum(
+                            merged[ny0: ny0 + h_int, nx0: nx0 + w_int],
+                            prev_mask[oy0: oy0 + h_int, ox0: ox0 + w_int].to(dtype=torch.uint8),
                         )
 
                     crop_mask = torch.maximum(merged, cur_mask.to(dtype=torch.uint8))
@@ -233,7 +393,31 @@ class SceneTracker:
                     crop_mask=crop_mask,
                 )
             else:
-                crop_box, crop_img, crop_mask = self._compute_crop(frame_bgr_u8, box, mask)
+                h, w = int(frame_bgr_u8.shape[0]), int(frame_bgr_u8.shape[1])
+                base_crop_box, _ = crop_box_to_target_v3(
+                    box,
+                    img_h=h,
+                    img_w=w,
+                    target_hw=(self.cfg.clip_size, self.cfg.clip_size),
+                    max_box_expansion_factor=self.cfg.max_box_expansion_factor,
+                    border_size=float(self.cfg.border_size),
+                )
+
+                prev_crop_box = matched.crop_boxes[-1] if matched.crop_boxes else None
+                stable_crop_box = self._stabilize_crop_box(
+                    roi_box=box,
+                    base_crop_box=base_crop_box,
+                    prev_crop_box=prev_crop_box,
+                    img_h=h,
+                    img_w=w,
+                )
+
+                crop_box, crop_img, crop_mask = self._compute_crop(
+                    frame_bgr_u8,
+                    box,
+                    mask,
+                    force_crop_box=stable_crop_box,
+                )
                 matched.add_frame(
                     frame_num=frame_num,
                     roi_box=box,
@@ -283,8 +467,6 @@ class SceneTracker:
 
         t1 = time.perf_counter()
 
-        # reason_by_scene_id is built alongside the LADA-style completion selection above.
-
         new_clips: List[Clip] = []
         t_clip_build = 0.0
         for s in completed_unique:
@@ -308,15 +490,8 @@ class SceneTracker:
             tb1 = time.perf_counter()
             t_clip_build += (tb1 - tb0)
 
-        t2 = time.perf_counter()
-
         overlay_boxes: List[Box] = []
-        # For debug/visualization we want the boxes corresponding to *this frame's* overlays.
-        # Crucially, this must include scenes that *complete on this frame* (e.g. max_len),
-        # otherwise you see missing overlays at f=29,59,... even though detections exist.
-        #
-        # NOTE: At this point, any scenes that completed have already been removed from
-        # self._scenes, so we must also include completed_unique.
+        # Include scenes that complete on this frame (e.g. max_len), otherwise you see missing overlays.
         for s in self._scenes:
             if s.frame_end == frame_num and s.roi_boxes:
                 overlay_boxes.append(s.roi_boxes[-1])

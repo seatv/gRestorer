@@ -106,16 +106,40 @@ def _pick_device(gpu_id: int) -> torch.device:
     return torch.device("cpu")
 
 
-def _tensor_boxes_to_list_xyxy(boxes_xyxy: Optional[torch.Tensor]) -> List[Box]:
+def _tensor_boxes_to_list_xyxy(
+    boxes_xyxy: Optional[torch.Tensor],
+    *,
+    w: Optional[int] = None,
+    h: Optional[int] = None,
+) -> List[Box]:
+    """Convert YOLO xyxy boxes -> List[Box] (t,l,b,r) using LADA-style quantization.
+
+    - No rounding: int() truncation (after optional clamp) to avoid 0.5 ping-pong.
+    - Optional clamp to [0..w] / [0..h] before truncation for stability.
+    """
     if boxes_xyxy is None or boxes_xyxy.numel() == 0:
         return []
+
+    w_f = float(w) if w is not None else None
+    h_f = float(h) if h is not None else None
+
     out: List[Box] = []
     for row in boxes_xyxy.tolist():
         x1, y1, x2, y2 = row
-        l = int(round(x1))
-        t = int(round(y1))
-        r = int(round(x2))
-        b = int(round(y2))
+
+        if w_f is not None:
+            x1 = max(0.0, min(float(x1), w_f))
+            x2 = max(0.0, min(float(x2), w_f))
+        if h_f is not None:
+            y1 = max(0.0, min(float(y1), h_f))
+            y2 = max(0.0, min(float(y2), h_f))
+
+        # NOTE: int() truncates toward zero (LADA-style after clamp).
+        l = int(x1)
+        t = int(y1)
+        r = int(x2)
+        b = int(y2)
+
         out.append((t, l, b, r))
     return out
 
@@ -204,14 +228,31 @@ class Pipeline:
             return None
         if not self.det_model:
             raise FileNotFoundError("Detector model path is empty (check config.json or --det-model)")
-        return YoloDetector(
-            model_path=self.det_model,
-            device=self.device,
-            imgsz=self.det_imgsz,
-            conf_thres=self.det_conf,
-            iou_thres=self.det_iou,
-            fp16=self.det_fp16,
-        )
+
+        det_type = str(self.cfg.get("detection", "dete_type", default="yolo") or "yolo").lower()
+        print(f"[Detector] type={det_type}")
+
+        if det_type == "yolo":
+            return YoloDetector(
+                model_path=self.det_model,
+                device=self.device,
+                imgsz=self.det_imgsz,
+                conf_thres=self.det_conf,
+                iou_thres=self.det_iou,
+                fp16=self.det_fp16,
+            )
+        elif det_type in ("lada-yolo", "lada_yolo"):
+            from gRestorer.detector.lada_yolo import LadaYoloDetector
+            return LadaYoloDetector(
+                model_path=self.det_model,
+                device=self.device,
+                imgsz=self.det_imgsz,
+                conf_thres=self.det_conf,
+                iou_thres=self.det_iou,
+                fp16=self.det_fp16,
+            )
+        else:
+            raise ValueError(f"Unknown detector_type: {det_type}")
 
     def _build_restorer(self):
         if self.mode == "none":
@@ -386,6 +427,9 @@ class Pipeline:
 
             metrics.t_prepare += (time.perf_counter() - t0_prep)
 
+            # Convert RGB -> BGR uint8 once per frame (LADA parity + reuse everywhere)
+            batch_bgr_u8: List[torch.Tensor] = [rgb_hwc_to_bgr_hwc_u8(rgb) for rgb in batch_rgb]
+
             # -----------------------------
             # Detect (optional)
             # -----------------------------
@@ -395,8 +439,8 @@ class Pipeline:
                     left_frames: List[torch.Tensor] = []
                     right_frames: List[torch.Tensor] = []
                     half_w = w // 2
-                    for rgb in batch_rgb:
-                        l, r = split_frame_lr(rgb, layout=self.sbs_layout)
+                    for bgr in batch_bgr_u8:
+                        l, r = split_frame_lr(bgr, layout=self.sbs_layout)
                         left_frames.append(l.contiguous())
                         right_frames.append(r.contiguous())
 
@@ -406,8 +450,8 @@ class Pipeline:
                     metrics.t_det += (time.perf_counter() - t0)
 
                     for dl, dr in zip(det_l, det_r):
-                        boxes_l = _tensor_boxes_to_list_xyxy(dl.boxes)
-                        boxes_r = _tensor_boxes_to_list_xyxy(dr.boxes)
+                        boxes_l = _tensor_boxes_to_list_xyxy(dl.boxes, w=half_w, h=h)
+                        boxes_r = _tensor_boxes_to_list_xyxy(dr.boxes, w=half_w, h=h)
                         masks_l = _extract_masks_list(dl) if self.use_seg_masks else None
                         masks_r = _extract_masks_list(dr) if self.use_seg_masks else None
 
@@ -442,7 +486,7 @@ class Pipeline:
                         detections.append(det)
                 else:
                     t0 = time.perf_counter()
-                    detections = detector.detect_batch(batch_rgb)
+                    detections = detector.detect_batch(batch_bgr_u8)
                     metrics.t_det += (time.perf_counter() - t0)
             else:
                 detections = [Detection(boxes=None, scores=None, classes=None, masks=None) for _ in batch_rgb]
@@ -456,8 +500,7 @@ class Pipeline:
                 if self.enc_sync_before_encode:
                     sync_device(self.device)
                 t0 = time.perf_counter()
-                for rgb in batch_rgb:
-                    bgr_u8 = rgb_hwc_to_bgr_hwc_u8(rgb)
+                for bgr_u8 in batch_bgr_u8:
                     encoder.encode_frame(bgr_u8_to_bgra_u8(bgr_u8))
                     frame_num += 1
                     metrics.processed_frames += 1
@@ -467,14 +510,13 @@ class Pipeline:
 
             safe_before_batch: int = frame_num  # will advance as we process frames
 
-            for i, rgb in enumerate(batch_rgb):
+            for i, bgr_u8 in enumerate(batch_bgr_u8):
                 if self.max_frames is not None and frame_num >= self.max_frames:
                     break
 
                 det = detections[i] if i < len(detections) else Detection(boxes=None, scores=None, classes=None, masks=None)
-                bgr_u8 = rgb_hwc_to_bgr_hwc_u8(rgb)
 
-                boxes = _tensor_boxes_to_list_xyxy(det.boxes)
+                boxes = _tensor_boxes_to_list_xyxy(det.boxes, w=w, h=h)
                 masks_list = _extract_masks_list(det) if (self.use_seg_masks and det.masks is not None) else None
 
                 if self.roi_dilate > 0 and boxes:

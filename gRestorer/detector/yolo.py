@@ -255,14 +255,30 @@ class MosaicDetectionModel:
         with torch.inference_mode():
             out = self.model(x)
 
-            # Seg models typically return (pred, proto) or [pred, proto]
+            # Seg models typically return (pred, proto) but newer Ultralytics may wrap proto in dict/list
             if isinstance(out, (list, tuple)) and len(out) >= 2:
                 pred_logits = out[0]
                 protos = out[1]
-                if isinstance(protos, (list, tuple)):
-                    protos = protos[-1]
+            elif isinstance(out, dict):
+                # very defensive: handle dict output if it ever happens
+                pred_logits = out.get("pred", out.get(0, None))
+                protos = out.get("proto", out.get("protos", out.get(1, None)))
             else:
                 raise RuntimeError("YOLO model output did not include protos (segmentation). Check weights/model type.")
+
+            # Normalize protos to a tensor or list/tuple of tensors
+            if isinstance(protos, dict):
+                # common keys across versions
+                for k in ("proto", "protos", "p"):
+                    if k in protos:
+                        protos = protos[k]
+                        break
+                else:
+                    protos = next(iter(protos.values()))
+
+            if isinstance(protos, (list, tuple)):
+                # some builds return a list of proto tensors; last element is usually the proto feature map
+                protos = protos[-1]
 
             # Ultralytics 8.3.243 NMS is in ultralytics.utils.nms and does not take `nm`,
             # it infers extra dims from `nc` (see docs).
@@ -286,7 +302,27 @@ class MosaicDetectionModel:
             # Defensive clones: some Ultralytics utilities do in-place ops on their inputs
             mask_coeff = pred[:, 6:].detach()
             boxes_for_mask = pred[:, :4].detach().clone()
-            masks_lb = ops.process_mask(protos[i], mask_coeff, boxes_for_mask, x.shape[2:], upsample=True)
+
+            # Pick per-image proto safely (8.4.4 sometimes returns protos as dict/other container)
+            proto_i = protos
+            if isinstance(protos, torch.Tensor) and protos.ndim == 4:
+                # protos shape: [B, C, H, W]
+                proto_i = protos[i]
+            elif isinstance(protos, (list, tuple)):
+                proto_i = protos[i]
+            elif isinstance(protos, dict):
+                # try common keys, else first value
+                if "proto" in protos:
+                    proto_i = protos["proto"]
+                elif "protos" in protos:
+                    proto_i = protos["protos"]
+                else:
+                    proto_i = next(iter(protos.values()))
+                # if proto is still batched, index it
+                if isinstance(proto_i, torch.Tensor) and proto_i.ndim == 4:
+                    proto_i = proto_i[i]
+
+            masks_lb = ops.process_mask(proto_i, mask_coeff, boxes_for_mask, x.shape[2:], upsample=True)
 
             # Scale boxes from letterbox to original
             # ops.scale_boxes() does in-place math; clone to avoid inference-tensor restrictions

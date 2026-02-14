@@ -114,6 +114,7 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--mp4-fast-start", action=argparse.BooleanOptionalAction, default=None, help="MP4 faststart (+faststart)")
 
     # --- Detection ---
+    p.add_argument("--det-type", default=None, choices=["yolo", "lada-yolo"])
     p.add_argument("--det-model", default=None)
     p.add_argument("--det-batch-size", type=int, default=None)
     p.add_argument("--det-conf", type=float, default=None)
@@ -312,6 +313,10 @@ def parse_args(argv: list[str] | None = None) -> Config:
         cfg.set("sbs_det_split", value=True)
     if args.no_sbs_det_split:
         cfg.set("sbs_det_split", value=False)
+
+    # Detector Switch (CLI overrides config/default)
+    if args.det_type is not None:
+        cfg.set("detection", "dete_type", value=str(args.det_type))
 
     # Runtime-only toggles
     if args.debug:
