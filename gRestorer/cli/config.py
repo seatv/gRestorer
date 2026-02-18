@@ -125,11 +125,16 @@ def create_parser() -> argparse.ArgumentParser:
     # --- Restoration ---
     p.add_argument("--rest-model", default=None)
     p.add_argument("--rest-fp16", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--rest-max-clip-length", type=int, default=None)
+    p.add_argument("--rest-max-clip-length", type=int, default=None,
+                   help="Max frames per restoration clip (default: 30, higher=smoother but more VRAM)")
     p.add_argument("--rest-clip-size", type=int, default=None)
     p.add_argument("--rest-border-ratio", type=float, default=None)
     p.add_argument("--rest-pad-mode", default=None)
     p.add_argument("--rest-feather-radius", type=int, default=None)
+
+    # [CHANGE 2] FrameStore backpressure
+    p.add_argument("--store-max-frames", type=int, default=None,
+                   help="Max frames in FrameStore (0=auto, -1=unlimited; controls VRAM backpressure)")
 
     # --- Scene tracking (kept for config parity) ---
     p.add_argument("--trk-min-iou", type=float, default=None)
@@ -280,6 +285,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("restoration", "border_ratio"), args.rest_border_ratio)
     _set_if_not_none(cfg, ("restoration", "pad_mode"), args.rest_pad_mode)
     _set_if_not_none(cfg, ("restoration", "feather_radius"), args.rest_feather_radius)
+
+    # [CHANGE 2] FrameStore backpressure
+    _set_if_not_none(cfg, ("store_max_frames",), args.store_max_frames)
 
     # Scene tracking
     _set_if_not_none(cfg, ("scene_tracking", "min_iou"), args.trk_min_iou)

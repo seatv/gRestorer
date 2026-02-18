@@ -1,22 +1,32 @@
-id,priority,status,area,title,description,sources,created
+ID,Priority,Status,Are,Title,Description,Source,Created On
 RM-001,P0,,Compositor,Fix halo around pasted/restored regions,"Investigate mask feather/dilation, colorspace/range mismatch, resize interpolation; match LADA paste/blend behavior.",Jan2026-26.md; Jan2026-27.md,1/27/2026
 RM-002,P0,Done,Detection/Preprocess,Eliminate YOLO CPU hop,Move letterbox/preprocess to torch on GPU/XPU; keep frames and YOLO outputs on-device (no CPU uint8/NumPy).,Dec-19.md:590; Dec-19.md:304,1/27/2026
 RM-003,P0,,Video I/O,Fix remux/mux timestamps (Duration N/A),Ensure output container has valid duration/PTS/DTS; handle VFR; verify via ffprobe frame pkt_pts_time/pkt_duration_time.,Dec-19.md:3254; Dec-21.md,1/27/2026
-RM-004,P0,,Pipeline,Early passthrough when no detections,"If det=0 and no active scenes, encode original frame immediately to save memory/latency.",Dec-26.md:4025,1/27/2026
-RM-005,P1,,Detection,Tiled detection for 4K+ sources,Add overlapping tiling path for YOLO; merge boxes/masks on-device.,Nov-10.md:506; Nov-10.md:613,1/27/2026
-RM-006,P1,,Detection/Mask,GPU mask postproc (dilate/feather/gain),Implement dilation/feathering/gain entirely on-device (CUDA/XPU); unify with compositor.,Nov-10.md:506,1/27/2026
-RM-007,P1,,Restoration,ROI-cropped restoration to save compute,"Optionally crop to ROI bbox (+context), run restorer, paste back; preserve temporal window semantics.",Nov-10.md:512,1/27/2026
-RM-008,P1,,Detection Tuning,Dynamic imgsz by input resolution,"Auto imgsz heuristic (e.g., 640 for 1080p, 960 for higher); expose override.",Dec-26.md:1659; TODO-17,1/27/2026
-RM-009,P1,,Detection Robustness,Investigate intermittent missed ROI detections,"Compare padding/letterbox parity, conf threshold, imgsz, fp16 precision, dilation/union; add logging to isolate frames.",TODO-19,1/27/2026
-RM-010,P1,,ROI Tracking,Control ROI unions vs per-box,Add option to control union/merge strategy and measure impact on quality/speed.,Dec-26.md; TODO list,1/27/2026
-RM-011,P1,,Video I/O,NVDEC prefetch N/N+1 (2-batch),Decode next batch while current batch runs detect+restore to reduce GPU idle gaps.,Jan2026-23.md thread notes,1/27/2026
-RM-012,P2,,CLI/UX,Custom ffmpeg decoder/encoder args,Allow user-specified ffmpeg input and output options (ordered correctly) and surface stderr on fallback.,Existing memory,1/27/2026
-RM-013,P2,,Metrics,Better timing + print around remux,Add prints around remux and per-stage timing summary; keep wall clock vs perf_counter.,Jan2026-23.md:2234,1/27/2026
-RM-014,P2,,VR/SBS,Parallel SBS processing,Explore running left/right eye restoration concurrently (threads/streams) while keeping ordering stable.,Dec-26.md; Dec-31.md,1/27/2026
-RM-015,P2,,VR/SBS,VR pre-projection options for detection,Optional fisheye/v360 transforms to improve detection on edge/trapezoid VR cases (yaw/pitch/fov).,Zelefans notes,1/27/2026
-RM-016,P3,,Packaging,Inference-only model graph port,Port/verify inference-only graph (TSA/PCD/residual) and ensure weight loading works.,Oct-28.md:410,1/27/2026
-RM-017,P3,,Diagnostics,Startup banner: file version + config echo,Print build/version hash and resolved config at start to avoid stale file confusion.,Nov-03.md:2528,1/27/2026
-RM-018,P3,,UX,Progress indicators,Add progress bars / throughput readout; keep lightweight for CLI.,Nov-03.md:1040,1/27/2026
-RM-019,P0,,Detection,Inference-Letterbox ,Keep mask postproc + compositor ops on-device (replace cv2/np in mask_utils/image_utils hot path).,GS/chatGPT,1/27/2026
-RM-020,P1,,Debug,Standardize env-var debug controls,"Keep and standardize env-var driven debug hooks (GR_DEBUG, GR_DUMP_ONE_FRAME, GR_DUMP_DIR, GR_DUMP_MASKS, GR_DUMP_ROI_INDEX, optional GR_DUMP_EVERY_N). Ensure default-off, throttled logging, no per-frame disk I/O unless enabled, and avoid GPU sync unless dumping.","Halo investigation; mask/alpha/overlay dumps; SBS tile-pad debugging",2026-01-29
-
+RM-004,P0,,Pipeline,Early passthrough when no detections,"If det=0 and no active scenes, encode original frame immediately (avoid storing full-res GPU frame)",Dec-26.md:4025,1/27/2026
+RM-005,P1,,Detection,Tiled detection for 4K+ sources,Add overlapping tiling path for YOLO; merge boxes with NMS/union; reduce missed small mosaics in high-res sources.,Nov-10.md:506; Nov-10.md:613,1/27/2026
+RM-006,P1,,Detection/Mask,GPU mask postproc (dilate/feather/gain),Implement dilation/feathering/gain entirely on GPU/XPU (torch); reduce CPU mask ops and match LADA blend strategy.,Nov-10.md:506,1/27/2026
+RM-007,P1,,Restoration,ROI-cropped restoration to save compute,"Optionally crop to ROI bbox (+context), run restoration on crop, paste back; reduce VRAM/compute for small mosaics.",Nov-10.md:512,1/27/2026
+RM-008,P1,,Detection Tuning,Dynamic imgsz by input resolution,"Auto imgsz heuristic (e.g., 640 for 1080p, 960 for higher-res) to improve detection quality/perf balance.",Dec-26.md:1659; TODO-17,1/27/2026
+RM-009,P1,,Detection Robustness,Investigate intermittent missed ROI detections,"Compare padding/letterbox parity, conf threshold, imgsz, fp16/precision, ROI dilation/union; add logging to isolate frames.",TODO-19,1/27/2026
+RM-010,P1,,ROI Tracking,Control ROI unions vs per-box,Add option to control union/merge strategy and padding rounding; mitigate ROI flicker and scene membership drift.,Dec-26.md; TODO list,1/27/2026
+RM-011,P1,,Video I/O,NVDEC prefetch N/N+1 (2-batch),Decode next batch while current batch runs detection/restoration to reduce GPU idle gaps and keep NVDEC busy.,Jan2026-23.md thread notes,1/27/2026
+RM-012,P2,,CLI/UX,Custom ffmpeg decoder/encoder args,Allow user-specified ffmpeg input and output options; ensure input opts placed before -i; validate and surface stderr.,Existing memory,1/27/2026
+RM-013,P2,,Metrics,Better timing + print around remux,Add prints around remux and per-stage timing so perf regressions are visible; include decode/det/rest/encode durations.,Jan2026-23.md:2234,1/27/2026
+RM-014,P2,,VR/SBS,Parallel SBS processing,Explore running left/right eye restoration concurrently (if VRAM allows) and/or overlap pipeline stages.,Dec-26.md; Dec-31.md,1/27/2026
+RM-015,P2,,VR/SBS,VR pre-projection options for detection,Optional fisheye/v360 transforms to improve detector performance on VR projections; keep fast path.,Zelefans notes,1/27/2026
+RM-016,P3,,Packaging,Inference-only model graph port,Port/verify inference-only graph (TSA/PCD/residual) to minimize overhead; ensure weights load without training deps.,Oct-28.md:410,1/27/2026
+RM-017,P3,,Diagnostics,Startup banner: file version + config echo,Print build/version hash and resolved config at startup for reproducibility.,Nov-03.md:2528,1/27/2026
+RM-018,P3,,UX,Progress indicators,Add progress bars / throughput readout; keep logs clean under MF_DEBUG/GR_DEBUG.,Nov-03.md:1040,1/27/2026
+RM-019,P0,,Detection,Inference-Letterbox ,Keep mask postproc + compositor ops on-device (torch); eliminate unnecessary CPU conversions.,GS/chatGPT,1/27/2026
+RM-020,P1,,Debug,Standardize env-var debug controls,Keep and standardize env-var driven debug hooks across modules (dump frames/masks/boxes).,Halo investigation; mask/alpha/overlay dumps; unify toggles,1/29/2026
+RM-021,P1,,Pipeline,Avoid pinned min_active_start,Implement rolling clip finalization so long active scenes don’t pin min_active_start; let safe_before advance and frames drain.Add per-scene “emitted watermark” (safe_emitted_until) so safe_before can move forward during long scenes; reduce buffering.,Claude suggestion merge,2/15/2026
+RM-022,P0,,Pipeline,Bound FrameStore growth (cap + emergency ceiling),Add FrameStore max_frames with backpressure; when blocked by active scene (safe_before pinned)- temporarily raise cap to bounded emergency ceiling; otherwise block/retry (no runaway decode).,ClaudeParityAnalysis.md:11.3; patch CHANGE-2 followup,2/15/2026
+RM-023,P1,,CLI/UX,Add strict LADA parity preset (disable stabilization),"Provide a one-flag preset (or config profile) that sets crop_quant_px=0, crop_sticky=False, match_pad_px=0 (and any other stabilization extras) for apples-to-apples parity testing.",ClaudeParityAnalysis.md:11.2 #1; 7.1 #1-2,2/15/2026
+RM-024,P1,,Restoration,Add big-ROI quality warning + clip_size option,Track downscale ratio (roi_area vs clip_size^2) and warn when restoration heavily downsamples; allow clip_size=512 (or configurable) when VRAM allows.,ClaudeParityAnalysis.md:8.1,2/15/2026
+RM-025,P2,,Restoration,Tile very large ROIs for restoration,"For ROIs covering large % of frame, split into overlapping tiles (e.g., 256x256), restore each, then feather-blend tiles back to avoid extreme downscale artifacts.",ClaudeParityAnalysis.md:8.1,2/15/2026
+RM-026,P0,,Video I/O,Robust PTS/timebase handling (VFR-safe mode),"Plumb per-frame PTS end-to-end and infer timebase (ns/us/90k/etc.) before deriving fps; if VFR detected, warn and choose explicit strategy (CFR by avg fps vs true VFR container path).",ClaudeParityAnalysis.md:10.3; 11.2 #5; existing RM-003 related,2/15/2026
+RM-027,P2,,Performance,Overlap detection and restoration with CUDA streams,Use separate CUDA streams (and events) to overlap YOLO and BasicVSR++ work where possible; profile to ensure net throughput gain without VRAM spikes.,ClaudeParityAnalysis.md:9.2,2/15/2026
+RM-028,P3,,Cleanup,Remove redundant double mask OR in _compute_crop,Eliminate the second seg_mask OR pass in _compute_crop (idempotent) to reduce clutter and avoid confusion in parity reviews.,ClaudeParityAnalysis.md:11.2 #4; 7.1 #4,2/15/2026
+RM-029,P3,,Testing,Test non-256 clip_size mapping in crop_box_to_target_v3,Add a unit test (or quick harness) to verify crop_box_to_target_v3 target_hw mapping behaves correctly for clip_size != 256 / non-square targets.,ClaudeParityAnalysis.md:11.2 #3,2/15/2026
+RM-030,P0,,Packaging,Build a packager for gRestorer - on Windows,"Create one executable, with config outside of _internal, at the same level as gRestorer.exe",GS,2/17/2026
+RM-031,P4,,Packaging,Build a packager for gRestorer - on Unix,Build packager for Unix,GS,2/17/2026

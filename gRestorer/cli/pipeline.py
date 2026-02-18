@@ -1,4 +1,11 @@
 # gRestorer/cli/pipeline.py
+# --------------------------------------------------------------------------
+# CHANGES vs original:
+#   [CHANGE 3] max_clip_length default: 9 -> 30  (better temporal stability)
+#   [CHANGE 2] FrameStore backpressure: store_max_frames config + is_full() check
+#   [CHANGE 4] PTS preservation: read_batch_with_pts, PTS in FrameStore,
+#              timecodes file generation, PTS-derived fps for remux
+# --------------------------------------------------------------------------
 from __future__ import annotations
 
 import datetime as _dt
@@ -7,7 +14,7 @@ import threading as _threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -34,6 +41,7 @@ from .pipeline_utils import (
     clip_box_to_bounds,
     cfg_first,
     cfg_path,
+    compute_pts_fps,              # [CHANGE 4]
     drain_store_to_encoder,
     nv12_to_rgb_hwc_u8,
     rgb_hwc_to_bgr_hwc_u8,
@@ -44,6 +52,7 @@ from .pipeline_utils import (
     unsplit_boxes_layout,
     unsplit_masks_layout,
     wrap_surface_as_tensor,
+    write_timecodes_v2,           # [CHANGE 4]
 )
 
 
@@ -78,6 +87,70 @@ class DetStats:
         return self.frames_with_det, self.frames_total, self.total_boxes, avg_area, pct
 
 
+# ---------------------------------------------------------------------------
+# [CHANGE 2+] Emergency FrameStore cap bump
+# ---------------------------------------------------------------------------
+def _compute_emergency_store_max(
+    width: int,
+    height: int,
+    max_clip_length: int,
+    current_max_frames: int,
+    device: torch.device,
+) -> int:
+    """Compute an emergency (temporary) max_frames cap when an active scene blocks draining.
+
+    The goal is to avoid runaway growth ("decode anyway") while still allowing long-running
+    active clips to make progress.
+
+    Strategy:
+      - target = max(current_max_frames, 4*max_clip_length + 64)
+      - apply a hard ceiling (default 600)
+      - on CUDA/XPU, also cap by a fraction of total device memory (best-effort)
+    """
+    base = int(current_max_frames)
+    if base <= 0:
+        return base
+
+    target = max(base, int(max_clip_length) * 4 + 64)
+
+    # Keep the same absolute guardrail as the default computation unless you
+    # explicitly set store_max_frames higher.
+    abs_cap = 600
+
+    frame_bytes = int(width) * int(height) * 3  # BGR u8
+    if frame_bytes <= 0:
+        return max(base, min(target, abs_cap))
+
+    cap_by_mem = abs_cap
+
+    if device.type == "cuda":
+        try:
+            total = int(torch.cuda.get_device_properties(device).total_memory)
+            # Let FrameStore use up to ~55% of total VRAM. Remaining VRAM is for
+            # model weights, activations, scratch, and NVENC surfaces.
+            budget = int(total * 0.55)
+            cap_by_mem = max(base, int(budget // frame_bytes))
+        except Exception:
+            cap_by_mem = abs_cap
+
+    elif device.type == "xpu" and hasattr(torch, "xpu"):
+        # Best-effort: torch.xpu.get_device_properties exists on some builds.
+        try:
+            getp = getattr(torch.xpu, "get_device_properties", None)  # type: ignore[attr-defined]
+            if getp is not None:
+                idx = getattr(device, "index", 0) or 0
+                props = getp(int(idx))
+                total = int(getattr(props, "total_memory", 0))
+                if total > 0:
+                    budget = int(total * 0.55)
+                    cap_by_mem = max(base, int(budget // frame_bytes))
+        except Exception:
+            cap_by_mem = abs_cap
+
+    ceiling = max(base, min(abs_cap, cap_by_mem if cap_by_mem > 0 else abs_cap))
+    return max(base, min(target, ceiling))
+
+
 @dataclass
 class PipelineMetrics:
     processed_frames: int = 0
@@ -99,6 +172,9 @@ class PipelineMetrics:
     wall_end: _dt.datetime | None = None
 
     det_stats: DetStats = field(default_factory=DetStats)
+
+    # [CHANGE 2] backpressure stats
+    backpressure_waits: int = 0
 
     def sum_parts(self) -> float:
         return self.t_decode + self.t_det + self.t_track + self.t_restore + self.t_encode
@@ -162,6 +238,93 @@ def _extract_masks_list(det: Detection) -> Optional[List[Optional[torch.Tensor]]
     return None
 
 
+# ---------------------------------------------------------------------------
+# [CHANGE 2] Default FrameStore size computation
+# ---------------------------------------------------------------------------
+def _compute_default_store_max(width: int, height: int, max_clip_length: int) -> int:
+    """Compute a sensible default max_frames for the FrameStore.
+
+    Strategy: allow at least 2× max_clip_length frames so that the store can hold
+    the current clip's worth of frames plus one batch of new frames.
+    Cap at a VRAM budget of ~1.5 GB for the store (per-frame BGR u8).
+    """
+    frame_bytes = width * height * 3  # BGR u8
+    if frame_bytes <= 0:
+        return 300  # fallback
+
+    vram_budget = 1.5 * 1024 * 1024 * 1024  # 1.5 GB
+    budget_frames = int(vram_budget / frame_bytes)
+
+    # At minimum, need 2x max_clip_length + some headroom for batching
+    min_frames = max(max_clip_length * 2 + 32, 64)
+
+    return max(min_frames, min(budget_frames, 600))
+
+
+# ---------------------------------------------------------------------------
+# [CHANGE 2+] Emergency FrameStore cap bump
+# ---------------------------------------------------------------------------
+def _compute_emergency_store_max(
+    width: int,
+    height: int,
+    max_clip_length: int,
+    current_max_frames: int,
+    device: torch.device,
+) -> int:
+    """Compute an emergency (temporary) max_frames cap when an active scene blocks draining.
+
+    The goal is to avoid runaway growth ("decode anyway") while still allowing long-running
+    active clips to make progress.
+
+    Strategy:
+      - target = max(current_max_frames, 4*max_clip_length + 64)
+      - apply a hard ceiling (default 600)
+      - on CUDA/XPU, also cap by a fraction of total device memory (best-effort)
+    """
+    base = int(current_max_frames)
+    if base <= 0:
+        return base
+
+    target = max(base, int(max_clip_length) * 4 + 64)
+
+    # Keep the same absolute guardrail as the default computation unless you
+    # explicitly set store_max_frames higher.
+    abs_cap = 600
+
+    frame_bytes = int(width) * int(height) * 3  # BGR u8
+    if frame_bytes <= 0:
+        return max(base, min(target, abs_cap))
+
+    cap_by_mem = abs_cap
+
+    if device.type == "cuda":
+        try:
+            total = int(torch.cuda.get_device_properties(device).total_memory)
+            # Let FrameStore use up to ~55% of total VRAM. Remaining VRAM is for
+            # model weights, activations, scratch, and NVENC surfaces.
+            budget = int(total * 0.55)
+            cap_by_mem = max(base, int(budget // frame_bytes))
+        except Exception:
+            cap_by_mem = abs_cap
+
+    elif device.type == "xpu" and hasattr(torch, "xpu"):
+        # Best-effort: torch.xpu.get_device_properties exists on some builds.
+        try:
+            getp = getattr(torch.xpu, "get_device_properties", None)  # type: ignore[attr-defined]
+            if getp is not None:
+                idx = getattr(device, "index", 0) or 0
+                props = getp(int(idx))
+                total = int(getattr(props, "total_memory", 0))
+                if total > 0:
+                    budget = int(total * 0.55)
+                    cap_by_mem = max(base, int(budget // frame_bytes))
+        except Exception:
+            cap_by_mem = abs_cap
+
+    ceiling = max(base, min(abs_cap, cap_by_mem if cap_by_mem > 0 else abs_cap))
+    return max(base, min(target, ceiling))
+
+
 @dataclass
 class Pipeline:
     cfg: Config
@@ -202,11 +365,18 @@ class Pipeline:
 
         self.rest_model: str = cfg_path(self.cfg, ("restoration", "rest_model_path"), default="")
         self.rest_fp16: bool = bool(self.cfg.get("restoration", "fp16", default=True))
-        self.rest_max_clip_length: int = int(self.cfg.get("restoration", "max_clip_length", default=9))
+
+        # [CHANGE 3] max_clip_length default: 9 -> 30
+        self.rest_max_clip_length: int = int(self.cfg.get("restoration", "max_clip_length", default=30))
+
         self.rest_clip_size: int = int(self.cfg.get("restoration", "clip_size", default=256))
         self.rest_border_ratio: float = float(self.cfg.get("restoration", "border_ratio", default=0.06))
         self.rest_pad_mode: str = str(self.cfg.get("restoration", "pad_mode", default="reflect"))
         self.feather_radius: int = int(self.cfg.get("restoration", "feather_radius", default=0))
+
+        # [CHANGE 2] FrameStore backpressure
+        # 0 = auto-compute from resolution + max_clip_length;  -1 = unlimited
+        self.store_max_frames: int = int(self.cfg.get("store_max_frames", default=0))
 
         # Encoder base
         self.enc_codec: str = str(self.cfg.get("encoder", "codec", default="hevc")).lower()
@@ -362,7 +532,23 @@ class Pipeline:
             else:
                 tracker = SceneTracker(cfg=tracker_cfg)
 
-        store = FrameStore()
+        # [CHANGE 2] FrameStore with backpressure
+        if self.store_max_frames == 0:
+            computed_max = _compute_default_store_max(w, h, self.rest_max_clip_length)
+            store = FrameStore(max_frames=computed_max)
+        elif self.store_max_frames < 0:
+            store = FrameStore(max_frames=0)  # unlimited
+        else:
+            store = FrameStore(max_frames=self.store_max_frames)
+
+        if store.max_frames > 0:
+            est_mb = (store.max_frames * w * h * 3) / (1024.0 * 1024.0)
+            print(f"[FrameStore] max_frames={store.max_frames} (~{est_mb:.0f} MB VRAM budget)")
+        else:
+            print("[FrameStore] max_frames=unlimited")
+
+        # [CHANGE 4] PTS log: collects (frame_num, pts_ns) for all encoded frames
+        pts_log: List[Tuple[int, Optional[int]]] = []
 
         pbar_total = (self.max_frames if self.max_frames is not None else (total_frames if total_frames > 0 else None))
         pbar = tqdm(total=pbar_total, disable=self.debug)
@@ -378,7 +564,10 @@ class Pipeline:
         prod: Optional[_threading.Thread] = None
         q: Optional[_queue.Queue[Optional[List[object]]]] = None
 
-        def consume_batch(batch: List[object]) -> None:
+        # [CHANGE 4] batch-level PTS storage: populated by read_batch_with_pts
+        batch_pts_cache: List[Optional[int]] = []
+
+        def consume_batch(batch: List[object], batch_pts: Optional[List[Optional[int]]] = None) -> None:
             nonlocal frame_num
 
             # If we're stopping early, trim batch to remaining frames.
@@ -388,6 +577,14 @@ class Pipeline:
                     return
                 if len(batch) > remaining:
                     batch = batch[:remaining]
+                    if batch_pts is not None:
+                        batch_pts = batch_pts[:remaining]
+
+            # [CHANGE 4] Ensure batch_pts list is correctly sized
+            if batch_pts is None:
+                batch_pts = [None] * len(batch)
+            while len(batch_pts) < len(batch):
+                batch_pts.append(None)
 
             # -----------------------------
             # Prepare: surface/tensor -> RGB HWC u8 on pipeline device
@@ -521,7 +718,10 @@ class Pipeline:
                 if self.enc_sync_before_encode:
                     sync_device(self.device)
                 t0 = time.perf_counter()
-                for bgr_u8 in batch_bgr_u8:
+                for i, bgr_u8 in enumerate(batch_bgr_u8):
+                    # [CHANGE 4] track PTS for passthrough frames too
+                    frame_pts = batch_pts[i] if i < len(batch_pts) else None
+                    pts_log.append((frame_num, frame_pts))
                     encoder.encode_frame(bgr_u8_to_bgra_u8(bgr_u8))
                     frame_num += 1
                     metrics.processed_frames += 1
@@ -555,7 +755,9 @@ class Pipeline:
 
                 metrics.det_stats.add(boxes, w=w, h=h)
 
-                store.put(frame_num, bgr_u8)
+                # [CHANGE 4] Store frame with PTS
+                frame_pts = batch_pts[i] if i < len(batch_pts) else None
+                store.put(frame_num, bgr_u8, pts=frame_pts)
 
                 t0 = time.perf_counter()
                 step = tracker.step_frame(frame_num, bgr_u8, boxes, masks_list)
@@ -602,6 +804,7 @@ class Pipeline:
                 encoder=encoder,
                 device=self.device,
                 sync_before_encode=self.enc_sync_before_encode,
+                pts_log=pts_log,              # [CHANGE 4]
             )
             metrics.t_encode += (time.perf_counter() - t0)
 
@@ -647,6 +850,52 @@ class Pipeline:
                     if self.max_frames is not None and frame_num >= self.max_frames:
                         break
 
+                    # [CHANGE 2+] Backpressure: enforce cap. If an active scene blocks draining,
+                    # temporarily raise the cap (bounded) instead of letting the store grow unbounded.
+                    while store.is_full():
+                        metrics.backpressure_waits += 1
+
+                        # Try to drain frames that are guaranteed not to be touched by any active clip.
+                        min_start = tracker.min_active_start() if tracker is not None else None
+                        sb = int(min_start) if min_start is not None else int(frame_num + 1)
+
+                        drain_store_to_encoder(
+                            store=store,
+                            safe_before=sb,
+                            encoder=encoder,
+                            device=self.device,
+                            sync_before_encode=self.enc_sync_before_encode,
+                            pts_log=pts_log,
+                        )
+
+                        if not store.is_full():
+                            break
+
+                        # If we cannot drain because the oldest stored frame is still within an
+                        # active clip, bump the cap up to an emergency ceiling.
+                        if store.max_frames > 0 and min_start is not None and len(store.frames_bgr_u8) > 0:
+                            oldest = min(store.frames_bgr_u8.keys())
+                            if sb <= oldest:
+                                new_max = _compute_emergency_store_max(w, h, self.rest_max_clip_length, store.max_frames, self.device)
+                                if new_max > store.max_frames:
+                                    old_max = store.max_frames
+                                    store.max_frames = new_max
+                                    try:
+                                        mb = store.vram_mb()
+                                        print(
+                                            f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); "
+                                            f"raising max_frames {old_max}->{new_max} (~{mb:.0f} MB est in-use)"
+                                        )
+                                    except Exception:
+                                        print(
+                                            f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); "
+                                            f"raising max_frames {old_max}->{new_max}"
+                                        )
+                                    continue
+
+                        # Otherwise, block briefly and retry. This prevents "decode anyway" runaway.
+                        time.sleep(0.001)
+
                     t0 = time.perf_counter()
                     batch = q.get()
                     metrics.t_queue_wait += (time.perf_counter() - t0)
@@ -664,14 +913,61 @@ class Pipeline:
                     if self.max_frames is not None and frame_num >= self.max_frames:
                         break
 
+                    # [CHANGE 2+] Backpressure: enforce cap. If an active scene blocks draining,
+                    # temporarily raise the cap (bounded) instead of letting the store grow unbounded.
+                    while store.is_full():
+                        metrics.backpressure_waits += 1
+
+                        # Try to drain frames that are guaranteed not to be touched by any active clip.
+                        min_start = tracker.min_active_start() if tracker is not None else None
+                        sb = int(min_start) if min_start is not None else int(frame_num + 1)
+
+                        drain_store_to_encoder(
+                            store=store,
+                            safe_before=sb,
+                            encoder=encoder,
+                            device=self.device,
+                            sync_before_encode=self.enc_sync_before_encode,
+                            pts_log=pts_log,
+                        )
+
+                        if not store.is_full():
+                            break
+
+                        # If we cannot drain because the oldest stored frame is still within an
+                        # active clip, bump the cap up to an emergency ceiling.
+                        if store.max_frames > 0 and min_start is not None and len(store.frames_bgr_u8) > 0:
+                            oldest = min(store.frames_bgr_u8.keys())
+                            if sb <= oldest:
+                                new_max = _compute_emergency_store_max(w, h, self.rest_max_clip_length, store.max_frames, self.device)
+                                if new_max > store.max_frames:
+                                    old_max = store.max_frames
+                                    store.max_frames = new_max
+                                    try:
+                                        mb = store.vram_mb()
+                                        print(
+                                            f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); "
+                                            f"raising max_frames {old_max}->{new_max} (~{mb:.0f} MB est in-use)"
+                                        )
+                                    except Exception:
+                                        print(
+                                            f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); "
+                                            f"raising max_frames {old_max}->{new_max}"
+                                        )
+                                    continue
+
+                        # Otherwise, block briefly and retry. This prevents "decode anyway" runaway.
+                        time.sleep(0.001)
+
                     t0 = time.perf_counter()
-                    batch0 = decoder.read_batch()
+                    # [CHANGE 4] Use read_batch_with_pts for PTS extraction
+                    batch0, batch_pts_raw = decoder.read_batch_with_pts()
                     metrics.t_decode += (time.perf_counter() - t0)
 
                     if not batch0:
                         break
 
-                    consume_batch(list(batch0))
+                    consume_batch(list(batch0), batch_pts=batch_pts_raw)
 
         finally:
             # Stop producer safely and avoid deadlock if it is blocked on a full queue.
@@ -715,9 +1011,28 @@ class Pipeline:
                 encoder=encoder,
                 device=self.device,
                 sync_before_encode=self.enc_sync_before_encode,
+                pts_log=pts_log,              # [CHANGE 4]
             )
 
             t_total_no_mux = time.perf_counter() - t0_all
+
+            # [CHANGE 4] Write timecodes file and compute PTS-derived fps
+            tc_path: Optional[str] = None
+            pts_fps: float = fps
+            is_vfr: bool = False
+            if pts_log:
+                pts_fps, is_vfr = compute_pts_fps(pts_log, fallback_fps=fps)
+                tc_path = write_timecodes_v2(pts_log, self.output_path, fps=fps)
+
+                if abs(pts_fps - fps) / max(fps, 0.001) > 0.002:
+                    print(f"[PTS] FPS mismatch: metadata={fps:.3f}  pts_derived={pts_fps:.3f}")
+                if is_vfr:
+                    print(f"[PTS] WARNING: Variable frame rate detected. Timecodes file written for accurate remux.")
+
+                # [CHANGE 4] Pass PTS-derived fps to encoder for more accurate remux
+                encoder._pts_fps = pts_fps
+                encoder._pts_timecodes_path = tc_path
+                encoder._pts_is_vfr = is_vfr
 
             t0 = time.perf_counter()
             try:
@@ -747,6 +1062,9 @@ class Pipeline:
                 f"t_queue_wait={metrics.t_queue_wait:.2f}s t_prepare={metrics.t_prepare:.2f}s "
                 f"t_upload={metrics.t_upload:.2f}s t_csc={metrics.t_csc:.2f}s"
             )
+            # [CHANGE 2] Print backpressure stats
+            if metrics.backpressure_waits > 0:
+                print(f"[Pipeline] Backpressure waits: {metrics.backpressure_waits} (store peaked at max_frames={store.max_frames})")
             print(
                 f"[Pipeline] Processing time (no mux) = {t_total_no_mux:.2f}s "
                 f"Overhead = {overhead:.2f}s (sum_parts={sum_parts:.2f}s)"
@@ -765,6 +1083,13 @@ class Pipeline:
                 elapsed = metrics.wall_end - metrics.wall_start
                 print(f"[Pipeline] Wall clock: start={metrics.wall_start} end={metrics.wall_end} elapsed={elapsed}")
             print(f"[Pipeline] perf_counter elapsed = {t_total_with_mux:.2f}s")
+
+            # [CHANGE 4] Cleanup timecodes file (kept only if VFR)
+            if tc_path and not is_vfr:
+                try:
+                    Path(tc_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
             try:
                 pbar.close()

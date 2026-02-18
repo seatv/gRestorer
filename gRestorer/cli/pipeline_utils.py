@@ -1,10 +1,16 @@
 # gRestorer/cli/pipeline_utils.py
+# --------------------------------------------------------------------------
+# CHANGES vs original:
+#   [CHANGE 2] FrameStore: added max_frames cap + vram_bytes() + is_full()
+#   [CHANGE 4] FrameStore: PTS tracking per frame
+#   [CHANGE 4] drain_store_to_encoder: writes timecodes v2 file for PTS-aware remux
+# --------------------------------------------------------------------------
 from __future__ import annotations
 
 import contextlib
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
@@ -267,25 +273,71 @@ def unsplit_masks_layout(
     raise ValueError(f"Unknown sbs layout: {layout!r}")
 
 
+# ---------------------------------------------------------------------------
+# [CHANGE 2] FrameStore: backpressure via max_frames cap
+# [CHANGE 4] FrameStore: PTS tracking per frame
+# ---------------------------------------------------------------------------
 @dataclass
 class FrameStore:
-    """In-memory store of full frames that may be modified later by clip compositing."""
+    """In-memory store of full frames that may be modified later by clip compositing.
+
+    Changes vs original:
+    - Tracks per-frame PTS (presentation timestamp) from the decoder.
+    - Supports a max_frames watermark for backpressure.
+    - Provides vram_bytes() estimate for monitoring.
+    """
     frames_bgr_u8: Dict[int, torch.Tensor]
+    frame_pts: Dict[int, Optional[int]]           # [CHANGE 4] frame_num -> PTS (nanoseconds or codec ticks)
+    max_frames: int                                 # [CHANGE 2] 0 = unlimited
+    _frame_bytes: int                               # cached per-frame byte size
 
-    def __init__(self) -> None:
+    def __init__(self, max_frames: int = 0) -> None:
         self.frames_bgr_u8 = {}
+        self.frame_pts: Dict[int, Optional[int]] = {}
+        self.max_frames = int(max_frames)
+        self._frame_bytes = 0
 
-    def put(self, frame_num: int, frame_bgr_u8: torch.Tensor) -> None:
-        self.frames_bgr_u8[int(frame_num)] = frame_bgr_u8
+    def put(self, frame_num: int, frame_bgr_u8: torch.Tensor, pts: Optional[int] = None) -> None:
+        k = int(frame_num)
+        self.frames_bgr_u8[k] = frame_bgr_u8
+        self.frame_pts[k] = pts                     # [CHANGE 4]
+        if self._frame_bytes == 0 and frame_bgr_u8.numel() > 0:
+            self._frame_bytes = int(frame_bgr_u8.nelement() * frame_bgr_u8.element_size())
 
     def pop(self, frame_num: int) -> torch.Tensor:
-        return self.frames_bgr_u8.pop(int(frame_num))
+        k = int(frame_num)
+        self.frame_pts.pop(k, None)                  # [CHANGE 4]
+        return self.frames_bgr_u8.pop(k)
+
+    def pop_with_pts(self, frame_num: int) -> Tuple[torch.Tensor, Optional[int]]:
+        """Pop frame and its PTS together."""         # [CHANGE 4]
+        k = int(frame_num)
+        pts = self.frame_pts.pop(k, None)
+        frm = self.frames_bgr_u8.pop(k)
+        return frm, pts
 
     def keys_sorted(self) -> List[int]:
         return sorted(self.frames_bgr_u8.keys())
 
     def __len__(self) -> int:
         return len(self.frames_bgr_u8)
+
+    # [CHANGE 2] -------------------------------------------------------
+    def is_full(self) -> bool:
+        """True when backpressure should pause decoding."""
+        if self.max_frames <= 0:
+            return False
+        return len(self.frames_bgr_u8) >= self.max_frames
+
+    def vram_bytes(self) -> int:
+        """Estimated VRAM held by stored frames (bytes)."""
+        if self._frame_bytes <= 0:
+            return 0
+        return len(self.frames_bgr_u8) * self._frame_bytes
+
+    def vram_mb(self) -> float:
+        return self.vram_bytes() / (1024.0 * 1024.0)
+    # -------------------------------------------------------------------
 
 
 def drain_store_to_encoder(
@@ -295,10 +347,14 @@ def drain_store_to_encoder(
     encoder,
     device: torch.device,
     sync_before_encode: bool = True,
+    pts_log: Optional[List[Tuple[int, Optional[int]]]] = None,   # [CHANGE 4] collects (frame_num, pts) pairs
 ) -> int:
     """
     Encode and remove all frames with frame_num < safe_before.
     Returns number of frames encoded.
+
+    [CHANGE 4] If pts_log is provided, appends (frame_num, pts) for every
+    drained frame so the caller can write a timecodes file at close.
     """
     keys = store.keys_sorted()
     drain_keys = [k for k in keys if k < safe_before]
@@ -312,11 +368,124 @@ def drain_store_to_encoder(
 
     count = 0
     for k in drain_keys:
-        frm_bgr = store.pop(k)
+        frm_bgr, pts = store.pop_with_pts(k)         # [CHANGE 4] use pop_with_pts
+        if pts_log is not None:                       # [CHANGE 4]
+            pts_log.append((k, pts))
         encoder.encode_frame(bgr_u8_to_bgra_u8(frm_bgr))
         count += 1
     return count
 
+
+# ---------------------------------------------------------------------------
+# [CHANGE 4] Timecodes v2 file writer
+# ---------------------------------------------------------------------------
+def write_timecodes_v2(
+    pts_log: List[Tuple[int, Optional[int]]],
+    output_path: str,
+    fps: float,
+    time_base_den: int = 1_000_000_000,   # NVDEC PTS are typically in nanoseconds
+) -> Optional[str]:
+    """Write a Matroska-compatible 'timecodes v2' file from collected PTS data.
+
+    Returns the path to the timecodes file, or None if PTS data is unavailable/uniform.
+    The file format is:
+        # timecode format v2
+        0
+        33.333
+        66.667
+        ...
+    Each line is a timestamp in milliseconds for the corresponding frame.
+    """
+    if not pts_log:
+        return None
+
+    # Check if we have usable PTS data
+    valid_pts = [(fn, p) for fn, p in pts_log if p is not None]
+    if len(valid_pts) < 2:
+        return None
+
+    # Sort by frame number (should already be sorted, but be safe)
+    valid_pts.sort(key=lambda x: x[0])
+
+    # Compute deltas to detect VFR
+    pts_values = [p for _, p in valid_pts]
+    deltas = [pts_values[i + 1] - pts_values[i] for i in range(len(pts_values) - 1)]
+
+    if not deltas:
+        return None
+
+    median_delta = sorted(deltas)[len(deltas) // 2]
+
+    if median_delta <= 0:
+        return None
+
+    # Check if VFR: if max delta differs from median by >2%, it's VFR
+    min_d = min(deltas)
+    max_d = max(deltas)
+    is_vfr = (max_d - min_d) / max(1, median_delta) > 0.02
+
+    # Compute PTS-derived FPS for informational purposes
+    total_time_ns = pts_values[-1] - pts_values[0]
+    if total_time_ns > 0:
+        pts_fps = (len(valid_pts) - 1) / (total_time_ns / 1_000_000_000.0)
+    else:
+        pts_fps = fps
+
+    # Write the timecodes file
+    tc_path = output_path + ".timecodes.txt"
+    base_pts = pts_values[0]
+
+    with open(tc_path, "w") as f:
+        f.write("# timecode format v2\n")
+        # For frames with PTS, use actual PTS; for gaps, interpolate
+        all_frames = sorted(pts_log, key=lambda x: x[0])
+        for fn, p in all_frames:
+            if p is not None:
+                ms = (p - base_pts) / 1_000_000.0   # ns -> ms
+            else:
+                # Interpolate from frame number
+                ms = (fn - all_frames[0][0]) * (1000.0 / fps)
+            f.write(f"{ms:.3f}\n")
+
+    vfr_str = "VFR" if is_vfr else "CFR"
+    print(f"[PTS] Wrote timecodes: {tc_path} ({len(all_frames)} frames, {vfr_str}, pts_fps={pts_fps:.3f})")
+
+    return tc_path
+
+
+def compute_pts_fps(
+    pts_log: List[Tuple[int, Optional[int]]],
+    fallback_fps: float,
+) -> Tuple[float, bool]:
+    """Compute actual average FPS from PTS data.
+
+    Returns (fps, is_vfr).
+    If PTS data is insufficient, returns (fallback_fps, False).
+    """
+    valid = [(fn, p) for fn, p in pts_log if p is not None]
+    if len(valid) < 10:
+        return fallback_fps, False
+
+    valid.sort(key=lambda x: x[0])
+    pts_vals = [p for _, p in valid]
+    total_ns = pts_vals[-1] - pts_vals[0]
+
+    if total_ns <= 0:
+        return fallback_fps, False
+
+    fps = (len(valid) - 1) / (total_ns / 1_000_000_000.0)
+
+    # VFR detection
+    deltas = [pts_vals[i + 1] - pts_vals[i] for i in range(len(pts_vals) - 1)]
+    median_d = sorted(deltas)[len(deltas) // 2]
+    if median_d <= 0:
+        return fallback_fps, False
+
+    min_d = min(deltas)
+    max_d = max(deltas)
+    is_vfr = (max_d - min_d) / max(1, median_d) > 0.02
+
+    return fps, is_vfr
 
 
 def nv12_to_rgb_hwc_u8(

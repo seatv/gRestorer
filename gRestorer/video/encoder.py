@@ -417,6 +417,11 @@ class Encoder:
 
         self._encoder = self._create_encoder_with_fallback(self.width, self.height, fmt, enc_opts)
 
+        # [CHANGE 4] PTS-derived timing (set by Pipeline before close())
+        self._pts_fps: Optional[float] = None
+        self._pts_timecodes_path: Optional[str] = None
+        self._pts_is_vfr: bool = False
+
     # -------------------------
     # NVENC option building
     # -------------------------
@@ -665,10 +670,19 @@ class Encoder:
         have_source = bool(input_video and input_video.exists())
         src_pi = _probe_info(input_video, self.ffprobe_path) if have_source else _ProbeInfo()
 
-        # Decide CFR fps to feed the raw stream
-        fps_r = f"{self.fps:g}"
-        if have_source and src_pi.avg_frame_rate:
-            fps_r = src_pi.avg_frame_rate
+        # [CHANGE 4] Prefer PTS-derived fps when available for more accurate remux
+        if self._pts_fps is not None and self._pts_fps > 0:
+            fps_r = f"{self._pts_fps:g}"
+            if have_source and src_pi.avg_frame_rate:
+                # Log difference between PTS-derived and metadata fps
+                meta_fps = _rate_to_float(src_pi.avg_frame_rate) or self.fps
+                if abs(self._pts_fps - meta_fps) / max(meta_fps, 0.001) > 0.002:
+                    print(f"[Encoder] Using PTS-derived fps={self._pts_fps:.4f} "
+                          f"(metadata={meta_fps:.4f})")
+        else:
+            fps_r = f"{self.fps:g}"
+            if have_source and src_pi.avg_frame_rate:
+                fps_r = src_pi.avg_frame_rate
 
         # Truncation / duration trimming:
         # If output is partial (max_frames or early abort), trim mux to frames_encoded/fps.

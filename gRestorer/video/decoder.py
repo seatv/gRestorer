@@ -1,10 +1,16 @@
 # gRestorer/video/decoder.py
+# --------------------------------------------------------------------------
+# CHANGES vs original:
+#   [CHANGE 4] Added per-frame PTS extraction in read_batch()
+#   [CHANGE 4] New method: read_batch_with_pts() returns (frames, pts_list)
+#   [CHANGE 4] ffmpeg CPU path: PTS estimated from frame count + fps
+# --------------------------------------------------------------------------
 from __future__ import annotations
 
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import json
 import os
@@ -75,6 +81,9 @@ class Decoder:
         self._prefetch: List[Any] = []
         self._trim_prefix: int = 0
         self._trim_negative_pts: bool = bool(trim_negative_pts)
+
+        # [CHANGE 4] PTS tracking for prefetched frames
+        self._prefetch_pts: List[Optional[int]] = []
 
         # Init backend
         if self._force_cpu:
@@ -180,6 +189,7 @@ class Decoder:
         return self._frames_read >= self._raw_num_frames
 
     def read_batch(self) -> List[Any]:
+        """Original API: returns list of frames (surfaces or tensors)."""
         if self.backend != "nvdec":
             n = self.batch_size
             out: List[torch.Tensor] = []
@@ -203,6 +213,7 @@ class Decoder:
         if self._prefetch:
             frames = self._prefetch
             self._prefetch = []
+            self._prefetch_pts = []                    # [CHANGE 4]
             if len(frames) > n:
                 out = frames[:n]
                 self._prefetch = frames[n:]
@@ -214,6 +225,69 @@ class Decoder:
             return []
         self._frames_read += len(frames)
         return frames
+
+    # [CHANGE 4] -------------------------------------------------------
+    def read_batch_with_pts(self) -> Tuple[List[Any], List[Optional[int]]]:
+        """Enhanced API: returns (frames, pts_list) where pts_list[i] is the
+        PTS of frames[i] (nanoseconds), or None if unavailable.
+
+        For NVDEC: extracts PTS via frame.pts()
+        For ffmpeg-cpu: synthesizes PTS from frame count and fps.
+        """
+        if self.backend != "nvdec":
+            n = self.batch_size
+            out_frames: List[torch.Tensor] = []
+            out_pts: List[Optional[int]] = []
+            fps = float(self.metadata.fps or 30.0) or 30.0
+            for _ in range(n):
+                fr = self._ffmpeg_read_frame()
+                if fr is None:
+                    self.close()
+                    break
+                # Synthesize PTS from frame count (nanoseconds)
+                synth_pts = int(self._frames_read * (1_000_000_000.0 / fps))
+                self._frames_read += 1
+                out_frames.append(fr)
+                out_pts.append(synth_pts)
+            return out_frames, out_pts
+
+        # NVDEC path
+        n = self.batch_size
+        if self._raw_num_frames > 0:
+            remaining_raw = self._raw_num_frames - self._frames_read
+            if remaining_raw <= 0 and not self._prefetch:
+                return [], []
+            if remaining_raw > 0:
+                n = min(n, remaining_raw)
+
+        if self._prefetch:
+            frames = self._prefetch
+            pts_list = self._prefetch_pts
+            self._prefetch = []
+            self._prefetch_pts = []
+            if len(frames) > n:
+                out_f = frames[:n]
+                out_p = pts_list[:n] if pts_list else [None] * n
+                self._prefetch = frames[n:]
+                self._prefetch_pts = pts_list[n:] if pts_list else []
+                return out_f, out_p
+            # Pad PTS if needed
+            while len(pts_list) < len(frames):
+                pts_list.append(None)
+            return frames, pts_list
+
+        frames = self._decoder.get_batch_frames(n)
+        if not frames:
+            return [], []
+        self._frames_read += len(frames)
+
+        # Extract PTS from each frame
+        pts_list = []
+        for fr in frames:
+            pts_list.append(self._frame_pts(fr))
+
+        return frames, pts_list
+    # -------------------------------------------------------------------
 
     def close(self) -> None:
         if self.backend != "nvdec":
@@ -296,6 +370,7 @@ class Decoder:
                 pts = self._frame_pts(fr)
                 if pts is None:
                     self._prefetch = frames
+                    self._prefetch_pts = [self._frame_pts(f) for f in frames]  # [CHANGE 4]
                     return
                 if pts >= 0:
                     first_ok = i
@@ -307,6 +382,7 @@ class Decoder:
 
             self._trim_prefix += first_ok
             self._prefetch = frames[first_ok:]
+            self._prefetch_pts = [self._frame_pts(f) for f in frames[first_ok:]]  # [CHANGE 4]
 
             if self._trim_prefix > 0:
                 presented = max(0, self._raw_num_frames - self._trim_prefix)
