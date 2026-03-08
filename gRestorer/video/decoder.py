@@ -37,7 +37,7 @@ class Decoder:
     """
     GPU-first video decoder.
 
-    - Primary backend: PyNvVideoCodec (NVDEC) outputting RGBP (planar) or RGB (packed) in device memory.
+    - Primary backend: PyNvVideoCodec ThreadedDecoder (NVDEC) outputting RGBP (planar) or RGB (packed) in device memory.
     - Fallback backend: ffmpeg CPU decode to raw NV12 (default) or RGB24 (env override).
 
     Extra:
@@ -95,13 +95,13 @@ class Decoder:
                 if self.output_format == "RGB":
                     out_color = nvc.OutputColorType.RGB
 
-                self._decoder = nvc.SimpleDecoder(
+                self._decoder = nvc.ThreadedDecoder(
                     enc_file_path=self.input_path,
+                    buffer_size=self._threaded_buffer_size(),
                     gpu_id=self.gpu_id,
                     output_color_type=out_color,
                     use_device_memory=True,
-                    decoder_cache_size=self.batch_size,
-                    need_scanned_stream_metadata=False,
+                    need_scanned_stream_metadata=True,
                 )
                 self.backend = "nvdec"
             except Exception as e:
@@ -118,7 +118,11 @@ class Decoder:
 
         # Extract metadata
         if self.backend == "nvdec":
-            meta = self._decoder.get_stream_metadata()
+            meta = None
+            try:
+                meta = self._decoder.get_scanned_stream_metadata()
+            except Exception:
+                meta = self._decoder.get_stream_metadata()
             self.metadata = VideoMetadata(
                 width=int(getattr(meta, "width", 0) or 0),
                 height=int(getattr(meta, "height", 0) or 0),
@@ -171,7 +175,7 @@ class Decoder:
         nf_s = str(self.metadata.num_frames) if self.metadata.num_frames else "?"
         print(f"[Decoder] Initialized ({self.backend}): {self.metadata.width}x{self.metadata.height}, {nf_s} frames, {fps_s} fps")
         if self.backend == "nvdec":
-            print(f"[Decoder] Output: {self.output_format} on GPU {self.gpu_id}")
+            print(f"[Decoder] Output: {self.output_format} on GPU {self.gpu_id} (ThreadedDecoder, buffer={self._threaded_buffer_size()})")
         else:
             print(f"[Decoder] Output: {self.output_pix_fmt} on CPU (ffmpeg)")
 
@@ -327,6 +331,21 @@ class Decoder:
             self.close()
         except Exception:
             pass
+
+    def _threaded_buffer_size(self) -> int:
+        env = os.environ.get("GR_NVDEC_BUFFER_SIZE", "").strip()
+        if env:
+            try:
+                v = int(env)
+                if v > 0:
+                    return v
+            except Exception:
+                pass
+
+        # ThreadedDecoder buffer_size is a prefetch queue depth, not a consumer batch size.
+        # Keep it modest by default to avoid excessive GPU memory use on 4K streams while
+        # still giving the background decoder room to stay ahead of inference.
+        return max(8, min(max(self.batch_size, 16), 32))
 
     @staticmethod
     def _looks_like_nvdec_unsupported(e: Exception) -> bool:

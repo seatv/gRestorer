@@ -34,6 +34,7 @@ Thumbs.db
 *.ts
 *.log
 *.exe
+*.zip
 
 #Custom
 /gitShouldNotSee/

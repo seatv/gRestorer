@@ -15,8 +15,10 @@ from gRestorer.video.encoder import Encoder
 # Reuse the same zero-copy + colorspace helpers your pipeline uses.
 from gRestorer.cli.pipeline_utils import (
     wrap_surface_as_tensor,
-    rgb_to_bgr_u8_inplace,
-    pack_bgr_u8_to_bgra_u8_inplace,
+    rgbp_chw_to_rgb_hwc_u8,
+    rgb_hwc_to_bgr_hwc_u8,
+    bgr_u8_to_bgra_u8,
+    nv12_to_rgb_hwc_u8,
 )
 
 Box = Tuple[int, int, int, int]  # (t,l,b,r)
@@ -141,18 +143,30 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--gpu-id", type=int, default=0)
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--max-frames", type=int, default=None)
+    ap.add_argument("--trim-negative-pts", action="store_true", help="Trim leading negative-PTS preroll frames (disabled by default for 1:1 frame matching).")
 
     ap.add_argument("--roi", action="append", type=_parse_roi, default=[], help="ROI 't,l,b,r' (inclusive). Repeat 3x.")
     ap.add_argument("--block", type=int, default=None, help="Mosaic block size (default 16 or config synth_mosaic.block_size)")
 
-    # Encoder overrides (optional)
-    ap.add_argument("--codec", type=str, default=None)
-    ap.add_argument("--preset", type=str, default=None)
-    ap.add_argument("--profile", type=str, default=None)
-    ap.add_argument("--qp", type=int, default=None)
-    ap.add_argument("--container", type=str, default=None)
+    # Encoder overrides (optional). Keep old add_mosaic flags, but also expose
+    # the same richer encoder surface the main restoration path uses.
+    ap.add_argument("--codec", "--enc-codec", dest="codec", type=str, default=None)
+    ap.add_argument("--preset", "--enc-preset", dest="preset", type=str, default=None)
+    ap.add_argument("--profile", "--enc-profile", dest="profile", type=str, default=None)
+    ap.add_argument("--qp", "--enc-qp", dest="qp", type=int, default=None)
+    ap.add_argument("--container", "--enc-format", dest="container", type=str, default=None)
     ap.add_argument("--bframes", type=int, default=None)
     ap.add_argument("--ffmpeg-path", type=str, default=None)
+
+    ap.add_argument("--enc-mode", choices=["hq", "preview", "archive", "custom"], default=None, help="Encoder preset mode")
+    ap.add_argument("--enc-options", default=None, help='FFmpeg-style NVENC options string (e.g. "-rc constqp -qp 18 -spatial_aq 1")')
+    ap.add_argument("--enc-opt", action="append", default=None, help="NVENC option KEY=VALUE (repeatable)")
+    ap.add_argument("--enc-allow-unknown", action=argparse.BooleanOptionalAction, default=None, help="Allow passing unknown NVENC option keys (best-effort)")
+
+    ap.add_argument("--mux-audio", choices=["auto", "copy", "aac", "none"], default=None, help="Audio mux policy")
+    ap.add_argument("--mux-keep-subs", action=argparse.BooleanOptionalAction, default=None, help="Keep subtitles (mkv: copy; mp4: mov_text)")
+    ap.add_argument("--mux-extra-args", default=None, help="Extra ffmpeg mux args (no extra -i allowed)")
+    ap.add_argument("--mp4-fast-start", action=argparse.BooleanOptionalAction, default=None, help="Enable MP4 faststart / moov relocation")
 
     return ap.parse_args(argv)
 
@@ -214,8 +228,62 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     ffmpeg_path = args.ffmpeg_path or _cfg_get(cfg, ("encoder", "ffmpeg_path"), "ffmpeg")
 
-    decoder = Decoder(args.input, gpu_id=gpu_id, batch_size=batch_size)
+    enc_mode = args.enc_mode or _cfg_get(cfg, ("encoder", "mode"), "hq")
+    enc_options_str = args.enc_options
+    if enc_options_str is None:
+        enc_options_str = _cfg_get(cfg, ("encoder", "options"), "")
+        if not enc_options_str:
+            enc_options_str = _cfg_get(cfg, ("encoder", "options_str"), "")
+    enc_options_str = str(enc_options_str or "")
+
+    nvenc_allow_unknown = args.enc_allow_unknown
+    if nvenc_allow_unknown is None:
+        nvenc_allow_unknown = bool(_cfg_get(cfg, ("encoder", "allow_unknown"), False))
+
+    mux_audio = args.mux_audio
+    if mux_audio is None:
+        mux_audio = str(_cfg_get(cfg, ("encoder", "mux_audio"), "auto") or "auto").lower()
+
+    mux_keep_subs = args.mux_keep_subs
+    if mux_keep_subs is None:
+        mux_keep_subs = bool(_cfg_get(cfg, ("encoder", "mux_keep_subs"), False))
+
+    mux_extra_args = args.mux_extra_args
+    if mux_extra_args is None:
+        mux_extra_args = str(_cfg_get(cfg, ("encoder", "mux_extra_args"), "") or "")
+
+    mp4_faststart = args.mp4_fast_start
+    if mp4_faststart is None:
+        mp4_faststart = bool(_cfg_get(cfg, ("encoder", "mp4_faststart"), True))
+
+    nvenc_options: Dict[str, Any] = {"bf": str(bframes)}
+    opt_cfg = _cfg_get(cfg, ("encoder", "opt"), {})
+    if isinstance(opt_cfg, dict):
+        for k, v in opt_cfg.items():
+            if k is None:
+                continue
+            nvenc_options[str(k).strip()] = v
+    if args.enc_opt:
+        for item in args.enc_opt:
+            if "=" not in item:
+                raise SystemExit(f"--enc-opt expects KEY=VALUE, got: {item!r}")
+            k, v = item.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if not k:
+                raise SystemExit(f"--enc-opt invalid key in: {item!r}")
+            nvenc_options[k] = v
+
+    decoder = Decoder(
+        args.input,
+        gpu_id=gpu_id,
+        batch_size=batch_size,
+        trim_negative_pts=bool(args.trim_negative_pts),
+    )
     width, height, fps = _infer_video_props(decoder)
+
+    if getattr(decoder, "_trim_prefix", 0):
+        print(f"[add_mosaic] Decoder trimmed {decoder._trim_prefix} leading negative-PTS frames")
 
     encoder = Encoder(
         args.output,
@@ -227,9 +295,18 @@ def main(argv: Optional[List[str]] = None) -> None:
         profile=str(profile),
         qp=int(qp),
         gpu_id=gpu_id,
+        input_path=args.input,
         container=container,
-        bframes=bframes,
         ffmpeg_path=str(ffmpeg_path),
+        mode=str(enc_mode),
+        nvenc_options_str=enc_options_str,
+        nvenc_options=nvenc_options,
+        nvenc_allow_unknown=bool(nvenc_allow_unknown),
+        mux_audio=str(mux_audio),
+        mux_keep_subs=bool(mux_keep_subs),
+        mux_extra_args=str(mux_extra_args),
+        mp4_faststart=bool(mp4_faststart),
+        max_frames=args.max_frames,
     )
 
     frames_done = 0
@@ -244,19 +321,25 @@ def main(argv: Optional[List[str]] = None) -> None:
 
             bgra_batch: List[torch.Tensor] = []
             for s in surfaces:
-                rgb = wrap_surface_as_tensor(s)  # HWC RGB or CHW RGBP, uint8
+                if isinstance(s, torch.Tensor):
+                    # CPU fallback path from Decoder.read_batch(): usually NV12 [H*3/2,W], optionally RGB24 [H,W,3]
+                    if s.ndim == 2:
+                        rgb = nv12_to_rgb_hwc_u8(s, width=width, height=height)
+                    else:
+                        rgb = rgbp_chw_to_rgb_hwc_u8(s)
+                else:
+                    rgb = wrap_surface_as_tensor(s)  # HWC RGB or CHW RGBP, uint8
+                    rgb = rgbp_chw_to_rgb_hwc_u8(rgb)
 
                 # Convert -> BGR uint8 HWC
-                bgr = torch.empty((height, width, 3), device=rgb.device, dtype=torch.uint8)
-                rgb_to_bgr_u8_inplace(bgr, rgb)
+                bgr = rgb_hwc_to_bgr_hwc_u8(rgb)
 
                 # Mosaic all ROIs
                 for roi in rois:
                     pixelate_roi_bgr_u8_inplace(bgr, roi=roi, block=block)
 
                 # Pack -> BGRA uint8 HWC
-                bgra = torch.empty((height, width, 4), device=bgr.device, dtype=torch.uint8)
-                pack_bgr_u8_to_bgra_u8_inplace(bgra, bgr)
+                bgra = bgr_u8_to_bgra_u8(bgr)
 
                 bgra_batch.append(bgra)
                 frames_done += 1
@@ -267,7 +350,6 @@ def main(argv: Optional[List[str]] = None) -> None:
             encoder.encode_frames(bgra_batch)
 
     finally:
-        encoder.flush()
         encoder.close()
         decoder.close()
 

@@ -197,6 +197,24 @@ _KNOWN_KEYS = {
 }
 
 
+# Knobs that materially change stream structure / quality policy.
+# In strict mode we will not silently drop these to make CreateEncoder succeed.
+_STRICT_CRITICAL_KEYS = {
+    "codec",
+    "preset",
+    "profile",
+    "fps",
+    "gop",
+    "idrperiod",
+    "bf",
+    "bframes",
+    "rc",
+    "constqp",
+    "qp",
+    "tuning_info",
+}
+
+
 @dataclass
 class _ProbeInfo:
     avg_frame_rate: Optional[str] = None
@@ -321,6 +339,10 @@ class Encoder:
         * nvenc_options_str: ffmpeg-style "-rc constqp -qp 18 -spatial_aq 1 ..."
         * nvenc_options: dict of KEY->VALUE
       Both merge on top of mode defaults. Unsupported keys are dropped automatically.
+    - debug / safety knobs:
+        * strict_nvenc: fail if critical NVENC keys would need to be dropped
+        * keep_raw: preserve raw elementary stream after remux
+        * dump_effective_opts: print the option set that actually succeeded
     - remux controls: mux_audio, mux_keep_subs, mux_extra_args, mp4_faststart
     """
 
@@ -348,6 +370,9 @@ class Encoder:
         mux_extra_args: str = "",
         mp4_faststart: bool = True,
         max_frames: Optional[int] = None,
+        strict_nvenc: bool = False,
+        keep_raw: bool = False,
+        dump_effective_opts: bool = True,
     ) -> None:
         self.output_path = str(output_path)
         self.input_path = str(input_path) if input_path else None
@@ -373,6 +398,14 @@ class Encoder:
         self.mux_extra_args = str(mux_extra_args or "")
         self.mp4_faststart = bool(mp4_faststart)
         self.max_frames = int(max_frames) if max_frames is not None else None
+        self.strict_nvenc = bool(strict_nvenc)
+        self.keep_raw = bool(keep_raw)
+        self.dump_effective_opts = bool(dump_effective_opts)
+
+        self._requested_nvenc_opts: Dict[str, Any] = {}
+        self._effective_nvenc_opts: Dict[str, Any] = {}
+        self._effective_nvenc_stage: Optional[str] = None
+        self._effective_nvenc_note: Optional[str] = None
 
         self.container = container if container is not None else _infer_container(self.output_path)
 
@@ -396,16 +429,21 @@ class Encoder:
         fmt = "ARGB"  # expects BGRA bytes on little-endian
 
         enc_opts = self._build_nvenc_options()
+        self._requested_nvenc_opts = dict(enc_opts)
 
         print(f"[Encoder] Creating: {self.output_path}")
         print(f"[Encoder] Resolution: {self.width}x{self.height} @ {self.fps:.3f} fps")
         print(f"[Encoder] Codec: {self.codec}, Preset: {self.preset}, Profile: {self.profile}")
         print(f"[Encoder] Mode: {self.mode}  QP(default)={self.qp}")
+        print(
+            f"[Encoder] Strict NVENC: {'on' if self.strict_nvenc else 'off'}  "
+            f"Keep raw: {'yes' if self.keep_raw else 'no'}"
+        )
         if self.nvenc_options_str.strip():
             print(f"[Encoder] nvenc_options_str: {self.nvenc_options_str}")
         if self.nvenc_options:
             print(f"[Encoder] nvenc_options(dict): {self.nvenc_options}")
-        print(f"[Encoder] Final NVENC opts: {enc_opts}")
+        print(f"[Encoder] Requested NVENC opts: {enc_opts}")
         print(f"[Encoder] Format: ARGB (expects BGRA memory layout)")
         if self._needs_remux:
             print(f"[Encoder] Container: {self.container} (ffmpeg remux at close)")
@@ -416,6 +454,30 @@ class Encoder:
             print("[Encoder] Container: NONE (raw elementary bitstream)")
 
         self._encoder = self._create_encoder_with_fallback(self.width, self.height, fmt, enc_opts)
+        if self.dump_effective_opts and self._effective_nvenc_opts:
+            print(
+                f"[Encoder] Effective NVENC opts ({self._effective_nvenc_stage or 'unknown'}): "
+                f"{self._effective_nvenc_opts}"
+            )
+            req_keys = set(self._requested_nvenc_opts.keys())
+            eff_keys = set(self._effective_nvenc_opts.keys())
+            dropped = sorted(req_keys - eff_keys)
+            changed = sorted(
+                k for k in (req_keys & eff_keys)
+                if str(self._requested_nvenc_opts.get(k)) != str(self._effective_nvenc_opts.get(k))
+            )
+            if dropped:
+                print(f"[Encoder] Effective NVENC dropped keys: {dropped}")
+            if changed:
+                print(
+                    "[Encoder] Effective NVENC changed values: "
+                    + ", ".join(
+                        f"{k}={self._requested_nvenc_opts.get(k)!r}->{self._effective_nvenc_opts.get(k)!r}"
+                        for k in changed
+                    )
+                )
+            if self._effective_nvenc_note:
+                print(f"[Encoder] Effective NVENC note: {self._effective_nvenc_note}")
 
         # [CHANGE 4] PTS-derived timing (set by Pipeline before close())
         self._pts_fps: Optional[float] = None
@@ -542,8 +604,10 @@ class Encoder:
         Try CreateEncoder with:
           1) all opts
           2) if allow_unknown=False: filter to _KNOWN_KEYS and retry
-          3) iterative drop of optional knobs (lookahead/aq/bf/...)
+          3) iterative drop of optional knobs
           4) last-resort minimal opts (codec/preset/profile/fps)
+
+        In strict mode, critical knobs may not be silently dropped.
         """
         def try_create(o: Dict[str, Any]) -> Tuple[Optional[Any], Optional[Exception]]:
             try:
@@ -551,17 +615,36 @@ class Encoder:
             except Exception as e:
                 return None, e
 
-        # Pass 1: all
+        def record_success(stage: str, used: Dict[str, Any], note: Optional[str] = None) -> None:
+            self._effective_nvenc_stage = stage
+            self._effective_nvenc_opts = dict(used)
+            self._effective_nvenc_note = note
+
+        requested_critical = sorted(k for k in _STRICT_CRITICAL_KEYS if k in opts)
+
+        # Pass 1: all requested opts
         enc, err = try_create(opts)
         if enc is not None:
+            record_success("requested", opts)
             return enc
 
         # Pass 2: known filter (safer)
         if not self.nvenc_allow_unknown:
             filtered = {k: v for (k, v) in opts.items() if k in _KNOWN_KEYS}
+            removed = sorted(set(opts.keys()) - set(filtered.keys()))
+            removed_critical = sorted(k for k in removed if k in _STRICT_CRITICAL_KEYS)
+            if self.strict_nvenc and removed_critical:
+                raise RuntimeError(
+                    "CreateEncoder failed, and strict NVENC forbids dropping critical keys during known-filter "
+                    f"fallback: {removed_critical}. Initial error: {err}"
+                )
             enc2, err2 = try_create(filtered)
             if enc2 is not None:
-                print(f"[Encoder] WARN: dropped unknown opts; CreateEncoder succeeded. (prev err: {err})")
+                note = None
+                if removed:
+                    note = f"dropped unknown/unsupported keys: {removed}"
+                    print(f"[Encoder] WARN: dropped unknown opts; CreateEncoder succeeded. (prev err: {err})")
+                record_success("known-filtered", filtered, note=note)
                 return enc2
             err = err2 or err
             opts = filtered  # continue fallback with filtered set
@@ -588,15 +671,29 @@ class Encoder:
             "gop",
         ]
         o3 = dict(opts)
+        dropped_so_far: List[str] = []
         last = err
         for k in drop_order:
-            if k in o3:
-                o3.pop(k, None)
-                enc3, err3 = try_create(o3)
-                if enc3 is not None:
-                    print(f"[Encoder] WARN: CreateEncoder succeeded after dropping '{k}'.")
-                    return enc3
-                last = err3 or last
+            if k not in o3:
+                continue
+            if self.strict_nvenc and k in _STRICT_CRITICAL_KEYS:
+                raise RuntimeError(
+                    "CreateEncoder failed, and strict NVENC forbids dropping critical keys. "
+                    f"Needed to drop '{k}' to continue fallback. Requested critical keys: {requested_critical}. "
+                    f"Last error: {last}"
+                )
+            o3.pop(k, None)
+            dropped_so_far.append(k)
+            enc3, err3 = try_create(o3)
+            if enc3 is not None:
+                print(f"[Encoder] WARN: CreateEncoder succeeded after dropping '{k}'.")
+                record_success(
+                    "drop-fallback",
+                    o3,
+                    note=f"dropped fallback keys: {dropped_so_far}",
+                )
+                return enc3
+            last = err3 or last
 
         # Pass 4: minimal
         minimal = {
@@ -605,9 +702,22 @@ class Encoder:
             "profile": opts.get("profile", self.profile),
             "fps": opts.get("fps", f"{self.fps:g}"),
         }
+        if self.strict_nvenc:
+            missing_critical = sorted(k for k in requested_critical if k not in minimal)
+            if missing_critical:
+                raise RuntimeError(
+                    "CreateEncoder failed, and strict NVENC forbids falling back to a minimal config that drops "
+                    f"critical keys: {missing_critical}. Last error: {last}"
+                )
+
         enc4, err4 = try_create(minimal)
         if enc4 is not None:
             print(f"[Encoder] WARN: CreateEncoder succeeded with minimal opts. (prev err: {last})")
+            record_success(
+                "minimal",
+                minimal,
+                note="fell back to minimal opts",
+            )
             return enc4
 
         raise RuntimeError(f"CreateEncoder failed. Last error: {err4 or last}")
@@ -837,11 +947,14 @@ class Encoder:
             else:
                 return
 
-        # Delete raw bitstream on success
-        try:
-            raw_path.unlink()
-        except OSError:
-            pass
+        # Delete raw bitstream on success unless explicitly requested otherwise.
+        if self.keep_raw:
+            print(f"[Encoder] Keeping raw bitstream: {raw_path}")
+        else:
+            try:
+                raw_path.unlink()
+            except OSError:
+                pass
 
     # -------------------------
     # Close
