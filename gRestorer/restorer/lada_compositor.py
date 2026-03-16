@@ -33,6 +33,8 @@ def _resize_mask_u8(mask_u8: torch.Tensor, shape_hw: Tuple[int, int]) -> torch.T
     return cv2.resize(mask_u8, (shape_hw[1], shape_hw[0]), interpolation=cv2.INTER_NEAREST)
 
 
+
+
 def _blend_into_frame_lada(
     *,
     frame_bgr_u8: torch.Tensor,
@@ -130,6 +132,5 @@ def composite_lada_clip_into_store(
             model_dtype=model_dtype,
             border_ratio=border_ratio,
         )
-
 
 __all__ = ["composite_lada_clip_into_store"]

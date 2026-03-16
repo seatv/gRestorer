@@ -158,7 +158,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--bframes", type=int, default=None)
     ap.add_argument("--ffmpeg-path", type=str, default=None)
 
-    ap.add_argument("--enc-mode", choices=["hq", "preview", "archive", "custom"], default=None, help="Encoder preset mode")
+    ap.add_argument("--enc-mode", choices=["default", "hq", "preview", "archive", "analysis", "custom"], default=None, help="Encoder preset mode")
     ap.add_argument("--enc-options", default=None, help='FFmpeg-style NVENC options string (e.g. "-rc constqp -qp 18 -spatial_aq 1")')
     ap.add_argument("--enc-opt", action="append", default=None, help="NVENC option KEY=VALUE (repeatable)")
     ap.add_argument("--enc-allow-unknown", action=argparse.BooleanOptionalAction, default=None, help="Allow passing unknown NVENC option keys (best-effort)")
@@ -243,6 +243,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     mux_audio = args.mux_audio
     if mux_audio is None:
         mux_audio = str(_cfg_get(cfg, ("encoder", "mux_audio"), "auto") or "auto").lower()
+    if str(enc_mode).lower() == "analysis" and mux_audio == "auto":
+        mux_audio = "none"
 
     mux_keep_subs = args.mux_keep_subs
     if mux_keep_subs is None:

@@ -102,7 +102,7 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--enc-sync-before-encode", action=argparse.BooleanOptionalAction, default=None)
 
     # --- Encoder advanced (NVENC knobs) ---
-    p.add_argument("--enc-mode", choices=["hq", "preview", "archive", "custom"], default=None, help="Encoder preset mode")
+    p.add_argument("--enc-mode", choices=["default", "hq", "preview", "archive", "analysis", "custom"], default=None, help="Encoder preset mode")
     p.add_argument("--enc-options", default=None, help="FFmpeg-style NVENC options string (e.g. \"-rc constqp -qp 18 -spatial_aq 1\")")
     p.add_argument("--enc-opt", action="append", default=None, help="NVENC option KEY=VALUE (repeatable)")
     p.add_argument("--enc-allow-unknown", action=argparse.BooleanOptionalAction, default=None, help="Allow passing unknown NVENC option keys (best-effort)")
@@ -131,6 +131,12 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--rest-border-ratio", type=float, default=None)
     p.add_argument("--rest-pad-mode", default=None)
     p.add_argument("--rest-feather-radius", type=int, default=None)
+    p.add_argument("--rest-compositor-quantize-before-resize", action=argparse.BooleanOptionalAction, default=None,
+                   help="Generic compositor: quantize restored patch to uint8 grid before resize/composite")
+    p.add_argument("--rest-compositor-resize-backend", choices=["torch", "image_utils"], default=None,
+                   help="Generic compositor resize path (torch=F.interpolate, image_utils=torchvision/cv2 path)")
+    p.add_argument("--analysis-use-synth-rois", action=argparse.BooleanOptionalAction, default=None,
+                   help="Analysis/tuning mode: use fixed synth_mosaic.rois for every frame instead of detector boxes")
 
     # [CHANGE 2] FrameStore backpressure
     p.add_argument("--store-max-frames", type=int, default=None,
@@ -285,6 +291,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("restoration", "border_ratio"), args.rest_border_ratio)
     _set_if_not_none(cfg, ("restoration", "pad_mode"), args.rest_pad_mode)
     _set_if_not_none(cfg, ("restoration", "feather_radius"), args.rest_feather_radius)
+    _set_if_not_none(cfg, ("restoration", "compositor_quantize_before_resize"), args.rest_compositor_quantize_before_resize)
+    _set_if_not_none(cfg, ("restoration", "compositor_resize_backend"), args.rest_compositor_resize_backend)
+    _set_if_not_none(cfg, ("restoration", "analysis_use_synth_rois"), args.analysis_use_synth_rois)
 
     # [CHANGE 2] FrameStore backpressure
     _set_if_not_none(cfg, ("store_max_frames",), args.store_max_frames)

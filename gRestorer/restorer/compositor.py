@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
+import cv2
 import torch
 import torch.nn.functional as F
 
@@ -49,12 +50,16 @@ def _feather_alpha(alpha_hw: torch.Tensor, radius: int = 3) -> torch.Tensor:
     return a.squeeze(0).squeeze(0).clamp(0.0, 1.0)
 
 
+
+
 def _composite_clip_into_store(
     *,
     clip: Clip,
     restored_frames: List[torch.Tensor],
     store_bgr_u8: Dict[int, torch.Tensor],
     feather_radius: int = 0,
+    quantize_before_resize: bool = False,
+    resize_backend: str = "torch",
 ) -> None:
     """Paste restored clip results back into buffered full frames (in-place)."""
     if len(restored_frames) != len(clip):
@@ -82,7 +87,15 @@ def _composite_clip_into_store(
         m_u = clip.masks[i]
         m_u = _unpad_hwc(m_u.unsqueeze(-1), pad).squeeze(-1)
 
+        # Optional experiment knobs kept for pipeline compatibility.
+        # For this debug drop-in we preserve the current generic numeric path,
+        # but accept the extra arguments so pipeline.py does not explode.
+        if quantize_before_resize:
+            frm_u = frm_u.mul(255.0).round().clamp(0.0, 255.0).div(255.0)
+
         # Resize to original crop size.
+        # image_utils backend is accepted for compatibility, but this debug drop-in
+        # still uses the generic float bilinear path for the restored patch.
         patch = _resize_hwc_float(frm_u, (crop_h, crop_w))
         mask_rs = _resize_hw_mask_u8(m_u, (crop_h, crop_w))
 
@@ -100,4 +113,5 @@ def _composite_clip_into_store(
         region_f = region_u8.to(dtype=torch.float32) / 255.0
         out_f = region_f * (1.0 - a3) + patch * a3
         region_u8.copy_(out_f.mul(255.0).round().clamp(0.0, 255.0).to(dtype=torch.uint8))
+
         #region_u8.copy_(out_f.mul(255.0).clamp(0.0, 255.0).to(dtype=torch.uint8))

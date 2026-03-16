@@ -374,6 +374,28 @@ class Pipeline:
         self.rest_pad_mode: str = str(self.cfg.get("restoration", "pad_mode", default="reflect"))
         self.feather_radius: int = int(self.cfg.get("restoration", "feather_radius", default=0))
 
+        # Generic compositor tuning knobs
+        self.rest_compositor_quantize_before_resize: bool = bool(
+            self.cfg.get("restoration", "compositor_quantize_before_resize", default=False)
+        )
+        self.rest_compositor_resize_backend: str = str(
+            self.cfg.get("restoration", "compositor_resize_backend", default="torch") or "torch"
+        ).lower()
+
+        # Fixed-box analysis mode (use synth_mosaic.rois instead of detector boxes)
+        self.analysis_use_synth_rois: bool = bool(
+            self.cfg.get("restoration", "analysis_use_synth_rois", default=False)
+        )
+        _raw_synth_rois = self.cfg.get("synth_mosaic", "rois", default=[]) or []
+        self.analysis_synth_rois: List[Tuple[int, int, int, int]] = []
+        try:
+            for _roi in _raw_synth_rois:
+                if isinstance(_roi, (list, tuple)) and len(_roi) == 4:
+                    t, l, b, r = [int(v) for v in _roi]
+                    self.analysis_synth_rois.append((t, l, b, r))
+        except Exception:
+            self.analysis_synth_rois = []
+
         # [CHANGE 2] FrameStore backpressure
         # 0 = auto-compute from resolution + max_clip_length;  -1 = unlimited
         self.store_max_frames: int = int(self.cfg.get("store_max_frames", default=0))
@@ -476,12 +498,16 @@ class Pipeline:
             batch_size=self.batch_size,
             output_format=self.dec_output_format,
             ffmpeg_input_args=self.dec_ffmpeg_input_args,
+            trim_negative_pts=False,
         )
 
         w = int(decoder.metadata.width)
         h = int(decoder.metadata.height)
         fps = float(decoder.metadata.fps or 0.0) or 0.0
         total_frames = int(decoder.metadata.num_frames or 0)
+
+        if self.analysis_use_synth_rois:
+            print(f"[Analysis] Fixed synth ROIs enabled: {len(self.analysis_synth_rois)} boxes/frame")
 
         if self.sbs_enabled:
             if w < 2 or w % 2 != 0:
@@ -511,7 +537,7 @@ class Pipeline:
             max_frames=self.max_frames,
         )
 
-        detector = self._build_detector()
+        detector = None if self.analysis_use_synth_rois else self._build_detector()
         restorer = self._build_restorer()
         use_lada_restoration = isinstance(restorer, LadaBasicVSRPPClipRestorer)
 
@@ -652,7 +678,9 @@ class Pipeline:
             # Detect (optional)
             # -----------------------------
             detections: List[Detection] = []
-            if detector is not None:
+            if self.analysis_use_synth_rois:
+                detections = [Detection(boxes=None, scores=None, classes=None, masks=None) for _ in batch_rgb]
+            elif detector is not None:
                 if self.sbs_enabled and self.sbs_det_split:
                     left_frames: List[torch.Tensor] = []
                     right_frames: List[torch.Tensor] = []
@@ -737,15 +765,19 @@ class Pipeline:
 
                 det = detections[i] if i < len(detections) else Detection(boxes=None, scores=None, classes=None, masks=None)
 
-                boxes = _tensor_boxes_to_list_xyxy(det.boxes, w=w, h=h)
-                masks_list = _extract_masks_list(det) if (self.use_seg_masks and det.masks is not None) else None
+                if self.analysis_use_synth_rois and self.analysis_synth_rois:
+                    boxes = [clip_box_to_bounds(bx, w=w, h=h) for bx in self.analysis_synth_rois]
+                    masks_list = None
+                else:
+                    boxes = _tensor_boxes_to_list_xyxy(det.boxes, w=w, h=h)
+                    masks_list = _extract_masks_list(det) if (self.use_seg_masks and det.masks is not None) else None
 
-                if self.roi_dilate > 0 and boxes:
-                    dil = self.roi_dilate
-                    boxes = [(t - dil, l - dil, b + dil, r + dil) for (t, l, b, r) in boxes]
+                    if self.roi_dilate > 0 and boxes:
+                        dil = self.roi_dilate
+                        boxes = [(t - dil, l - dil, b + dil, r + dil) for (t, l, b, r) in boxes]
 
-                if boxes:
-                    boxes = [clip_box_to_bounds(bx, w=w, h=h) for bx in boxes]
+                    if boxes:
+                        boxes = [clip_box_to_bounds(bx, w=w, h=h) for bx in boxes]
 
                 if self.sbs_enabled and boxes:
                     seam_x = w // 2
@@ -781,6 +813,8 @@ class Pipeline:
                                 restored_frames=restored,
                                 store_bgr_u8=store.frames_bgr_u8,
                                 feather_radius=int(self.feather_radius),
+                                quantize_before_resize=bool(self.rest_compositor_quantize_before_resize),
+                                resize_backend=str(self.rest_compositor_resize_backend),
                             )
 
                         metrics.t_restore += (time.perf_counter() - t0)
