@@ -87,6 +87,42 @@ def _normalize_preset(p: str) -> str:
     return s.upper()
 
 
+def _fps_to_rate_str(v: Any) -> str:
+    """Preserve an exact-ish fps rational for ffmpeg/NVENC surfaces.
+
+    Accepts Fraction, exact rational strings like ``30000/1001``, ints, or floats.
+    Floats are converted back to a limited denominator rational rather than being
+    stringified loosely (for example ``29.97002997`` -> ``30000/1001``).
+    """
+    if isinstance(v, Fraction):
+        if v.denominator == 1:
+            return str(v.numerator)
+        return f"{v.numerator}/{v.denominator}"
+
+    s = str(v).strip()
+    if not s:
+        raise ValueError(f"Invalid fps: {v!r}")
+
+    if "/" in s:
+        try:
+            num, den = s.split("/", 1)
+            frac = Fraction(int(num.strip()), int(den.strip()))
+            if frac.denominator == 1:
+                return str(frac.numerator)
+            return f"{frac.numerator}/{frac.denominator}"
+        except Exception:
+            pass
+
+    try:
+        frac = Fraction(s).limit_denominator(100000)
+    except Exception:
+        frac = Fraction(float(v)).limit_denominator(100000)
+
+    if frac.denominator == 1:
+        return str(frac.numerator)
+    return f"{frac.numerator}/{frac.denominator}"
+
+
 def _as_int(v: Any) -> Optional[int]:
     try:
         if v is None:
@@ -216,7 +252,13 @@ def _ffprobe_json(path: Path, ffprobe_bin: str) -> dict:
         "-of", "json",
         str(path),
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     if r.returncode != 0:
         raise RuntimeError(f"ffprobe failed:\n{r.stderr}")
     return json.loads(r.stdout or "{}")
@@ -354,6 +396,7 @@ class Encoder:
         self.width = int(width)
         self.height = int(height)
         self.fps = float(fps)
+        self.fps_rate_str = _fps_to_rate_str(fps)
         self.codec = str(codec).lower()
         self.preset = _normalize_preset(preset)
         self.profile = str(profile)
@@ -446,7 +489,7 @@ class Encoder:
             return {
                 "preset": _normalize_preset(self.preset or "P3"),
                 "profile": self.profile,
-                "fps": f"{self.fps:g}",
+                "fps": self.fps_rate_str,
                 "gop": str(gop_frames),
                 "idrperiod": str(gop_frames),
                 "rc": "constqp",
@@ -460,7 +503,7 @@ class Encoder:
             return {
                 "preset": _normalize_preset(self.preset or "P7"),
                 "profile": self.profile,
-                "fps": f"{self.fps:g}",
+                "fps": self.fps_rate_str,
                 "gop": str(gop_frames),
                 "idrperiod": str(gop_frames),
                 "rc": "constqp",
@@ -475,7 +518,7 @@ class Encoder:
         return {
             "preset": _normalize_preset(self.preset or "P7"),
             "profile": self.profile,
-            "fps": f"{self.fps:g}",
+            "fps": self.fps_rate_str,
             "gop": str(gop_frames),
             "idrperiod": str(gop_frames),
             "rc": "constqp",
@@ -508,7 +551,7 @@ class Encoder:
         out["codec"] = self.codec
         out["preset"] = _normalize_preset(str(out.get("preset", self.preset)))
         out["profile"] = str(out.get("profile", self.profile))
-        out["fps"] = f"{self.fps:g}"
+        out["fps"] = self.fps_rate_str
         out["rc"] = "constqp"
         out["constqp"] = str(_as_int(out.get("constqp")) or self.qp)
         out["bf"] = "0"
@@ -529,7 +572,7 @@ class Encoder:
             "codec": self.codec,
             "preset": _normalize_preset(self.preset),
             "profile": self.profile,
-            "fps": f"{self.fps:g}",
+            "fps": self.fps_rate_str,
         }
 
         # Merge mode defaults
@@ -655,7 +698,7 @@ class Encoder:
             "codec": opts.get("codec", self.codec),
             "preset": opts.get("preset", self.preset),
             "profile": opts.get("profile", self.profile),
-            "fps": opts.get("fps", f"{self.fps:g}"),
+            "fps": opts.get("fps", self.fps_rate_str),
         }
         enc4, err4 = try_create(minimal)
         if enc4 is not None:
@@ -722,19 +765,20 @@ class Encoder:
         have_source = bool(input_video and input_video.exists())
         src_pi = _probe_info(input_video, self.ffprobe_path) if have_source else _ProbeInfo()
 
-        # [CHANGE 4] Prefer PTS-derived fps when available for more accurate remux
-        if self._pts_fps is not None and self._pts_fps > 0:
-            fps_r = f"{self._pts_fps:g}"
-            if have_source and src_pi.avg_frame_rate:
-                # Log difference between PTS-derived and metadata fps
+        # Prefer an exact rational from the source when available.
+        # Falling back to floatified fps values here can materially skew long outputs
+        # (for example 30000/1001 becoming 29), which in turn causes A/V drift.
+        if have_source and src_pi.avg_frame_rate and src_pi.avg_frame_rate not in ("0/0", "0"):
+            fps_r = src_pi.avg_frame_rate
+            if self._pts_fps is not None and self._pts_fps > 0:
                 meta_fps = _rate_to_float(src_pi.avg_frame_rate) or self.fps
                 if abs(self._pts_fps - meta_fps) / max(meta_fps, 0.001) > 0.002:
-                    print(f"[Encoder] Using PTS-derived fps={self._pts_fps:.4f} "
-                          f"(metadata={meta_fps:.4f})")
+                    print(f"[Encoder] Keeping source fps rational {src_pi.avg_frame_rate} "
+                          f"(PTS-derived={self._pts_fps:.4f})")
+        elif self._pts_fps is not None and self._pts_fps > 0:
+            fps_r = _fps_to_rate_str(self._pts_fps)
         else:
-            fps_r = f"{self.fps:g}"
-            if have_source and src_pi.avg_frame_rate:
-                fps_r = src_pi.avg_frame_rate
+            fps_r = self.fps_rate_str
 
         # Truncation / duration trimming:
         # If output is partial (max_frames or early abort), trim mux to frames_encoded/fps.
@@ -888,13 +932,13 @@ class Encoder:
                     return
             else:
                 return
-
+        """
         # Delete raw bitstream on success
         try:
             raw_path.unlink()
         except OSError:
             pass
-
+        """
     # -------------------------
     # Close
     # -------------------------

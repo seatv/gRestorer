@@ -86,7 +86,13 @@ class Decoder:
         self._prefetch_pts: List[Optional[int]] = []
 
         # Init backend
+        skip_nvdec, skip_reason = self._should_skip_nvdec_preflight()
+
         if self._force_cpu:
+            self.backend = "ffmpeg-cpu"
+            self._init_ffmpeg_cpu_backend()
+        elif skip_nvdec:
+            print(f"[Decoder] Preflight: {skip_reason}; using ffmpeg CPU decode.")
             self.backend = "ffmpeg-cpu"
             self._init_ffmpeg_cpu_backend()
         else:
@@ -115,7 +121,6 @@ class Decoder:
                     self._init_ffmpeg_cpu_backend()
                 else:
                     raise
-
         # Extract metadata
         if self.backend == "nvdec":
             meta = None
@@ -539,3 +544,24 @@ class Decoder:
         if getattr(self, "ffmpeg_pix_fmt", "nv12") == "rgb24":
             return buf_t.view(h, w, 3)
         return buf_t.view(h * 3 // 2, w)
+
+    def _should_skip_nvdec_preflight(self) -> tuple[bool, str]:
+        """
+        Skip NVDEC entirely for stream classes we already know are unstable or
+        unsupported on this NVIDIA decode path.
+
+        Current evidence-backed rule:
+        - H.264/AVC with width>4096 or height>4096
+        """
+        pm = self._probe_meta
+        if pm is None:
+            return False, ""
+
+        codec = (pm.codec_name or "").strip().lower()
+        width = int(pm.width or 0)
+        height = int(pm.height or 0)
+
+        if codec in ("h264", "avc", "avc1") and (width > 4096 or height > 4096):
+            return True, f"H.264 {width}x{height} exceeds safe NVDEC path on this GPU/stack"
+
+        return False, ""
