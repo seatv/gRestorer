@@ -932,13 +932,12 @@ class Encoder:
                     return
             else:
                 return
-        """
         # Delete raw bitstream on success
         try:
             raw_path.unlink()
         except OSError:
             pass
-        """
+
     # -------------------------
     # Close
     # -------------------------
