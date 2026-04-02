@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
-import cv2
 import torch
 import torch.nn.functional as F
 
 from gRestorer.core.scene import Clip
-from gRestorer.utils.mask_utils import create_blend_mask
+from gRestorer.utils.mask_utils import create_blend_mask, create_support_blend_mask
 
 
 def _unpad_hwc(x: torch.Tensor, pad: Tuple[int, int, int, int]) -> torch.Tensor:
@@ -39,7 +38,7 @@ def _resize_hw_mask_u8(m: torch.Tensor, out_hw: Tuple[int, int]) -> torch.Tensor
 
 
 def _feather_alpha(alpha_hw: torch.Tensor, radius: int = 3) -> torch.Tensor:
-    """Cheap edge feathering: a few avg-pool passes."""
+    """Optional extra feathering pass for experimentation."""
     r = int(radius)
     if r <= 0:
         return alpha_hw
@@ -47,8 +46,26 @@ def _feather_alpha(alpha_hw: torch.Tensor, radius: int = 3) -> torch.Tensor:
     a = alpha_hw.unsqueeze(0).unsqueeze(0)
     k = 2 * r + 1
     a = F.avg_pool2d(a, kernel_size=k, stride=1, padding=r)
-    return a.squeeze(0).squeeze(0).clamp(0.0, 1.0)
+    a = a.squeeze(0).squeeze(0)
 
+    if bool((alpha_hw > 0).any()):
+        a = a * (alpha_hw > 0).to(dtype=a.dtype)
+        amax = a.max()
+        if float(amax) > 0.0:
+            a = a / amax
+
+    return a.clamp(0.0, 1.0)
+
+
+def _alpha_support_box(alpha_hw: torch.Tensor, eps: float = 1e-6) -> Optional[Tuple[int, int, int, int]]:
+    """Return (top, left, bottom, right) for the non-zero alpha support."""
+    nz = alpha_hw > float(eps)
+    if not bool(nz.any()):
+        return None
+
+    rows = torch.where(nz.any(dim=1))[0]
+    cols = torch.where(nz.any(dim=0))[0]
+    return int(rows[0]), int(cols[0]), int(rows[-1]), int(cols[-1])
 
 
 
@@ -61,7 +78,18 @@ def _composite_clip_into_store(
     quantize_before_resize: bool = False,
     resize_backend: str = "torch",
 ) -> None:
-    """Paste restored clip results back into buffered full frames (in-place)."""
+    """Paste restored clip results back into buffered full frames (in-place).
+
+    Mainline compositor only.
+
+    Changes versus the previous version:
+      - alpha is built from the *actual resized mask support*, not from a fixed
+        inner rectangle
+      - compositing is limited to the effective alpha support box instead of the
+        entire ROI rectangle
+      - legacy blend-mask logic is kept as a fallback if the support-driven mask
+        ends up empty
+    """
     if len(restored_frames) != len(clip):
         raise ValueError(f"restored_frames length ({len(restored_frames)}) != clip length ({len(clip)})")
 
@@ -70,14 +98,12 @@ def _composite_clip_into_store(
     for i, frame_num in enumerate(clip.frame_nums):
         full = store_bgr_u8.get(int(frame_num))
         if full is None:
-            # Shouldn't happen in the streaming design, but don't crash.
             continue
 
         crop_box = clip.crop_boxes[i]
         crop_h, crop_w = clip.crop_shapes[i]
         pad = clip.pad_after_resizes[i]
 
-        # Restored frame is float HWC in [0,1] with clip_size.
         frm = restored_frames[i]
         if frm.shape[0] != clip_size or frm.shape[1] != clip_size:
             raise ValueError(f"Restored frame must be {clip_size}x{clip_size}, got {tuple(frm.shape)}")
@@ -87,31 +113,50 @@ def _composite_clip_into_store(
         m_u = clip.masks[i]
         m_u = _unpad_hwc(m_u.unsqueeze(-1), pad).squeeze(-1)
 
-        # Optional experiment knobs kept for pipeline compatibility.
-        # For this debug drop-in we preserve the current generic numeric path,
-        # but accept the extra arguments so pipeline.py does not explode.
         if quantize_before_resize:
             frm_u = frm_u.mul(255.0).round().clamp(0.0, 255.0).div(255.0)
 
-        # Resize to original crop size.
-        # image_utils backend is accepted for compatibility, but this debug drop-in
-        # still uses the generic float bilinear path for the restored patch.
+        # Resize back to original crop size.
         patch = _resize_hwc_float(frm_u, (crop_h, crop_w))
         mask_rs = _resize_hw_mask_u8(m_u, (crop_h, crop_w))
 
-        # LADA-style blend mask to reduce visible paste-back boundaries.
-        # It creates a soft transition band near the crop edge while keeping the ROI interior strong.
-        alpha = create_blend_mask(mask_rs.to(dtype=torch.float32) / 255.0).clamp(0.0, 1.0)
-        # Optional extra feathering knob (usually keep 0 once blend mask is enabled).
+        # New mainline path: build alpha from the real resized mask support.
+        alpha = create_support_blend_mask(mask_rs)
+
+        # Fallback to the legacy alpha if support somehow disappears.
+        if not bool((alpha > 0).any()):
+            alpha = create_blend_mask(mask_rs.to(dtype=torch.float32) / 255.0).clamp(0.0, 1.0)
+
+        # Optional extra feathering knob for experiments.
         alpha = _feather_alpha(alpha, radius=feather_radius)
-        a3 = alpha.unsqueeze(-1)
+
+        support_box = _alpha_support_box(alpha)
+        if support_box is None:
+            continue
+
+        mt, ml, mb, mr = support_box
+        alpha_sub = alpha[mt:mb + 1, ml:mr + 1]
+        patch_sub = patch[mt:mb + 1, ml:mr + 1, :]
 
         t, l, b, r = crop_box
-        region_u8 = full[t : b + 1, l : r + 1, :]
+        rt = t + mt
+        rl = l + ml
+        rb = t + mb
+        rr = l + mr
 
-        # Blend in float on the (cropped) ROI, then write back to the uint8 buffer.
+        region_u8 = full[rt:rb + 1, rl:rr + 1, :]
+
+        # Safety guard for rare off-by-one shape mismatches.
+        if region_u8.shape[0] != patch_sub.shape[0] or region_u8.shape[1] != patch_sub.shape[1]:
+            hh = min(int(region_u8.shape[0]), int(patch_sub.shape[0]))
+            ww = min(int(region_u8.shape[1]), int(patch_sub.shape[1]))
+            if hh <= 0 or ww <= 0:
+                continue
+            region_u8 = region_u8[:hh, :ww, :]
+            patch_sub = patch_sub[:hh, :ww, :]
+            alpha_sub = alpha_sub[:hh, :ww]
+
+        a3 = alpha_sub.unsqueeze(-1)
         region_f = region_u8.to(dtype=torch.float32) / 255.0
-        out_f = region_f * (1.0 - a3) + patch * a3
+        out_f = region_f * (1.0 - a3) + patch_sub * a3
         region_u8.copy_(out_f.mul(255.0).round().clamp(0.0, 255.0).to(dtype=torch.uint8))
-
-        #region_u8.copy_(out_f.mul(255.0).clamp(0.0, 255.0).to(dtype=torch.uint8))
