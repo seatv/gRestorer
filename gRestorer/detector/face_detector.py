@@ -49,7 +49,7 @@ class FaceDetector:
         self.fp16 = bool(fp16)
 
         # ROI expansion factors
-        self.top_expand = 0.01
+        self.top_expand = 0.05
         self.bottom_expand = 0.10
         self.side_expand = 0.15
 

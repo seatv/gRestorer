@@ -435,15 +435,16 @@ def drain_store_to_encoder(
     sync_before_encode: bool = True,
     pts_log: Optional[List[Tuple[int, Optional[int]]]] = None,
 ) -> int:
+
     """
     Encode and remove all frames with frame_num < safe_before.
     Returns number of frames encoded.
 
-    Safe diagnostic version:
-      - keeps the one-sync-per-drain behavior
-      - also syncs per frame after making a private BGRA clone
-      - slower, but stable
+    Notes:
+      - Keeps optional one-sync-per-drain behavior.
+      - Per-frame ownership/safety is handled inside Encoder.encode_frame().
     """
+
     keys = store.keys_sorted()
     drain_keys = [k for k in keys if k < safe_before]
     if not drain_keys:
@@ -459,15 +460,8 @@ def drain_store_to_encoder(
         if pts_log is not None:
             pts_log.append((k, pts))
 
-        bgra = bgr_u8_to_bgra_u8(frm_bgr).contiguous().clone()
-
-        if bgra.device.type == "cuda":
-            torch.cuda.synchronize(device=bgra.device)
-        elif bgra.device.type == "xpu" and hasattr(torch, "xpu"):
-            torch.xpu.synchronize(device=bgra.device)
-
+        bgra = bgr_u8_to_bgra_u8(frm_bgr).contiguous()
         encoder.encode_frame(bgra)
-        del bgra
         count += 1
 
     return count

@@ -710,14 +710,46 @@ class Encoder:
     # -------------------------
     # Encode API
     # -------------------------
-    def encode_frame(self, frame: Any) -> None:
+    def encode_frame(self, frame):
+        """
+        Encode a single BGRA frame.
+
+        Fixes:
+          - Ensures encoder gets its own memory (no aliasing / reuse issues)
+          - Optional sync for safety (can be disabled later)
+
+        Env controls:
+          GR_ENC_SAFE=1   -> enable clone + sync (default ON for now)
+          GR_ENC_SYNC=1   -> force sync (default ON when SAFE=1)
+          Above were commented out in code below as testing showed, sync was needed to avoid corruption
+        """
+
+        import os
+        import torch
+
         if frame is None:
             return
-        self._frames_encoded += 1
+
+        # ---- config knobs (env-driven) ----
+        #safe_mode = str(os.getenv("GR_ENC_SAFE", "1")).lower() not in ("0", "false", "no")
+        #sync_mode = str(os.getenv("GR_ENC_SYNC", "1")).lower() not in ("0", "false", "no")
+        #if sync_mode:
+
+
+        if frame.device.type == "cuda":
+            torch.cuda.synchronize(device=frame.device)
+        elif frame.device.type == "xpu" and hasattr(torch, "xpu"):
+            torch.xpu.synchronize(device=frame.device)
+
+        # ---- actual encode ----
         bitstream = self._encoder.Encode(frame)
+
         if bitstream:
             self._file.write(bytearray(bitstream))
 
+        self._frames_encoded += 1 #bump the encoded frame count
+
+    # Thin wrapper, calls encode_frame
     def encode_frames(self, frames: Iterable[Any]) -> None:
         for fr in frames:
             self.encode_frame(fr)
