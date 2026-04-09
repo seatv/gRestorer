@@ -10,6 +10,8 @@ from __future__ import annotations
 import contextlib
 import os
 import time
+from pathlib import Path
+import cv2
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -340,6 +342,90 @@ class FrameStore:
     # -------------------------------------------------------------------
 
 
+_DEBUG_FRAME_SET: Optional[set[int]] = None
+_DEBUG_DUMP_DIR: Optional[Path] = None
+_DEBUG_ENABLED: Optional[bool] = None
+
+
+def _get_debug_frames() -> set[int]:
+    global _DEBUG_FRAME_SET
+    if _DEBUG_FRAME_SET is not None:
+        return _DEBUG_FRAME_SET
+
+    raw = str(os.getenv("GR_CORRUPT_DUMP_FRAMES", "") or "").strip()
+    out: set[int] = set()
+    if raw:
+        for part in raw.replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                out.add(int(part))
+            except Exception:
+                pass
+
+    _DEBUG_FRAME_SET = out
+    return out
+
+
+def _get_debug_dump_dir() -> Optional[Path]:
+    global _DEBUG_DUMP_DIR
+    if _DEBUG_DUMP_DIR is not None:
+        return _DEBUG_DUMP_DIR
+
+    raw = str(os.getenv("GR_CORRUPT_DUMP_DIR", "") or "").strip()
+    if not raw:
+        _DEBUG_DUMP_DIR = None
+        return None
+
+    p = Path(raw)
+    p.mkdir(parents=True, exist_ok=True)
+    _DEBUG_DUMP_DIR = p
+    return p
+
+
+def _debug_enabled() -> bool:
+    global _DEBUG_ENABLED
+    if _DEBUG_ENABLED is not None:
+        return _DEBUG_ENABLED
+
+    frames = _get_debug_frames()
+    dump_dir = _get_debug_dump_dir()
+    _DEBUG_ENABLED = bool(frames and dump_dir is not None)
+    return _DEBUG_ENABLED
+
+
+def _maybe_dump_preencode_frame(frame_num: int, frm_bgr: torch.Tensor, pts: Optional[int]) -> None:
+    if not _debug_enabled():
+        return
+    if int(frame_num) not in _get_debug_frames():
+        return
+
+    dump_dir = _get_debug_dump_dir()
+    if dump_dir is None:
+        return
+
+    x = frm_bgr.detach()
+    if x.device.type != "cpu":
+        x = x.cpu()
+    x = x.contiguous()
+    arr = x.numpy()
+
+    png_path = dump_dir / f"preencode_f{int(frame_num):06d}.png"
+    txt_path = dump_dir / f"preencode_f{int(frame_num):06d}.txt"
+
+    cv2.imwrite(str(png_path), arr)
+
+    checksum = int(arr.astype("uint64").sum() % (1 << 32))
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(f"frame_num={int(frame_num)}\n")
+        f.write(f"pts={pts}\n")
+        f.write(f"shape={tuple(arr.shape)}\n")
+        f.write(f"dtype={arr.dtype}\n")
+        f.write(f"device={frm_bgr.device}\n")
+        f.write(f"checksum32={checksum}\n")
+        f.write(f"min={int(arr.min())} max={int(arr.max())}\n")
+
 def drain_store_to_encoder(
     *,
     store: FrameStore,
@@ -347,34 +433,44 @@ def drain_store_to_encoder(
     encoder,
     device: torch.device,
     sync_before_encode: bool = True,
-    pts_log: Optional[List[Tuple[int, Optional[int]]]] = None,   # [CHANGE 4] collects (frame_num, pts) pairs
+    pts_log: Optional[List[Tuple[int, Optional[int]]]] = None,
 ) -> int:
     """
     Encode and remove all frames with frame_num < safe_before.
     Returns number of frames encoded.
 
-    [CHANGE 4] If pts_log is provided, appends (frame_num, pts) for every
-    drained frame so the caller can write a timecodes file at close.
+    Safe diagnostic version:
+      - keeps the one-sync-per-drain behavior
+      - also syncs per frame after making a private BGRA clone
+      - slower, but stable
     """
     keys = store.keys_sorted()
     drain_keys = [k for k in keys if k < safe_before]
     if not drain_keys:
         return 0
 
-    # IMPORTANT: sync once per drain, not per-frame.
-    # This reduces CPU-side stalls and improves overlap between GPU compute and encode.
     if sync_before_encode:
         sync_device(device)
 
     count = 0
     for k in drain_keys:
-        frm_bgr, pts = store.pop_with_pts(k)         # [CHANGE 4] use pop_with_pts
-        if pts_log is not None:                       # [CHANGE 4]
+        frm_bgr, pts = store.pop_with_pts(k)
+        _maybe_dump_preencode_frame(k, frm_bgr, pts)
+        if pts_log is not None:
             pts_log.append((k, pts))
-        encoder.encode_frame(bgr_u8_to_bgra_u8(frm_bgr))
-        count += 1
-    return count
 
+        bgra = bgr_u8_to_bgra_u8(frm_bgr).contiguous().clone()
+
+        if bgra.device.type == "cuda":
+            torch.cuda.synchronize(device=bgra.device)
+        elif bgra.device.type == "xpu" and hasattr(torch, "xpu"):
+            torch.xpu.synchronize(device=bgra.device)
+
+        encoder.encode_frame(bgra)
+        del bgra
+        count += 1
+
+    return count
 
 # ---------------------------------------------------------------------------
 # [CHANGE 4] Timecodes v2 file writer

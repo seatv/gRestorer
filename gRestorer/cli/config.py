@@ -67,7 +67,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--restorer",
-        choices=["basicvsrpp", "lada", "pseudo", "none"],
+        choices=["basicvsrpp", "lada", "pseudo", "none", "face_swap"],
         default=None,
         help="Restorer backend (default: basicvsrpp)",
     )
@@ -113,8 +113,7 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--mux-extra-args", default=None, help="Extra ffmpeg args appended to remux step (must not include -i)")
     p.add_argument("--mp4-fast-start", action=argparse.BooleanOptionalAction, default=None, help="MP4 faststart (+faststart)")
 
-    # --- Detection ---
-    p.add_argument("--det-type", default=None, choices=["yolo", "lada-yolo"])
+    p.add_argument("--det-type", default=None, choices=["yolo", "lada-yolo", "face"])
     p.add_argument("--det-model", default=None)
     p.add_argument("--det-batch-size", type=int, default=None)
     p.add_argument("--det-conf", type=float, default=None)
@@ -131,6 +130,12 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--rest-border-ratio", type=float, default=None)
     p.add_argument("--rest-pad-mode", default=None)
     p.add_argument("--rest-feather-radius", type=int, default=None)
+    p.add_argument("--rest-blendmask", choices=["none", "facefusion"], default=None,
+                   help="Mainline compositor blendmask mode (default: none)")
+    p.add_argument("--source-face", default=None, help="Source/reference face image for face_swap restorer")
+    p.add_argument("--swap-model", default=None, help="ONNX face swap model path (e.g. inswapper_128.fp16.onnx)")
+    p.add_argument("--swap-input-size", type=int, default=None, help="Swap model input size (default: 128)")
+    p.add_argument("--swap-provider", choices=["auto", "cuda", "cpu"], default=None, help="Inference provider for face_swap restorer")
     p.add_argument("--rest-compositor-quantize-before-resize", action=argparse.BooleanOptionalAction, default=None,
                    help="Generic compositor: quantize restored patch to uint8 grid before resize/composite")
     p.add_argument("--rest-compositor-resize-backend", choices=["torch", "image_utils"], default=None,
@@ -218,6 +223,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         cfg.set("mode", value="real")
     if cfg.get("restorer", default=None) is None:
         cfg.set("restorer", value="basicvsrpp")
+    if cfg.get("restoration", "blendmask", default=None) is None:
+        cfg.set("restoration", "blendmask", value="none")
 
     # High-level overrides
     _set_if_not_none(cfg, ("mode",), args.mode)
@@ -291,6 +298,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("restoration", "border_ratio"), args.rest_border_ratio)
     _set_if_not_none(cfg, ("restoration", "pad_mode"), args.rest_pad_mode)
     _set_if_not_none(cfg, ("restoration", "feather_radius"), args.rest_feather_radius)
+    _set_if_not_none(cfg, ("restoration", "blendmask"), args.rest_blendmask)
+    _set_if_not_none(cfg, ("restoration", "source_face_path"), args.source_face)
+    _set_if_not_none(cfg, ("restoration", "swap_model_path"), args.swap_model)
+    _set_if_not_none(cfg, ("restoration", "swap_input_size"), args.swap_input_size)
+    _set_if_not_none(cfg, ("restoration", "swap_provider"), args.swap_provider)
     _set_if_not_none(cfg, ("restoration", "compositor_quantize_before_resize"), args.rest_compositor_quantize_before_resize)
     _set_if_not_none(cfg, ("restoration", "compositor_resize_backend"), args.rest_compositor_resize_backend)
     _set_if_not_none(cfg, ("restoration", "analysis_use_synth_rois"), args.analysis_use_synth_rois)
@@ -333,8 +345,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
 
     # Detector Switch (CLI overrides config/default)
     if args.det_type is not None:
-        cfg.set("detection", "dete_type", value=str(args.det_type))
-
+        cfg.set("detection", "det_type", value=str(args.det_type))
     # Runtime-only toggles
     if args.debug:
         cfg.set("debug_enabled", value=True)
@@ -364,5 +375,20 @@ def parse_args(argv: list[str] | None = None) -> Config:
         rest_path = Path(rest_s)
         if not rest_path.exists():
             raise FileNotFoundError(f"Restoration model not found: {rest_path}")
+
+    if mode == "real" and restorer == "face_swap":
+        source_face_s = str(cfg.get("restoration", "source_face_path", default="") or "").strip()
+        if not source_face_s:
+            raise FileNotFoundError("Source face path is empty (check config.json or --source-face)")
+        source_face_path = Path(source_face_s)
+        if not source_face_path.exists():
+            raise FileNotFoundError(f"Source face image not found: {source_face_path}")
+
+        swap_model_s = str(cfg.get("restoration", "swap_model_path", default="") or "").strip()
+        if not swap_model_s:
+            raise FileNotFoundError("Swap model path is empty (check config.json or --swap-model)")
+        swap_model_path = Path(swap_model_s)
+        if not swap_model_path.exists():
+            raise FileNotFoundError(f"Swap model not found: {swap_model_path}")
 
     return cfg

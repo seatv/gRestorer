@@ -2,10 +2,13 @@
 
 
 # NVIDIA Video Codec SDK bindings (NVDEC/NVENC)
-PyNvVideoCodec>=2.0.2
+PyNvVideoCodec=>2.1.0
 
 # Detection
 ultralytics==8.4.4
+
+# Face Detection
+insightface=>0.7.3
 
 # Image processing / visualization
 opencv-python>=4.12.0.88

@@ -5,6 +5,7 @@
 #   [CHANGE 2] FrameStore backpressure: store_max_frames config + is_full() check
 #   [CHANGE 4] PTS preservation: read_batch_with_pts, PTS in FrameStore,
 #              timecodes file generation, PTS-derived fps for remux
+#   [CHANGE 5] face detector backend + restorer blendmask mode plumbed through
 # --------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -21,9 +22,11 @@ from tqdm import tqdm
 
 from gRestorer.core.scene_tracker import SceneTracker, TrackerConfig
 from gRestorer.detector.core import Detection, Detector as YoloDetector
+from gRestorer.detector.face_detector import FaceDetector
 from gRestorer.restorer.basicvsrpp_clip_restorer import BasicVSRPPClipRestorer
 from gRestorer.restorer.compositor import _composite_clip_into_store
 from gRestorer.restorer.pseudo_clip_restorer import PseudoClipRestorer
+from gRestorer.restorer.face_swap_clip_restorer import FaceSwapClipRestorer
 
 from gRestorer.core.lada_clip import LadaClip
 from gRestorer.restorer.lada_basicvsrpp_clip_restorer import LadaBasicVSRPPClipRestorer
@@ -41,7 +44,7 @@ from .pipeline_utils import (
     clip_box_to_bounds,
     cfg_first,
     cfg_path,
-    compute_pts_fps,              # [CHANGE 4]
+    compute_pts_fps,
     drain_store_to_encoder,
     nv12_to_rgb_hwc_u8,
     rgb_hwc_to_bgr_hwc_u8,
@@ -52,7 +55,7 @@ from .pipeline_utils import (
     unsplit_boxes_layout,
     unsplit_masks_layout,
     wrap_surface_as_tensor,
-    write_timecodes_v2,           # [CHANGE 4]
+    write_timecodes_v2,
 )
 
 
@@ -87,69 +90,6 @@ class DetStats:
         return self.frames_with_det, self.frames_total, self.total_boxes, avg_area, pct
 
 
-# ---------------------------------------------------------------------------
-# [CHANGE 2+] Emergency FrameStore cap bump
-# ---------------------------------------------------------------------------
-def _compute_emergency_store_max(
-    width: int,
-    height: int,
-    max_clip_length: int,
-    current_max_frames: int,
-    device: torch.device,
-) -> int:
-    """Compute an emergency (temporary) max_frames cap when an active scene blocks draining.
-
-    The goal is to avoid runaway growth ("decode anyway") while still allowing long-running
-    active clips to make progress.
-
-    Strategy:
-      - target = max(current_max_frames, 4*max_clip_length + 64)
-      - apply a hard ceiling (default 600)
-      - on CUDA/XPU, also cap by a fraction of total device memory (best-effort)
-    """
-    base = int(current_max_frames)
-    if base <= 0:
-        return base
-
-    target = max(base, int(max_clip_length) * 4 + 64)
-
-    # Keep the same absolute guardrail as the default computation unless you
-    # explicitly set store_max_frames higher.
-    abs_cap = 600
-
-    frame_bytes = int(width) * int(height) * 3  # BGR u8
-    if frame_bytes <= 0:
-        return max(base, min(target, abs_cap))
-
-    cap_by_mem = abs_cap
-
-    if device.type == "cuda":
-        try:
-            total = int(torch.cuda.get_device_properties(device).total_memory)
-            # Let FrameStore use up to ~55% of total VRAM. Remaining VRAM is for
-            # model weights, activations, scratch, and NVENC surfaces.
-            budget = int(total * 0.55)
-            cap_by_mem = max(base, int(budget // frame_bytes))
-        except Exception:
-            cap_by_mem = abs_cap
-
-    elif device.type == "xpu" and hasattr(torch, "xpu"):
-        # Best-effort: torch.xpu.get_device_properties exists on some builds.
-        try:
-            getp = getattr(torch.xpu, "get_device_properties", None)  # type: ignore[attr-defined]
-            if getp is not None:
-                idx = getattr(device, "index", 0) or 0
-                props = getp(int(idx))
-                total = int(getattr(props, "total_memory", 0))
-                if total > 0:
-                    budget = int(total * 0.55)
-                    cap_by_mem = max(base, int(budget // frame_bytes))
-        except Exception:
-            cap_by_mem = abs_cap
-
-    ceiling = max(base, min(abs_cap, cap_by_mem if cap_by_mem > 0 else abs_cap))
-    return max(base, min(target, ceiling))
-
 
 @dataclass
 class PipelineMetrics:
@@ -183,7 +123,7 @@ class PipelineMetrics:
 def _pick_device(gpu_id: int) -> torch.device:
     if torch.cuda.is_available():
         return torch.device(f"cuda:{gpu_id}")
-    if hasattr(torch, "xpu") and getattr(torch.xpu, "is_available", lambda: False)():  # type: ignore[attr-defined]
+    if hasattr(torch, "xpu") and getattr(torch.xpu, "is_available", lambda: False)():
         return torch.device(f"xpu:{gpu_id}")
     return torch.device("cpu")
 
@@ -242,17 +182,11 @@ def _extract_masks_list(det: Detection) -> Optional[List[Optional[torch.Tensor]]
 # [CHANGE 2] Default FrameStore size computation
 # ---------------------------------------------------------------------------
 def _compute_default_store_max(width: int, height: int, max_clip_length: int) -> int:
-    """Compute a sensible default max_frames for the FrameStore.
-
-    Strategy: allow at least 2× max_clip_length frames so that the store can hold
-    the current clip's worth of frames plus one batch of new frames.
-    Cap at a VRAM budget of ~1.5 GB for the store (per-frame BGR u8).
-    """
-    frame_bytes = width * height * 3  # BGR u8
+    frame_bytes = width * height * 3
     if frame_bytes <= 0:
-        return 300  # fallback
+        return 300
 
-    vram_budget = 1.5 * 1024 * 1024 * 1024  # 1.5 GB
+    vram_budget = 1.5 * 1024 * 1024 * 1024
     budget_frames = int(vram_budget / frame_bytes)
 
     # At minimum, need 2x max_clip_length + some headroom for batching
@@ -365,14 +299,19 @@ class Pipeline:
 
         self.rest_model: str = cfg_path(self.cfg, ("restoration", "rest_model_path"), default="")
         self.rest_fp16: bool = bool(self.cfg.get("restoration", "fp16", default=True))
-
-        # [CHANGE 3] max_clip_length default: 9 -> 30
+        self.source_face_path: str = cfg_path(self.cfg, ("restoration", "source_face_path"), default="")
+        self.swap_model_path: str = cfg_path(self.cfg, ("restoration", "swap_model_path"), default="")
+        self.swap_input_size: int = int(self.cfg.get("restoration", "swap_input_size", default=128))
+        self.swap_provider: str = str(self.cfg.get("restoration", "swap_provider", default="auto") or "auto").lower()
         self.rest_max_clip_length: int = int(self.cfg.get("restoration", "max_clip_length", default=30))
 
         self.rest_clip_size: int = int(self.cfg.get("restoration", "clip_size", default=256))
         self.rest_border_ratio: float = float(self.cfg.get("restoration", "border_ratio", default=0.06))
         self.rest_pad_mode: str = str(self.cfg.get("restoration", "pad_mode", default="reflect"))
         self.feather_radius: int = int(self.cfg.get("restoration", "feather_radius", default=0))
+        self.rest_blendmask: str = str(self.cfg.get("restoration", "blendmask", default="none") or "none").lower()
+        if self.rest_blendmask not in ("none", "facefusion"):
+            raise ValueError(f"Invalid restoration.blendmask: {self.rest_blendmask!r}")
 
         # Generic compositor tuning knobs
         self.rest_compositor_quantize_before_resize: bool = bool(
@@ -421,34 +360,31 @@ class Pipeline:
         self.mux_extra_args: str = str(self.cfg.get("encoder", "mux_extra_args", default="") or "")
         self.mp4_faststart: bool = bool(self.cfg.get("encoder", "mp4_faststart", default=True))
 
-    def _build_detector(self) -> Optional[YoloDetector]:
+    def _build_detector(self):
         if self.mode == "none":
             return None
         if not self.det_model:
             raise FileNotFoundError("Detector model path is empty (check config.json or --det-model)")
 
-        det_type = str(self.cfg.get("detection", "dete_type", default="yolo") or "yolo").lower()
+        det_type = str(self.cfg.get("detection", "det_type", default="yolo") or "yolo").lower()
         print(f"[Detector] type={det_type}")
 
+        common = dict(
+            model_path=self.det_model,
+            device=self.device,
+            imgsz=self.det_imgsz,
+            conf_thres=self.det_conf,
+            iou_thres=self.det_iou,
+            fp16=self.det_fp16,
+        )
+
         if det_type == "yolo":
-            return YoloDetector(
-                model_path=self.det_model,
-                device=self.device,
-                imgsz=self.det_imgsz,
-                conf_thres=self.det_conf,
-                iou_thres=self.det_iou,
-                fp16=self.det_fp16,
-            )
+            return YoloDetector(**common)
         elif det_type in ("lada-yolo", "lada_yolo"):
             from gRestorer.detector.lada_yolo import LadaYoloDetector
-            return LadaYoloDetector(
-                model_path=self.det_model,
-                device=self.device,
-                imgsz=self.det_imgsz,
-                conf_thres=self.det_conf,
-                iou_thres=self.det_iou,
-                fp16=self.det_fp16,
-            )
+            return LadaYoloDetector(**common)
+        elif det_type == "face":
+            return FaceDetector(**common)
         else:
             raise ValueError(f"Unknown detector_type: {det_type}")
 
@@ -464,6 +400,19 @@ class Pipeline:
 
         if self.restorer_name in ("none", "noop"):
             return None
+
+        if self.restorer_name == "face_swap":
+            if not self.source_face_path:
+                raise FileNotFoundError("Source face path is empty (check config.json or --source-face)")
+            if not self.swap_model_path:
+                raise FileNotFoundError("Swap model path is empty (check config.json or --swap-model)")
+            return FaceSwapClipRestorer(
+                device=self.device,
+                source_face_path=self.source_face_path,
+                swap_model_path=self.swap_model_path,
+                swap_input_size=self.swap_input_size,
+                provider=self.swap_provider,
+            )
 
         if not self.rest_model:
             raise FileNotFoundError("Restoration model path is empty (check config.json or --rest-model)")
@@ -563,7 +512,7 @@ class Pipeline:
             computed_max = _compute_default_store_max(w, h, self.rest_max_clip_length)
             store = FrameStore(max_frames=computed_max)
         elif self.store_max_frames < 0:
-            store = FrameStore(max_frames=0)  # unlimited
+            store = FrameStore(max_frames=0)
         else:
             store = FrameStore(max_frames=self.store_max_frames)
 
@@ -701,21 +650,11 @@ class Pipeline:
                         masks_l = _extract_masks_list(dl) if self.use_seg_masks else None
                         masks_r = _extract_masks_list(dr) if self.use_seg_masks else None
 
-                        merged_boxes = unsplit_boxes_layout(
-                            boxes_l, boxes_r, half_w=half_w, layout=self.sbs_layout
-                        )
-                        merged_masks = unsplit_masks_layout(
-                            masks_l, masks_r, full_w=w, half_w=half_w, layout=self.sbs_layout
-                        )
+                        merged_boxes = unsplit_boxes_layout(boxes_l, boxes_r, half_w=half_w, layout=self.sbs_layout)
+                        merged_masks = unsplit_masks_layout(masks_l, masks_r, full_w=w, half_w=half_w, layout=self.sbs_layout)
 
                         det = Detection(
-                            boxes=torch.tensor(
-                                [[b[1], b[0], b[3], b[2]] for b in merged_boxes],
-                                dtype=torch.float32,
-                                device="cpu",
-                            )
-                            if merged_boxes
-                            else None,
+                            boxes=torch.tensor([[b[1], b[0], b[3], b[2]] for b in merged_boxes], dtype=torch.float32, device="cpu") if merged_boxes else None,
                             scores=None,
                             classes=None,
                             masks=None,
@@ -757,8 +696,7 @@ class Pipeline:
                 metrics.t_encode += (time.perf_counter() - t0)
                 return
 
-            safe_before_batch: int = frame_num  # will advance as we process frames
-
+            safe_before_batch: int = frame_num
             for i, bgr_u8 in enumerate(batch_bgr_u8):
                 if self.max_frames is not None and frame_num >= self.max_frames:
                     break
@@ -781,9 +719,7 @@ class Pipeline:
 
                 if self.sbs_enabled and boxes:
                     seam_x = w // 2
-                    boxes, masks_list = seam_split_boxes(
-                        boxes, seam_x=seam_x, full_w=w, full_h=h, masks=masks_list
-                    )
+                    boxes, masks_list = seam_split_boxes(boxes, seam_x=seam_x, full_w=w, full_h=h, masks=masks_list)
 
                 metrics.det_stats.add(boxes, w=w, h=h)
 
@@ -815,6 +751,7 @@ class Pipeline:
                                 feather_radius=int(self.feather_radius),
                                 quantize_before_resize=bool(self.rest_compositor_quantize_before_resize),
                                 resize_backend=str(self.rest_compositor_resize_backend),
+                                blendmask_mode=self.rest_blendmask,
                             )
 
                         metrics.t_restore += (time.perf_counter() - t0)
@@ -838,7 +775,7 @@ class Pipeline:
                 encoder=encoder,
                 device=self.device,
                 sync_before_encode=self.enc_sync_before_encode,
-                pts_log=pts_log,              # [CHANGE 4]
+                pts_log=pts_log,
             )
             metrics.t_encode += (time.perf_counter() - t0)
 
@@ -916,15 +853,9 @@ class Pipeline:
                                     store.max_frames = new_max
                                     try:
                                         mb = store.vram_mb()
-                                        print(
-                                            f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); "
-                                            f"raising max_frames {old_max}->{new_max} (~{mb:.0f} MB est in-use)"
-                                        )
+                                        print(f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); raising max_frames {old_max}->{new_max} (~{mb:.0f} MB est in-use)")
                                     except Exception:
-                                        print(
-                                            f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); "
-                                            f"raising max_frames {old_max}->{new_max}"
-                                        )
+                                        print(f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); raising max_frames {old_max}->{new_max}")
                                     continue
 
                         # Otherwise, block briefly and retry. This prevents "decode anyway" runaway.
@@ -979,15 +910,9 @@ class Pipeline:
                                     store.max_frames = new_max
                                     try:
                                         mb = store.vram_mb()
-                                        print(
-                                            f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); "
-                                            f"raising max_frames {old_max}->{new_max} (~{mb:.0f} MB est in-use)"
-                                        )
+                                        print(f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); raising max_frames {old_max}->{new_max} (~{mb:.0f} MB est in-use)")
                                     except Exception:
-                                        print(
-                                            f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); "
-                                            f"raising max_frames {old_max}->{new_max}"
-                                        )
+                                        print(f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); raising max_frames {old_max}->{new_max}")
                                     continue
 
                         # Otherwise, block briefly and retry. This prevents "decode anyway" runaway.
@@ -1037,6 +962,9 @@ class Pipeline:
                             restored_frames=restored,
                             store_bgr_u8=store.frames_bgr_u8,
                             feather_radius=int(self.feather_radius),
+                            quantize_before_resize=bool(self.rest_compositor_quantize_before_resize),
+                            resize_backend=str(self.rest_compositor_resize_backend),
+                            blendmask_mode=self.rest_blendmask,
                         )
 
             drain_store_to_encoder(
@@ -1045,7 +973,7 @@ class Pipeline:
                 encoder=encoder,
                 device=self.device,
                 sync_before_encode=self.enc_sync_before_encode,
-                pts_log=pts_log,              # [CHANGE 4]
+                pts_log=pts_log,
             )
 
             t_total_no_mux = time.perf_counter() - t0_all
@@ -1061,9 +989,7 @@ class Pipeline:
                 if abs(pts_fps - fps) / max(fps, 0.001) > 0.002:
                     print(f"[PTS] FPS mismatch: metadata={fps:.3f}  pts_derived={pts_fps:.3f}")
                 if is_vfr:
-                    print(f"[PTS] WARNING: Variable frame rate detected. Timecodes file written for accurate remux.")
-
-                # [CHANGE 4] Pass PTS-derived fps to encoder for more accurate remux
+                    print("[PTS] WARNING: Variable frame rate detected. Timecodes file written for accurate remux.")
                 encoder._pts_fps = pts_fps
                 encoder._pts_timecodes_path = tc_path
                 encoder._pts_is_vfr = is_vfr
