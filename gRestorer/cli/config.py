@@ -59,19 +59,8 @@ def create_parser() -> argparse.ArgumentParser:
 
     # Config + high-level mode
     p.add_argument("--config", default=None, help="Path to config.json (defaults to nearest config.json)")
-    p.add_argument(
-        "--mode",
-        choices=["real", "pseudo", "none"],
-        default=None,
-        help="real=restore, pseudo=overlay, none=passthrough",
-    )
-    p.add_argument(
-        "--restorer",
-        choices=["basicvsrpp", "lada", "pseudo", "none", "face_swap"],
-        default=None,
-        help="Restorer backend (default: basicvsrpp)",
-    )
-
+    p.add_argument("--mode", choices=["real", "pseudo", "none"], default=None, help="real=restore, pseudo=overlay, none=passthrough")
+    p.add_argument("--restorer", choices=["basicvsrpp", "lada", "pseudo", "none", "face_swap"], default=None, help="Restorer backend (default: basicvsrpp)")
     p.add_argument("--max-frames", type=int, default=None, help="Process at most N frames (debug)")
 
     # GPU selection (applies to decoder/encoder unless overridden)
@@ -80,14 +69,7 @@ def create_parser() -> argparse.ArgumentParser:
     # --- Root knobs ---
     p.add_argument("--roi-dilate", type=int, default=None, help="Dilate detected ROIs by N pixels")
     p.add_argument("--batch-size", type=int, default=None, help="Decode/processing batch size")
-    p.add_argument(
-        "--use-seg-masks",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Use segmentation masks when available",
-    )
-
-    # --- Decoder ---
+    p.add_argument("--use-seg-masks", action=argparse.BooleanOptionalAction, default=None, help="Use segmentation masks when available")
     p.add_argument("--dec-gpu-id", type=int, default=None)
     p.add_argument("--dec-output-format", choices=["RGB", "RGBP"], default=None)
     p.add_argument("--dec-ffmpeg-input-args", default=None, help="Extra ffmpeg input args for CPU decode fallback (inserted before -i; must not contain -i)")
@@ -103,16 +85,13 @@ def create_parser() -> argparse.ArgumentParser:
 
     # --- Encoder advanced (NVENC knobs) ---
     p.add_argument("--enc-mode", choices=["default", "hq", "preview", "archive", "analysis", "custom"], default=None, help="Encoder preset mode")
-    p.add_argument("--enc-options", default=None, help="FFmpeg-style NVENC options string (e.g. \"-rc constqp -qp 18 -spatial_aq 1\")")
+    p.add_argument("--enc-options", default=None, help="FFmpeg-style NVENC options string")
     p.add_argument("--enc-opt", action="append", default=None, help="NVENC option KEY=VALUE (repeatable)")
-    p.add_argument("--enc-allow-unknown", action=argparse.BooleanOptionalAction, default=None, help="Allow passing unknown NVENC option keys (best-effort)")
-
-    # --- Remux / muxing ---
-    p.add_argument("--mux-audio", choices=["auto", "copy", "aac", "none"], default=None, help="Audio mux policy")
-    p.add_argument("--mux-keep-subs", action=argparse.BooleanOptionalAction, default=None, help="Keep subtitles (mkv: copy; mp4: mov_text)")
-    p.add_argument("--mux-extra-args", default=None, help="Extra ffmpeg args appended to remux step (must not include -i)")
-    p.add_argument("--mp4-fast-start", action=argparse.BooleanOptionalAction, default=None, help="MP4 faststart (+faststart)")
-
+    p.add_argument("--enc-allow-unknown", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--mux-audio", choices=["auto", "copy", "aac", "none"], default=None)
+    p.add_argument("--mux-keep-subs", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--mux-extra-args", default=None)
+    p.add_argument("--mp4-fast-start", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--det-type", default=None, choices=["yolo", "lada-yolo", "face"])
     p.add_argument("--det-model", default=None)
     p.add_argument("--det-batch-size", type=int, default=None)
@@ -124,30 +103,22 @@ def create_parser() -> argparse.ArgumentParser:
     # --- Restoration ---
     p.add_argument("--rest-model", default=None)
     p.add_argument("--rest-fp16", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--rest-max-clip-length", type=int, default=None,
-                   help="Max frames per restoration clip (default: 30, higher=smoother but more VRAM)")
+    p.add_argument("--rest-max-clip-length", type=int, default=None)
     p.add_argument("--rest-clip-size", type=int, default=None)
     p.add_argument("--rest-border-ratio", type=float, default=None)
     p.add_argument("--rest-pad-mode", default=None)
     p.add_argument("--rest-feather-radius", type=int, default=None)
-    p.add_argument("--rest-blendmask", choices=["none", "facefusion"], default=None,
-                   help="Mainline compositor blendmask mode (default: none)")
+    p.add_argument("--rest-blendmask", choices=["none", "facefusion"], default=None)
     p.add_argument("--source-face", default=None, help="Source/reference face image for face_swap restorer")
-    p.add_argument("--swap-model", default=None, help="ONNX face swap model path (e.g. inswapper_128.fp16.onnx)")
-    p.add_argument("--swap-input-size", type=int, default=None, help="Swap model input size (default: 128)")
-    p.add_argument("--swap-provider", choices=["auto", "cuda", "cpu"], default=None, help="Inference provider for face_swap restorer")
-    p.add_argument("--rest-compositor-quantize-before-resize", action=argparse.BooleanOptionalAction, default=None,
-                   help="Generic compositor: quantize restored patch to uint8 grid before resize/composite")
-    p.add_argument("--rest-compositor-resize-backend", choices=["torch", "image_utils"], default=None,
-                   help="Generic compositor resize path (torch=F.interpolate, image_utils=torchvision/cv2 path)")
-    p.add_argument("--analysis-use-synth-rois", action=argparse.BooleanOptionalAction, default=None,
-                   help="Analysis/tuning mode: use fixed synth_mosaic.rois for every frame instead of detector boxes")
-
-    # [CHANGE 2] FrameStore backpressure
-    p.add_argument("--store-max-frames", type=int, default=None,
-                   help="Max frames in FrameStore (0=auto, -1=unlimited; controls VRAM backpressure)")
-
-    # --- Scene tracking (kept for config parity) ---
+    p.add_argument("--swap-model", default=None, help="ONNX face swap model path")
+    p.add_argument("--swap-input-size", type=int, default=None)
+    p.add_argument("--swap-provider", choices=["auto", "cuda", "cpu"], default=None)
+    p.add_argument("--face-enhancer-model", default=None, help="Optional ONNX face enhancer model path (GFPGAN-like single-input model)")
+    p.add_argument("--face-enhancer-blend", type=int, default=None, help="Optional face enhancer blend 0..100")
+    p.add_argument("--rest-compositor-quantize-before-resize", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--rest-compositor-resize-backend", choices=["torch", "image_utils"], default=None)
+    p.add_argument("--analysis-use-synth-rois", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--store-max-frames", type=int, default=None)
     p.add_argument("--trk-min-iou", type=float, default=None)
     p.add_argument("--trk-max-clip-frames", type=int, default=None)
     p.add_argument("--trk-min-clip-frames", type=int, default=None)
@@ -168,18 +139,13 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--debug-save-detection-frames", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--debug-save-detection-json", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--debug-output-dir", default=None)
-
-    # --- SBS ---
-    p.add_argument("--sbs", action="store_true", help="Enable side-by-side (SBS) handling")
-    p.add_argument("--no-sbs", action="store_true", help="Disable SBS handling")
-    p.add_argument("--sbs-layout", choices=["lr", "rl"], default=None, help="SBS layout: lr=left|right, rl=right|left")
-    p.add_argument("--sbs-det-split", action="store_true", help="Run detector per-half (better per-eye)")
-    p.add_argument("--no-sbs-det-split", action="store_true", help="Disable per-half detection")
-
-    # --- Runtime debug flags (not config.json leaf keys) ---
-    p.add_argument("--debug", action="store_true", help="Verbose debug logging")
-    p.add_argument("--profile-sync", action="store_true", help="torch synchronize() around timings")
-
+    p.add_argument("--sbs", action="store_true")
+    p.add_argument("--no-sbs", action="store_true")
+    p.add_argument("--sbs-layout", choices=["lr", "rl"], default=None)
+    p.add_argument("--sbs-det-split", action="store_true")
+    p.add_argument("--no-sbs-det-split", action="store_true")
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("--profile-sync", action="store_true")
     return p
 
 
@@ -199,13 +165,7 @@ def _load_config_json(path: Path) -> dict[str, Any]:
 def parse_args(argv: list[str] | None = None) -> Config:
     p = create_parser()
     args = p.parse_args(argv)
-
-    cfg_path: Optional[Path]
-    if args.config:
-        cfg_path = Path(args.config)
-    else:
-        cfg_path = _default_config_path()
-
+    cfg_path = Path(args.config) if args.config else _default_config_path()
     cfg = Config({})
 
     if cfg_path is not None:
@@ -303,6 +263,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("restoration", "swap_model_path"), args.swap_model)
     _set_if_not_none(cfg, ("restoration", "swap_input_size"), args.swap_input_size)
     _set_if_not_none(cfg, ("restoration", "swap_provider"), args.swap_provider)
+    _set_if_not_none(cfg, ("restoration", "face_enhancer_model_path"), args.face_enhancer_model)
+    _set_if_not_none(cfg, ("restoration", "face_enhancer_blend"), args.face_enhancer_blend)
     _set_if_not_none(cfg, ("restoration", "compositor_quantize_before_resize"), args.rest_compositor_quantize_before_resize)
     _set_if_not_none(cfg, ("restoration", "compositor_resize_backend"), args.rest_compositor_resize_backend)
     _set_if_not_none(cfg, ("restoration", "analysis_use_synth_rois"), args.analysis_use_synth_rois)
@@ -390,5 +352,12 @@ def parse_args(argv: list[str] | None = None) -> Config:
         swap_model_path = Path(swap_model_s)
         if not swap_model_path.exists():
             raise FileNotFoundError(f"Swap model not found: {swap_model_path}")
-
+        face_enhancer_s = str(cfg.get("restoration", "face_enhancer_model_path", default="") or "").strip()
+        if face_enhancer_s:
+            face_enhancer_path = Path(face_enhancer_s)
+            if not face_enhancer_path.exists():
+                raise FileNotFoundError(f"Face enhancer model not found: {face_enhancer_path}")
+        blend = int(cfg.get("restoration", "face_enhancer_blend", default=80))
+        if blend < 0 or blend > 100:
+            raise ValueError("restoration.face_enhancer_blend must be in 0..100")
     return cfg

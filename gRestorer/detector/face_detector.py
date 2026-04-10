@@ -6,7 +6,7 @@ from typing import List, Optional, Sequence
 import numpy as np
 import torch
 
-from gRestorer.detector.core import Detection
+from gRestorer.detector.core import Detection, FaceMetadata
 
 
 @dataclass
@@ -15,20 +15,20 @@ class _FaceDetections:
     scores: Optional[torch.Tensor]
     classes: Optional[torch.Tensor]
     masks: Optional[torch.Tensor]
+    face_metas: Optional[List[Optional[FaceMetadata]]]
 
 
 class FaceDetector:
     """
     InsightFace/SCRFD-based face detector wrapper for the gRestorer pipeline.
 
-    Notes:
-    - Uses insightface.model_zoo.get_model() directly with an ONNX SCRFD detector.
-    - Returns pipeline-compatible Detection objects.
-    - Does NOT produce masks yet.
-    - Applies asymmetric bbox expansion so the ROI is swap-safe:
-        * top    +15% of detected height
-        * bottom +30% of detected height
-        * sides  +20% of detected width on both left and right
+    Important geometry contract:
+      - Detection.boxes = expanded ROI boxes used by tracker/cropper
+      - FaceMetadata.bbox_xyxy = original tight face box from detector
+      - FaceMetadata.kps = original tight landmark coordinates from detector
+
+    The tracker follows the expanded ROI, but the swapper must receive the
+    tight face geometry.
     """
 
     def __init__(
@@ -48,7 +48,7 @@ class FaceDetector:
         self.classes = classes
         self.fp16 = bool(fp16)
 
-        # ROI expansion factors
+        # ROI expansion factors used only for tracker/crop boxes.
         self.top_expand = 0.05
         self.bottom_expand = 0.10
         self.side_expand = 0.15
@@ -63,9 +63,6 @@ class FaceDetector:
 
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
 
-        # InsightFace ctx_id:
-        #   >= 0 => CUDA device index
-        #   -1   => CPU
         if self.device.type == "cuda":
             ctx_id = 0 if self.device.index is None else int(self.device.index)
         else:
@@ -76,12 +73,6 @@ class FaceDetector:
 
     @staticmethod
     def _to_numpy_bgr_u8(frame: torch.Tensor) -> np.ndarray:
-        """
-        Convert pipeline frame tensor -> numpy BGR uint8 HWC for InsightFace.
-        Accepts:
-          - uint8 HWC [0,255]
-          - float16/float32 HWC [0,1] or [0,255]
-        """
         if not isinstance(frame, torch.Tensor):
             raise TypeError(f"Expected torch.Tensor, got {type(frame)!r}")
 
@@ -109,6 +100,7 @@ class FaceDetector:
             scores=torch.empty((0,), dtype=torch.float32),
             classes=torch.empty((0,), dtype=torch.int64),
             masks=None,
+            face_metas=[],
         )
 
     def _expand_and_clip_boxes(
@@ -118,14 +110,6 @@ class FaceDetector:
         frame_w: int,
         frame_h: int,
     ) -> np.ndarray:
-        """
-        Expand detected face boxes asymmetrically and clamp to frame bounds.
-
-        Expansion:
-          - top    +15% of face height
-          - bottom +30% of face height
-          - sides  +20% of face width
-        """
         if boxes_xyxy.size == 0:
             return boxes_xyxy
 
@@ -143,19 +127,38 @@ class FaceDetector:
         out[:, 2] = np.clip(out[:, 2] + dx, 0.0, max(0.0, float(frame_w - 1)))
         out[:, 3] = np.clip(out[:, 3] + dy_bottom, 0.0, max(0.0, float(frame_h - 1)))
 
-        # Ensure x2 >= x1 and y2 >= y1 after clipping
         out[:, 2] = np.maximum(out[:, 2], out[:, 0])
         out[:, 3] = np.maximum(out[:, 3], out[:, 1])
-
         return out
+
+    @staticmethod
+    def _build_face_metas(
+        tight_boxes_xyxy: np.ndarray,
+        scores_np: np.ndarray,
+        kpss: Optional[np.ndarray],
+    ) -> List[Optional[FaceMetadata]]:
+        metas: List[Optional[FaceMetadata]] = []
+        for i in range(tight_boxes_xyxy.shape[0]):
+            bbox = tight_boxes_xyxy[i]
+            kps_t: Optional[torch.Tensor] = None
+            if kpss is not None and i < len(kpss) and kpss[i] is not None:
+                kps_arr = np.asarray(kpss[i], dtype=np.float32)
+                if kps_arr.ndim == 2 and kps_arr.shape[-1] == 2:
+                    kps_t = torch.from_numpy(kps_arr.copy()).to(dtype=torch.float32)
+            metas.append(
+                FaceMetadata(
+                    bbox_xyxy=(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])),
+                    kps=kps_t,
+                    det_score=float(scores_np[i]),
+                )
+            )
+        return metas
 
     def _detect_one(self, frame: torch.Tensor) -> _FaceDetections:
         img = self._to_numpy_bgr_u8(frame)
         frame_h, frame_w = img.shape[:2]
 
-        # InsightFace 0.7.x RetinaFace/SCRFD API:
-        # detect(img, input_size=None, max_num=0, metric='default')
-        bboxes, _kpss = self.model.detect(
+        bboxes, kpss = self.model.detect(
             img,
             input_size=(self.imgsz, self.imgsz),
             max_num=0,
@@ -164,7 +167,6 @@ class FaceDetector:
         if bboxes is None or len(bboxes) == 0:
             return self._empty_detection()
 
-        # InsightFace returns [x1, y1, x2, y2, score]
         bboxes = np.asarray(bboxes, dtype=np.float32)
         scores_np = bboxes[:, 4]
 
@@ -172,24 +174,29 @@ class FaceDetector:
         if not np.any(keep):
             return self._empty_detection()
 
-        boxes_np = bboxes[keep, :4]
+        tight_boxes_np = bboxes[keep, :4]
         scores_np = scores_np[keep]
+        kpss_np = None
+        if kpss is not None:
+            kpss_np = np.asarray(kpss, dtype=np.float32)[keep]
 
-        boxes_np = self._expand_and_clip_boxes(
-            boxes_np,
+        roi_boxes_np = self._expand_and_clip_boxes(
+            tight_boxes_np,
             frame_w=frame_w,
             frame_h=frame_h,
         )
 
-        boxes_xyxy = torch.from_numpy(boxes_np).to(dtype=torch.float32)
+        boxes_xyxy = torch.from_numpy(roi_boxes_np).to(dtype=torch.float32)
         scores = torch.from_numpy(scores_np).to(dtype=torch.float32)
         classes = torch.zeros((boxes_xyxy.shape[0],), dtype=torch.int64)
+        face_metas = self._build_face_metas(tight_boxes_np, scores_np, kpss_np)
 
         return _FaceDetections(
             boxes_xyxy=boxes_xyxy,
             scores=scores,
             classes=classes,
             masks=None,
+            face_metas=face_metas,
         )
 
     def detect_batch(self, frames: List[torch.Tensor]) -> List[Detection]:
@@ -205,6 +212,7 @@ class FaceDetector:
                     scores=fr.scores,
                     classes=fr.classes,
                     masks=fr.masks,
+                    face_metas=fr.face_metas,
                 )
             )
         return detections

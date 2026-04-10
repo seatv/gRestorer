@@ -1,23 +1,6 @@
 # SPDX-FileCopyrightText: gRestorer Authors
 # SPDX-License-Identifier: AGPL-3.0
 
-"""Scene / Clip primitives matching LADA 0.9.x semantics (inference pipeline).
-
-This module is a focused, GPU-friendly port of the behavior described in the
-"LadaAnalysis - Restoration Analysis.md" spec and the corresponding LADA 0.9.x
-helpers.
-
-Coordinate convention:
-  - Boxes are tuples (t, l, b, r) == (y1, x1, y2, x2), inclusive.
-
-Key behaviors mirrored from LADA:
-  - Scene.belongs() uses a strict overlap check (NOT IoU).
-  - Multiple detections belonging to the same scene *in the same frame* are
-    UNIONed (box union; mask union if provided).
-  - Clip creation normalizes crops to a fixed clip_size via per-clip scaling
-    based on the maximum crop width/height across the scene.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -28,13 +11,10 @@ import math
 import torch
 import torch.nn.functional as F
 
+from gRestorer.detector.core import FaceMetadata
+
 Box = Tuple[int, int, int, int]  # (t, l, b, r) inclusive
 Pad = Tuple[int, int, int, int]  # (pad_top, pad_bottom, pad_left, pad_right)
-
-
-# -------------------------
-# Box helpers (tlbr)
-# -------------------------
 
 
 def _clamp_int(v: float, lo: int, hi: int) -> int:
@@ -42,7 +22,6 @@ def _clamp_int(v: float, lo: int, hi: int) -> int:
 
 
 def xyxy_to_tlbr(xyxy: Tuple[float, float, float, float], h: int, w: int) -> Box:
-    """Convert (x1,y1,x2,y2) -> (t,l,b,r) with clamping."""
     x1, y1, x2, y2 = xyxy
     l = _clamp_int(x1, 0, w - 1)
     t = _clamp_int(y1, 0, h - 1)
@@ -72,20 +51,13 @@ def _box_size(b: Box) -> Tuple[int, int]:
 
 
 def _box_overlap(a: Box, b: Box) -> bool:
-    """LADA-style overlap predicate used for Scene.belongs()."""
     at, al, ab, ar = a
     bt, bl, bb, br = b
-    # Strict overlap (touching edges is NOT overlap).
     if ar <= bl or br <= al:
         return False
     if ab <= bt or bb <= at:
         return False
     return True
-
-
-# -------------------------
-# LADA crop_to_box_v3 (ported)
-# -------------------------
 
 
 def crop_box_to_target_v3(
@@ -97,25 +69,13 @@ def crop_box_to_target_v3(
     max_box_expansion_factor: float = 1.0,
     border_size: float = 0.0,
 ) -> Tuple[Box, float]:
-    """Exact port of LADA `crop_to_box_v3` box-expansion math.
-
-    This returns the *cropped box coordinates* (t,l,b,r) within the original
-    image and the computed scale_factor. It does NOT resize.
-
-    Notes:
-      - target_hw is (H,W) here, while LADA passes (W,H). For square clip_size
-        (the default), this doesn't matter. We still implement the math
-        faithfully by mapping appropriately.
-    """
     target_h, target_w = int(target_hw[0]), int(target_hw[1])
-    # LADA treats target_size as (target_width, target_height)
     target_width, target_height = target_w, target_h
 
     t, l, b, r = box
     width = int(r - l + 1)
     height = int(b - t + 1)
 
-    # border expansion
     if border_size and border_size > 0.0:
         border_px = max(20, int(max(width, height) * float(border_size)))
     else:
@@ -171,30 +131,21 @@ def crop_box_to_target_v3(
     if down_scale_factor <= 1.0:
         scale_factor = float(down_scale_factor)
     else:
-        # kept for parity with LADA, though down_scale_factor is clamped to <=1
         scale_factor = float(min(target_width / width2, target_height / height2))
 
     return (int(t2), int(l2), int(b2), int(r2)), scale_factor
 
 
-# -------------------------
-# Padding / resize (torch, HWC)
-# -------------------------
-
-
 def _torch_pad_reflect(x: torch.Tensor, pad: Pad) -> torch.Tensor:
-    """Reflect pad that supports large pads by chunking."""
     pt, pb, pl, pr = pad
     if pt < 0 or pb < 0 or pl < 0 or pr < 0:
         raise ValueError(f"Negative pad: {pad}")
 
-    # Work in NCHW for F.pad.
-    x_nchw = x.permute(2, 0, 1).unsqueeze(0)  # [1,C,H,W]
+    x_nchw = x.permute(2, 0, 1).unsqueeze(0)
 
     def pad_once(y: torch.Tensor, p: Tuple[int, int, int, int]) -> torch.Tensor:
         return F.pad(y, p, mode="reflect")
 
-    # Height
     while pt > 0 or pb > 0:
         _, _, hh, _ = x_nchw.shape
         max_step = max(1, hh - 1)
@@ -204,7 +155,6 @@ def _torch_pad_reflect(x: torch.Tensor, pad: Pad) -> torch.Tensor:
         pt -= step_t
         pb -= step_b
 
-    # Width
     while pl > 0 or pr > 0:
         _, _, _, ww = x_nchw.shape
         max_step = max(1, ww - 1)
@@ -224,7 +174,6 @@ def pad_image_hwc(
     pad_mode: str = "reflect",
     pad_value: float = 0.0,
 ) -> Tuple[torch.Tensor, Pad]:
-    """Pad HWC tensor to target (H,W). Returns padded tensor and pad tuple."""
     th, tw = target_hw
     h, w = int(x.shape[0]), int(x.shape[1])
     if h > th or w > tw:
@@ -254,11 +203,10 @@ def pad_image_hwc(
 
 
 def resize_hwc(x: torch.Tensor, out_hw: Tuple[int, int], *, mode: str) -> torch.Tensor:
-    """Resize HWC tensor via interpolate. mode: 'bilinear' or 'nearest'."""
     oh, ow = out_hw
     oh = max(1, int(oh))
     ow = max(1, int(ow))
-    x_nchw = x.permute(2, 0, 1).unsqueeze(0)  # [1,C,H,W]
+    x_nchw = x.permute(2, 0, 1).unsqueeze(0)
     if mode == "bilinear":
         y = F.interpolate(x_nchw, size=(oh, ow), mode="bilinear", align_corners=False)
     elif mode == "nearest":
@@ -269,13 +217,12 @@ def resize_hwc(x: torch.Tensor, out_hw: Tuple[int, int], *, mode: str) -> torch.
 
 
 def resize_hw_mask(m: torch.Tensor, out_hw: Tuple[int, int]) -> torch.Tensor:
-    """Resize HW mask (uint8/float) with nearest."""
     oh, ow = out_hw
     oh = max(1, int(oh))
     ow = max(1, int(ow))
     if m.ndim != 2:
         raise ValueError(f"Expected HW mask, got {tuple(m.shape)}")
-    m_f = m.to(torch.float32).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+    m_f = m.to(torch.float32).unsqueeze(0).unsqueeze(0)
     y = F.interpolate(m_f, size=(oh, ow), mode="nearest")
     y = y.squeeze(0).squeeze(0)
     if m.dtype == torch.uint8:
@@ -284,7 +231,6 @@ def resize_hw_mask(m: torch.Tensor, out_hw: Tuple[int, int]) -> torch.Tensor:
 
 
 def pad_mask_hw(m: torch.Tensor, target_hw: Tuple[int, int]) -> Tuple[torch.Tensor, Pad]:
-    """Pad HW mask to target with zeros."""
     th, tw = target_hw
     h, w = int(m.shape[0]), int(m.shape[1])
     dh = th - h
@@ -302,15 +248,115 @@ def pad_mask_hw(m: torch.Tensor, target_hw: Tuple[int, int]) -> Tuple[torch.Tens
     return y, pad
 
 
-# -------------------------
-# Scene + Clip
-# -------------------------
+def face_meta_full_to_crop(face_meta: Optional[FaceMetadata], crop_box: Box) -> Optional[FaceMetadata]:
+    if face_meta is None:
+        return None
+    t, l, _, _ = crop_box
+    x1, y1, x2, y2 = face_meta.bbox_xyxy
+    kps = face_meta.kps
+    if kps is not None:
+        kps = kps.clone().to(dtype=torch.float32)
+        kps[:, 0] -= float(l)
+        kps[:, 1] -= float(t)
+    return FaceMetadata(
+        bbox_xyxy=(float(x1 - l), float(y1 - t), float(x2 - l), float(y2 - t)),
+        kps=kps,
+        det_score=face_meta.det_score,
+    )
+
+
+def face_meta_crop_to_clip(
+    face_meta: Optional[FaceMetadata],
+    *,
+    crop_shape: Tuple[int, int],
+    out_hw: Tuple[int, int],
+    pad: Pad,
+) -> Optional[FaceMetadata]:
+    if face_meta is None:
+        return None
+
+    ch, cw = int(crop_shape[0]), int(crop_shape[1])
+    oh, ow = int(out_hw[0]), int(out_hw[1])
+    pt, pb, pl, pr = [int(v) for v in pad]
+    sx = float(ow) / float(max(1, cw))
+    sy = float(oh) / float(max(1, ch))
+
+    x1, y1, x2, y2 = face_meta.bbox_xyxy
+    x1 = x1 * sx + pl
+    x2 = x2 * sx + pl
+    y1 = y1 * sy + pt
+    y2 = y2 * sy + pt
+
+    kps = face_meta.kps
+    if kps is not None:
+        kps = kps.clone().to(dtype=torch.float32)
+        kps[:, 0] = kps[:, 0] * sx + pl
+        kps[:, 1] = kps[:, 1] * sy + pt
+
+    return FaceMetadata(
+        bbox_xyxy=(float(x1), float(y1), float(x2), float(y2)),
+        kps=kps,
+        det_score=face_meta.det_score,
+    )
+
+
+def _clip_coord_to_crop_coord(v: float, *, scale: float, pad_before: int, limit: int) -> float:
+    if scale <= 0.0:
+        return float(max(0, min(limit - 1 if limit > 0 else 0, int(v))))
+    out = (float(v) - float(pad_before)) / float(scale)
+    if limit > 0:
+        hi = max(0.0, float(limit - 1))
+        out = max(0.0, min(hi, out))
+    return out
+
+
+def face_meta_clip_to_crop(
+    face_meta: Optional[FaceMetadata],
+    *,
+    crop_shape: Tuple[int, int],
+    out_hw: Tuple[int, int],
+    pad: Pad,
+) -> Optional[FaceMetadata]:
+    """Map face metadata from clip-space back to original crop-space.
+
+    clip-space = resized+pad coordinates used inside Clip.frames
+    crop-space = original ROI crop coordinates used by the worker input image
+    """
+    if face_meta is None:
+        return None
+
+    ch, cw = int(crop_shape[0]), int(crop_shape[1])
+    oh, ow = int(out_hw[0]), int(out_hw[1])
+    pt, pb, pl, pr = [int(v) for v in pad]
+    sx = float(ow) / float(max(1, cw))
+    sy = float(oh) / float(max(1, ch))
+
+    x1, y1, x2, y2 = face_meta.bbox_xyxy
+    x1 = _clip_coord_to_crop_coord(x1, scale=sx, pad_before=pl, limit=cw)
+    x2 = _clip_coord_to_crop_coord(x2, scale=sx, pad_before=pl, limit=cw)
+    y1 = _clip_coord_to_crop_coord(y1, scale=sy, pad_before=pt, limit=ch)
+    y2 = _clip_coord_to_crop_coord(y2, scale=sy, pad_before=pt, limit=ch)
+
+    kps = face_meta.kps
+    if kps is not None:
+        kps = kps.clone().to(dtype=torch.float32)
+        kps[:, 0] = (kps[:, 0] - float(pl)) / float(max(sx, 1e-8))
+        kps[:, 1] = (kps[:, 1] - float(pt)) / float(max(sy, 1e-8))
+        if cw > 0:
+            kps[:, 0].clamp_(0.0, float(max(0, cw - 1)))
+        if ch > 0:
+            kps[:, 1].clamp_(0.0, float(max(0, ch - 1)))
+
+    return FaceMetadata(
+        bbox_xyxy=(float(x1), float(y1), float(x2), float(y2)),
+        kps=kps,
+        det_score=face_meta.det_score,
+    )
+
 
 
 @dataclass
 class Scene:
-    """Tracks one mosaic region across consecutive frames."""
-
     id: int
     frame_start: int
     frame_nums: List[int]
@@ -318,6 +364,7 @@ class Scene:
     crop_boxes: List[Box]
     crops: List[torch.Tensor]
     masks: List[Optional[torch.Tensor]]
+    face_metas: List[Optional[FaceMetadata]]
 
     def __init__(self, *, id: int, start_frame: int) -> None:
         self.id = int(id)
@@ -327,24 +374,21 @@ class Scene:
         self.crop_boxes = []
         self.crops = []
         self.masks = []
+        self.face_metas = []
 
-        self.ttl_after_end = 3      # allow this scene to persist for N frames
-        self.end_frame = None       # last frame before it was considered done
-        self.completed_reason = ""  # reason string for debug/logging
-
+        self.ttl_after_end = 3
+        self.end_frame = None
+        self.completed_reason = ""
 
     def mark_completed(self, frame_num: int, reason: str):
-        """Mark this scene as completed but keep it alive for a few frames."""
         self.end_frame = frame_num
         self.completed_reason = reason
         self.completed = True
 
     def is_expired(self, current_frame: int) -> bool:
-        """Return True only when the linger period has passed."""
         if not self.completed or self.end_frame is None:
             return False
         return (current_frame - self.end_frame) > self.ttl_after_end
-
 
     @property
     def frame_end(self) -> int:
@@ -366,6 +410,7 @@ class Scene:
         crop_box: Box,
         crop_img: torch.Tensor,
         crop_mask: Optional[torch.Tensor],
+        face_meta: Optional[FaceMetadata] = None,
     ) -> None:
         if self.frame_nums and frame_num != self.frame_nums[-1] + 1:
             raise AssertionError(
@@ -376,8 +421,8 @@ class Scene:
         self.crop_boxes.append(crop_box)
         self.crops.append(crop_img)
         self.masks.append(crop_mask)
+        self.face_metas.append(face_meta)
 
-    # --- Compatibility aliases (older pipeline revisions) ---
     def append(
         self,
         frame_num: int,
@@ -385,22 +430,18 @@ class Scene:
         crop_box: Box,
         crop_img: torch.Tensor,
         crop_mask: Optional[torch.Tensor],
+        face_meta: Optional[FaceMetadata] = None,
     ) -> None:
-        """Alias for older callers that used Scene.append(...)."""
         self.add_frame(
             frame_num=frame_num,
             roi_box=roi_box,
             crop_box=crop_box,
             crop_img=crop_img,
             crop_mask=crop_mask,
+            face_meta=face_meta,
         )
 
     def to_clip(self, *, clip_id: int, clip_size: int, pad_mode: str = "reflect") -> "Clip":
-        """Build a Clip from this Scene.
-
-        Kept as a Scene method because older pipeline revisions (and our
-        SceneTracker) call s.to_clip(...).
-        """
         return Clip(scene=self, clip_id=int(clip_id), clip_size=int(clip_size), pad_mode=str(pad_mode))
 
     def merge_same_frame(
@@ -410,21 +451,13 @@ class Scene:
         crop_box: Box,
         crop_img: torch.Tensor,
         crop_mask: Optional[torch.Tensor],
+        face_meta: Optional[FaceMetadata] = None,
     ) -> None:
         if not self.frame_nums:
             raise AssertionError("Cannot merge into empty scene")
         self.roi_boxes[-1] = _union_box(self.roi_boxes[-1], roi_box)
         self.crop_boxes[-1] = crop_box
         self.crops[-1] = crop_img
-        # NOTE (important): during same-frame merges, the *crop box usually changes*
-        # (we recompute it from the union ROI). That means any previously stored
-        # mask/crop for this frame may have a different spatial shape.
-        #
-        # LADA semantics are "union in full-frame coords, then re-crop".
-        # Our tracker already re-crops from the UNION ROI and passes a mask in the
-        # union-crop coordinate system.
-        #
-        # Therefore: if shapes mismatch, we must NOT try to max() them; we replace.
         if crop_mask is None:
             self.masks[-1] = None
         else:
@@ -435,8 +468,13 @@ class Scene:
                 if prev.shape == crop_mask.shape:
                     self.masks[-1] = torch.maximum(prev, crop_mask)
                 else:
-                    # Replace with the union-crop mask.
                     self.masks[-1] = crop_mask
+
+        # For face-swap flows, same-frame scene merges are uncommon. When they do
+        # happen we keep the metadata that corresponds to the union crop if present;
+        # otherwise preserve the previous value.
+        if face_meta is not None:
+            self.face_metas[-1] = face_meta
 
     def max_crop_hw(self) -> Tuple[int, int]:
         max_h = 0
@@ -450,8 +488,6 @@ class Scene:
 
 @dataclass
 class Clip:
-    """A normalized clip built from a Scene."""
-
     id: int
     frame_start: int
     frame_end: int
@@ -463,6 +499,7 @@ class Clip:
     frame_nums: List[int]
     clip_size: int
     pad_mode: str
+    face_metas: List[Optional[FaceMetadata]]
 
     def __init__(self, *, scene: Scene, clip_id: int, clip_size: int, pad_mode: str = "reflect") -> None:
         if len(scene) == 0:
@@ -486,6 +523,7 @@ class Clip:
         self.frames = []
         self.masks = []
         self.pad_after_resizes = []
+        self.face_metas = []
 
         for i, crop_u8 in enumerate(scene.crops):
             ch, cw = self.crop_shapes[i]
@@ -507,28 +545,31 @@ class Clip:
             self.frames.append(img_pd)
             self.masks.append(m_pd)
             self.pad_after_resizes.append(pad)
+            self.face_metas.append(
+                face_meta_crop_to_clip(
+                    scene.face_metas[i],
+                    crop_shape=(ch, cw),
+                    out_hw=(out_h, out_w),
+                    pad=pad,
+                )
+            )
 
     def __len__(self) -> int:
         return len(self.frames)
 
-    # --- Compatibility aliases ---
     @property
     def crop_boxes(self) -> List[Box]:
         return self.boxes
 
     def pop(self) -> Tuple[torch.Tensor, torch.Tensor, Box, Tuple[int, int], Pad]:
-        """Pop the earliest clip element.
-
-        LADA-faithful behavior: advance frame_start as frames are popped so a clip can be
-        applied by matching `clip.frame_start == frame_num` and popping once per frame.
-        """
         frame = self.frames.pop(0)
         mask = self.masks.pop(0)
         box = self.boxes.pop(0)
         crop_shape = self.crop_shapes.pop(0)
         pad = self.pad_after_resizes.pop(0)
+        if self.face_metas:
+            self.face_metas.pop(0)
 
-        # Keep frame_nums/frame_start in sync with pops (LADA-style).
         if self.frame_nums:
             self.frame_nums.pop(0)
 
@@ -536,7 +577,6 @@ class Clip:
             self.frame_start = int(self.frame_nums[0])
             self.frame_end = int(self.frame_nums[-1])
         else:
-            # Mark empty: keep invariant frame_start > frame_end
             old_end = int(self.frame_end)
             self.frame_start = old_end + 1
             self.frame_end = old_end
@@ -549,6 +589,10 @@ __all__ = [
     "Pad",
     "Scene",
     "Clip",
+    "FaceMetadata",
+    "face_meta_full_to_crop",
+    "face_meta_crop_to_clip",
+    "face_meta_clip_to_crop",
     "xyxy_to_tlbr",
     "tlbr_to_xyxy",
     "crop_box_to_target_v3",
