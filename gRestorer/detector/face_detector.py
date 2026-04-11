@@ -54,6 +54,12 @@ class FaceDetector:
         self.side_expand = 0.15
 
         try:
+            import onnxruntime as ort
+            ort.set_default_logger_severity(3)  # suppress warning spam from some RetinaFace ONNX exports
+        except Exception:
+            pass
+
+        try:
             from insightface.model_zoo import get_model
         except Exception as e:
             raise ImportError(

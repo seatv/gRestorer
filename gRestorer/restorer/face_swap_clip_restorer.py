@@ -14,6 +14,7 @@ from gRestorer.detector.core import FaceMetadata
 from gRestorer.restorer.clip_restorer import BaseClipRestorer
 from gRestorer.restorer.face_swap_worker import FaceSwapWorker
 from gRestorer.restorer.face_enhancer import FaceEnhancer
+from gRestorer.restorer.face_occluder import FaceOccluder
 
 
 @dataclass
@@ -34,6 +35,11 @@ class FaceSwapRestoreStats:
     frames_enhancer_failed: int = 0
     frames_enhancer_materially_changed: int = 0
     enhancer_mean_abs_diff_accum: float = 0.0
+    frames_occluder_called: int = 0
+    frames_occluder_returned: int = 0
+    frames_occluder_failed: int = 0
+    frames_occluder_materially_changed: int = 0
+    occluder_mean_abs_diff_accum: float = 0.0
 
     def avg_mean_abs_diff(self) -> float:
         return self.mean_abs_diff_accum / max(1, self.frames_worker_returned)
@@ -41,9 +47,12 @@ class FaceSwapRestoreStats:
     def avg_enhancer_mean_abs_diff(self) -> float:
         return self.enhancer_mean_abs_diff_accum / max(1, self.frames_enhancer_returned)
 
+    def avg_occluder_mean_abs_diff(self) -> float:
+        return self.occluder_mean_abs_diff_accum / max(1, self.frames_occluder_returned)
+
 
 class FaceSwapClipRestorer(BaseClipRestorer):
-    """ROI-authoritative face-swap wrapper with corrected geometry.
+    """ROI-authoritative face-swap wrapper with enhancer and optional occluder.
 
     Policy lives here:
       - choose/stabilize the target face track within a clip
@@ -63,14 +72,30 @@ class FaceSwapClipRestorer(BaseClipRestorer):
         provider: str = "auto",
         face_enhancer_model_path: str = "",
         face_enhancer_blend: int = 80,
+        face_occluder_model_path: str = "",
+        face_occluder_threshold: float = 0.5,
+        face_occluder_blur: int = 5,
+        face_occluder_blend: int = 100,
+        face_occluder_invert: bool = False,
     ) -> None:
         super().__init__(device=device)
         self.source_face_path = str(source_face_path)
         self.swap_model_path = str(swap_model_path)
         self.swap_input_size = int(swap_input_size)
         self.provider = str(provider or "auto").lower()
+
+        # Keep these ctor args optional but allow env-var only phase-1 bring-up to avoid touching pipeline/config first.
         self.face_enhancer_model_path = str(face_enhancer_model_path or "")
         self.face_enhancer_blend = int(face_enhancer_blend)
+        self.face_occluder_model_path = str(face_occluder_model_path or os.getenv("GR_FS_OCCLUDER_MODEL", "") or "")
+        self.face_occluder_threshold = float(face_occluder_threshold if face_occluder_model_path else os.getenv("GR_FS_OCCLUDER_THRESHOLD", face_occluder_threshold))
+        self.face_occluder_blur = int(face_occluder_blur if face_occluder_model_path else os.getenv("GR_FS_OCCLUDER_BLUR", face_occluder_blur))
+        self.face_occluder_blend = int(face_occluder_blend if face_occluder_model_path else os.getenv("GR_FS_OCCLUDER_BLEND", face_occluder_blend))
+        self.face_occluder_invert = (
+            bool(face_occluder_invert)
+            if face_occluder_model_path
+            else str(os.getenv("GR_FS_OCCLUDER_INVERT", "0")).strip().lower() not in ("", "0", "false", "no")
+        )
 
         self.debug_enabled = str(os.getenv("GR_FS_DEBUG", "0")).strip().lower() not in ("", "0", "false", "no")
         self.debug_dir = Path(os.getenv("GR_FS_DEBUG_DIR", "fs_debug"))
@@ -88,6 +113,7 @@ class FaceSwapClipRestorer(BaseClipRestorer):
             swap_model_path=self.swap_model_path,
             provider=self.provider,
         )
+
         self.enhancer = None
         if self.face_enhancer_model_path:
             self.enhancer = FaceEnhancer(
@@ -95,6 +121,18 @@ class FaceSwapClipRestorer(BaseClipRestorer):
                 enhancer_model_path=self.face_enhancer_model_path,
                 provider=self.provider,
                 blend=self.face_enhancer_blend,
+            )
+
+        self.occluder = None
+        if self.face_occluder_model_path:
+            self.occluder = FaceOccluder(
+                device=self.device,
+                occluder_model_path=self.face_occluder_model_path,
+                provider=self.provider,
+                threshold=self.face_occluder_threshold,
+                blur=self.face_occluder_blur,
+                blend=self.face_occluder_blend,
+                invert=self.face_occluder_invert,
             )
 
     @staticmethod
@@ -237,6 +275,8 @@ class FaceSwapClipRestorer(BaseClipRestorer):
             f"[FaceSwapStats] materially_changed={self.stats.frames_materially_changed} mad_threshold={self.material_change_mad_threshold:.3f} avg_mad={self.stats.avg_mean_abs_diff():.4f}",
             f"[FaceSwapStats] enhancer_called={self.stats.frames_enhancer_called} returned={self.stats.frames_enhancer_returned} failed={self.stats.frames_enhancer_failed}",
             f"[FaceSwapStats] enhancer_materially_changed={self.stats.frames_enhancer_materially_changed} avg_enhancer_mad={self.stats.avg_enhancer_mean_abs_diff():.4f}",
+            f"[FaceSwapStats] occluder_called={self.stats.frames_occluder_called} returned={self.stats.frames_occluder_returned} failed={self.stats.frames_occluder_failed}",
+            f"[FaceSwapStats] occluder_materially_changed={self.stats.frames_occluder_materially_changed} avg_occluder_mad={self.stats.avg_occluder_mean_abs_diff():.4f}",
         ]
 
     @torch.inference_mode()
@@ -305,6 +345,7 @@ class FaceSwapClipRestorer(BaseClipRestorer):
                 if face_meta.kps is not None:
                     self._save_debug_text(frame_num, f"target_face_kps_shape={tuple(face_meta.kps.shape)}")
 
+                original_roi = crop_np.copy()
                 before = crop_np.copy()
                 self.stats.frames_worker_called += 1
                 try:
@@ -346,6 +387,25 @@ class FaceSwapClipRestorer(BaseClipRestorer):
                             self._save_debug_image(frame_num, "03b_enhanced", enhanced)
                             self._save_debug_image(frame_num, "04b_enhancer_diff", self._diff_image(swapped_np, enhanced))
                             swapped_np = enhanced
+
+                    if self.occluder is not None:
+                        self.stats.frames_occluder_called += 1
+                        try:
+                            occluded = self.occluder.preserve(original_roi, swapped_np, face_meta)
+                        except Exception as e:
+                            self.stats.frames_occluder_failed += 1
+                            self._save_debug_text(frame_num, f"occluder_exception={e!r}")
+                            occluded = None
+                        if occluded is not None:
+                            self.stats.frames_occluder_returned += 1
+                            omad = float(np.mean(np.abs(occluded.astype(np.int16) - swapped_np.astype(np.int16))))
+                            self.stats.occluder_mean_abs_diff_accum += omad
+                            if omad >= self.material_change_mad_threshold:
+                                self.stats.frames_occluder_materially_changed += 1
+                            self._save_debug_text(frame_num, f"occluder_mean_abs_diff={omad:.4f}")
+                            self._save_debug_image(frame_num, "03c_occluded", occluded)
+                            self._save_debug_image(frame_num, "04c_occluder_diff", self._diff_image(swapped_np, occluded))
+                            swapped_np = occluded
             else:
                 self._save_debug_text(frame_num, "target_face_source=none")
 
