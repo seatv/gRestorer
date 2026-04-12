@@ -15,6 +15,7 @@ from gRestorer.restorer.clip_restorer import BaseClipRestorer
 from gRestorer.restorer.face_swap_worker import FaceSwapWorker
 from gRestorer.restorer.face_enhancer import FaceEnhancer
 from gRestorer.restorer.face_occluder import FaceOccluder
+from gRestorer.restorer.face_landmarker import FaceLandmarker
 
 
 @dataclass
@@ -25,6 +26,9 @@ class FaceSwapRestoreStats:
     frames_without_detector_face_meta: int = 0
     frames_gap_filled_forward: int = 0
     frames_gap_filled_backward: int = 0
+    frames_landmarker_called: int = 0
+    frames_landmarker_returned: int = 0
+    frames_landmarker_failed: int = 0
     frames_worker_called: int = 0
     frames_worker_returned: int = 0
     frames_worker_returned_none: int = 0
@@ -56,6 +60,7 @@ class FaceSwapClipRestorer(BaseClipRestorer):
 
     Policy lives here:
       - choose/stabilize the target face track within a clip
+      - optional landmark refinement for the already chosen target face
       - repad/resize behavior for the clip interface
 
     Worker contract:
@@ -70,13 +75,28 @@ class FaceSwapClipRestorer(BaseClipRestorer):
         *,
         swap_input_size: int = 128,
         provider: str = "auto",
+        face_enhancer_enabled: bool = False,
         face_enhancer_model_path: str = "",
+        face_enhancer_provider: str = "auto",
         face_enhancer_blend: int = 80,
+        face_occluder_enabled: bool = False,
         face_occluder_model_path: str = "",
+        face_occluder_provider: str = "auto",
         face_occluder_threshold: float = 0.5,
         face_occluder_blur: int = 5,
         face_occluder_blend: int = 100,
         face_occluder_invert: bool = False,
+        landmark_refiner_enabled: bool = False,
+        landmark_model: str = "2dfan4",
+        landmark_model_path: str = "",
+        landmark_provider: str = "auto",
+        landmark_score: float = 0.5,
+        debug_enabled: bool = False,
+        debug_dir: str = "fs_debug",
+        debug_start: int = -1,
+        debug_end: int = -1,
+        material_change_mad_threshold: float = 1.0,
+        **_ignored_kwargs,
     ) -> None:
         super().__init__(device=device)
         self.source_face_path = str(source_face_path)
@@ -84,27 +104,33 @@ class FaceSwapClipRestorer(BaseClipRestorer):
         self.swap_input_size = int(swap_input_size)
         self.provider = str(provider or "auto").lower()
 
-        # Keep these ctor args optional but allow env-var only phase-1 bring-up to avoid touching pipeline/config first.
+        self.face_enhancer_enabled = bool(face_enhancer_enabled)
         self.face_enhancer_model_path = str(face_enhancer_model_path or "")
+        self.face_enhancer_provider = str(face_enhancer_provider or self.provider or "auto").lower()
         self.face_enhancer_blend = int(face_enhancer_blend)
-        self.face_occluder_model_path = str(face_occluder_model_path or os.getenv("GR_FS_OCCLUDER_MODEL", "") or "")
-        self.face_occluder_threshold = float(face_occluder_threshold if face_occluder_model_path else os.getenv("GR_FS_OCCLUDER_THRESHOLD", face_occluder_threshold))
-        self.face_occluder_blur = int(face_occluder_blur if face_occluder_model_path else os.getenv("GR_FS_OCCLUDER_BLUR", face_occluder_blur))
-        self.face_occluder_blend = int(face_occluder_blend if face_occluder_model_path else os.getenv("GR_FS_OCCLUDER_BLEND", face_occluder_blend))
-        self.face_occluder_invert = (
-            bool(face_occluder_invert)
-            if face_occluder_model_path
-            else str(os.getenv("GR_FS_OCCLUDER_INVERT", "0")).strip().lower() not in ("", "0", "false", "no")
-        )
 
-        self.debug_enabled = str(os.getenv("GR_FS_DEBUG", "0")).strip().lower() not in ("", "0", "false", "no")
-        self.debug_dir = Path(os.getenv("GR_FS_DEBUG_DIR", "fs_debug"))
-        self.debug_start = int(os.getenv("GR_FS_DEBUG_START", "-1"))
-        self.debug_end = int(os.getenv("GR_FS_DEBUG_END", "-1"))
+        self.face_occluder_enabled = bool(face_occluder_enabled)
+        self.face_occluder_model_path = str(face_occluder_model_path or os.getenv("GR_FS_OCCLUDER_MODEL", "") or "")
+        self.face_occluder_provider = str(face_occluder_provider or self.provider or "auto").lower()
+        self.face_occluder_threshold = float(face_occluder_threshold)
+        self.face_occluder_blur = int(face_occluder_blur)
+        self.face_occluder_blend = int(face_occluder_blend)
+        self.face_occluder_invert = bool(face_occluder_invert)
+
+        self.landmark_refiner_enabled = bool(landmark_refiner_enabled)
+        self.landmark_model = str(landmark_model or "2dfan4")
+        self.landmark_model_path = str(landmark_model_path or "")
+        self.landmark_provider = str(landmark_provider or self.provider or "auto").lower()
+        self.landmark_score = float(max(0.0, min(1.0, landmark_score)))
+
+        self.debug_enabled = bool(debug_enabled)
+        self.debug_dir = Path(debug_dir)
+        self.debug_start = int(debug_start)
+        self.debug_end = int(debug_end)
         if self.debug_enabled:
             self.debug_dir.mkdir(parents=True, exist_ok=True)
 
-        self.material_change_mad_threshold = float(os.getenv("GR_FS_MATERIAL_MAD", "1.0"))
+        self.material_change_mad_threshold = float(material_change_mad_threshold)
         self.stats = FaceSwapRestoreStats()
 
         self.worker = FaceSwapWorker(
@@ -114,21 +140,33 @@ class FaceSwapClipRestorer(BaseClipRestorer):
             provider=self.provider,
         )
 
+        self.landmarker = None
+        if self.landmark_refiner_enabled:
+            if not self.landmark_model_path:
+                raise FileNotFoundError("Landmark refiner is enabled but landmark_model_path is empty")
+            self.landmarker = FaceLandmarker(
+                device=self.device,
+                model_name=self.landmark_model,
+                model_path=self.landmark_model_path,
+                provider=self.landmark_provider,
+                score=self.landmark_score,
+            )
+
         self.enhancer = None
-        if self.face_enhancer_model_path:
+        if self.face_enhancer_enabled and self.face_enhancer_model_path:
             self.enhancer = FaceEnhancer(
                 device=self.device,
                 enhancer_model_path=self.face_enhancer_model_path,
-                provider=self.provider,
+                provider=self.face_enhancer_provider,
                 blend=self.face_enhancer_blend,
             )
 
         self.occluder = None
-        if self.face_occluder_model_path:
+        if self.face_occluder_enabled and self.face_occluder_model_path:
             self.occluder = FaceOccluder(
                 device=self.device,
                 occluder_model_path=self.face_occluder_model_path,
-                provider=self.provider,
+                provider=self.face_occluder_provider,
                 threshold=self.face_occluder_threshold,
                 blur=self.face_occluder_blur,
                 blend=self.face_occluder_blend,
@@ -271,6 +309,7 @@ class FaceSwapClipRestorer(BaseClipRestorer):
             f"[FaceSwapStats] clips_processed={self.stats.clips_processed} frames_total={self.stats.frames_total}",
             f"[FaceSwapStats] detector_face_meta frames={self.stats.frames_with_detector_face_meta}/{self.stats.frames_total} missing={self.stats.frames_without_detector_face_meta}",
             f"[FaceSwapStats] gap_fill forward={self.stats.frames_gap_filled_forward} backward={self.stats.frames_gap_filled_backward}",
+            f"[FaceSwapStats] landmarker_called={self.stats.frames_landmarker_called} returned={self.stats.frames_landmarker_returned} failed={self.stats.frames_landmarker_failed}",
             f"[FaceSwapStats] worker_called={self.stats.frames_worker_called} returned={self.stats.frames_worker_returned} returned_none={self.stats.frames_worker_returned_none}",
             f"[FaceSwapStats] materially_changed={self.stats.frames_materially_changed} mad_threshold={self.material_change_mad_threshold:.3f} avg_mad={self.stats.avg_mean_abs_diff():.4f}",
             f"[FaceSwapStats] enhancer_called={self.stats.frames_enhancer_called} returned={self.stats.frames_enhancer_returned} failed={self.stats.frames_enhancer_failed}",
@@ -340,16 +379,32 @@ class FaceSwapClipRestorer(BaseClipRestorer):
             swapped_np = crop_np
 
             if face_meta is not None:
-                x1, y1, x2, y2 = face_meta.bbox_xyxy
+                active_face_meta = face_meta
+                if self.landmarker is not None:
+                    self.stats.frames_landmarker_called += 1
+                    try:
+                        refined = self.landmarker.refine(crop_np, face_meta)
+                    except Exception as e:
+                        self.stats.frames_landmarker_failed += 1
+                        self._save_debug_text(frame_num, f"landmarker_exception={e!r}")
+                        refined = None
+                    if refined is not None:
+                        active_face_meta = refined
+                        self.stats.frames_landmarker_returned += 1
+                        self._save_debug_text(frame_num, "landmarker_refined=True")
+                    else:
+                        self._save_debug_text(frame_num, "landmarker_refined=False")
+
+                x1, y1, x2, y2 = active_face_meta.bbox_xyxy
                 self._save_debug_text(frame_num, f"target_face_bbox=({x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f})")
-                if face_meta.kps is not None:
-                    self._save_debug_text(frame_num, f"target_face_kps_shape={tuple(face_meta.kps.shape)}")
+                if active_face_meta.kps is not None:
+                    self._save_debug_text(frame_num, f"target_face_kps_shape={tuple(active_face_meta.kps.shape)}")
 
                 original_roi = crop_np.copy()
                 before = crop_np.copy()
                 self.stats.frames_worker_called += 1
                 try:
-                    out = self.worker.swap(crop_np, face_meta)
+                    out = self.worker.swap(crop_np, active_face_meta)
                 except Exception as e:
                     self._save_debug_text(frame_num, f"swap_exception={e!r}")
                     out = None
@@ -372,7 +427,7 @@ class FaceSwapClipRestorer(BaseClipRestorer):
                     if self.enhancer is not None:
                         self.stats.frames_enhancer_called += 1
                         try:
-                            enhanced = self.enhancer.enhance(swapped_np, face_meta)
+                            enhanced = self.enhancer.enhance(swapped_np, active_face_meta)
                         except Exception as e:
                             self.stats.frames_enhancer_failed += 1
                             self._save_debug_text(frame_num, f"enhancer_exception={e!r}")
@@ -391,7 +446,7 @@ class FaceSwapClipRestorer(BaseClipRestorer):
                     if self.occluder is not None:
                         self.stats.frames_occluder_called += 1
                         try:
-                            occluded = self.occluder.preserve(original_roi, swapped_np, face_meta)
+                            occluded = self.occluder.preserve(original_roi, swapped_np, active_face_meta)
                         except Exception as e:
                             self.stats.frames_occluder_failed += 1
                             self._save_debug_text(frame_num, f"occluder_exception={e!r}")

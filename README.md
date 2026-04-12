@@ -47,8 +47,8 @@ Both commands default to loading `./config.json` if present.
 gRestorer/
   cli/         # CLI entry + pipeline orchestration
   core/        # scene/clip tracking logic
-  detector/    # mosaic detector wrapper (YOLO seg)
-  restorer/    # restorers: none, pseudo, pseudo_clip, basicvsrpp
+  detector/    # mosaic detector wrappers (YOLO seg), face detector wrapper
+  restorer/    # restorers: none, pseudo, pseudo_clip, basicvsrpp, face_swap
   utils/       # config + visualization helpers
   video/       # NVDEC/NVENC wrappers: decoder.py, encoder.py
   synthmosaic/ # mosaic addition functions
@@ -230,7 +230,7 @@ Quick check:
 ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,codec_tag_string,width,height -of default=nw=1 "VIDEO.mp4"
 ```
 
-How to fix a older file:
+How to fix an older file:
 ```PowerShell
 ffmpeg -hide_banner -y -i "in.mp4" -c copy -tag:v hvc1 "out.mp4"
 ```
@@ -261,6 +261,29 @@ ROIs can be specified either via CLI (`--roi t,l,b,r`, repeatable) or in `config
 ## Configuration (`config.json`)
 
 `config.json` is optional; CLI flags override config values.
+
+### Processing family selection
+
+Unless explicitly specified, gRestorer operates on **mosaic restoration**.
+
+Use:
+
+- `"process": "mosaic"` for mosaic detection/restoration
+- `"process": "face"` for face detection / face-swap workflows
+
+If `process` is omitted, the CLI defaults to **mosaic** blocks:
+- `mosaic_detection` then legacy `detection`
+- `mosaic_restoration` then legacy `restoration`
+
+Face workflows must set:
+
+```json
+{
+  "process": "face"
+}
+```
+
+Use `debug_enabled` as the runtime master switch. The `debug` object is only for debug settings/output locations.
 
 Common knobs:
 

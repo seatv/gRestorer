@@ -52,6 +52,46 @@ from .pipeline_utils import (
 )
 
 
+def _truthy_env(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).strip().lower() not in ("", "0", "false", "no")
+
+
+def _cfg_bool(cfg: Config, key_paths: List[Tuple[str, ...]], *, env_name: Optional[str] = None, default: bool = False) -> bool:
+    value = cfg_first(cfg, key_paths, default=None)
+    if value is not None:
+        return bool(value)
+    if env_name:
+        return _truthy_env(env_name, "1" if default else "0")
+    return bool(default)
+
+
+def _cfg_int(cfg: Config, key_paths: List[Tuple[str, ...]], *, env_name: Optional[str] = None, default: int = 0) -> int:
+    value = cfg_first(cfg, key_paths, default=None)
+    if value is not None:
+        return int(value)
+    if env_name:
+        return int(os.getenv(env_name, str(default)))
+    return int(default)
+
+
+def _cfg_float(cfg: Config, key_paths: List[Tuple[str, ...]], *, env_name: Optional[str] = None, default: float = 0.0) -> float:
+    value = cfg_first(cfg, key_paths, default=None)
+    if value is not None:
+        return float(value)
+    if env_name:
+        return float(os.getenv(env_name, str(default)))
+    return float(default)
+
+
+def _cfg_str(cfg: Config, key_paths: List[Tuple[str, ...]], *, env_name: Optional[str] = None, default: str = "") -> str:
+    value = cfg_first(cfg, key_paths, default=None)
+    if value is not None:
+        return str(value)
+    if env_name:
+        return str(os.getenv(env_name, default))
+    return str(default)
+
+
 @dataclass
 class DetStats:
     frames_total: int = 0
@@ -225,23 +265,63 @@ class Pipeline:
         self.input_path = str(self.cfg.get("input"))
         self.output_path = str(self.cfg.get("output"))
         self.max_frames: Optional[int] = self.cfg.get("max_frames", default=None)
+        self.process: str = str(self.cfg.get("process", default="mosaic") or "mosaic").lower()
+        if self.process not in ("mosaic", "face"):
+            raise ValueError(f"Invalid process: {self.process!r}. Expected 'mosaic' or 'face'.")
         self.debug: bool = bool(self.cfg.get("debug_enabled", default=False))
         self.profile_sync: bool = bool(self.cfg.get("profile_sync", default=False))
-        self.batch_size: int = int(self.cfg.get("batch_size", default=8))
-        self.dec_gpu_id: int = int(cfg_first(self.cfg, [("decoder", "gpu_id")], default=0))
-        self.enc_gpu_id: int = int(cfg_first(self.cfg, [("encoder", "gpu_id")], default=self.dec_gpu_id))
+        self.batch_size: int = int(cfg_first(self.cfg, [("runtime", "batch_size"), ("batch_size",)], default=8))
+        self.dec_gpu_id: int = int(cfg_first(self.cfg, [("decoder", "gpu_id"), ("runtime", "gpu_id")], default=0))
+        self.enc_gpu_id: int = int(cfg_first(self.cfg, [("encoder", "gpu_id"), ("runtime", "gpu_id")], default=self.dec_gpu_id))
         self.device: torch.device = _pick_device(self.dec_gpu_id)
         self.mode: str = str(self.cfg.get("mode", default="real")).lower()
-        self.restorer_name: str = str(self.cfg.get("restorer", default="basicvsrpp")).lower()
+        _restorer_default = "face_swap" if self.process == "face" else "basicvsrpp"
+        self.restorer_name: str = str(self.cfg.get("restorer", default=_restorer_default) or _restorer_default).lower()
+        if self.restorer_name == "face_swap" and self.process != "face":
+            raise ValueError("restorer=face_swap requires process=face. Unless explicitly specified, gRestorer operates on mosaic restoration.")
 
         self.dec_output_format: str = str(self.cfg.get("decoder", "output_format", default="RGBP")).upper()
         self.dec_ffmpeg_input_args: str = str(self.cfg.get("decoder", "ffmpeg_input_args", default="") or "")
 
-        self.det_model: str = cfg_path(self.cfg, ("detection", "model_path"), default="")
-        self.det_imgsz: int = int(self.cfg.get("detection", "imgsz", default=640))
-        self.det_conf: float = float(self.cfg.get("detection", "conf_threshold", default=0.30))
-        self.det_iou: float = float(self.cfg.get("detection", "iou_threshold", default=0.70))
-        self.det_fp16: bool = bool(self.cfg.get("detection", "fp16", default=True))
+        if self.process == "face":
+            self.det_type: str = str(
+                cfg_first(
+                    self.cfg,
+                    [("face_detection", "det_type"), ("detection", "det_type")],
+                    default="face",
+                )
+                or "face"
+            ).lower()
+            det_paths = [("face_detection", "model_path"), ("detection", "model_path")]
+            imgsz_paths = [("face_detection", "imgsz"), ("detection", "imgsz")]
+            conf_paths = [("face_detection", "conf_threshold"), ("detection", "conf_threshold")]
+            iou_paths = [("face_detection", "iou_threshold"), ("detection", "iou_threshold")]
+            fp16_paths = [("face_detection", "fp16"), ("detection", "fp16")]
+        else:
+            self.det_type: str = str(
+                cfg_first(
+                    self.cfg,
+                    [("mosaic_detection", "det_type"), ("detection", "det_type")],
+                    default="yolo",
+                )
+                or "yolo"
+            ).lower()
+            det_paths = [("mosaic_detection", "model_path"), ("detection", "model_path")]
+            imgsz_paths = [("mosaic_detection", "imgsz"), ("detection", "imgsz")]
+            conf_paths = [("mosaic_detection", "conf_threshold"), ("detection", "conf_threshold")]
+            iou_paths = [("mosaic_detection", "iou_threshold"), ("detection", "iou_threshold")]
+            fp16_paths = [("mosaic_detection", "fp16"), ("detection", "fp16")]
+
+        self.det_model: str = str(cfg_first(self.cfg, det_paths, default="") or "")
+        self.det_imgsz: int = int(cfg_first(self.cfg, imgsz_paths, default=640))
+        self.det_conf: float = float(cfg_first(self.cfg, conf_paths, default=0.30))
+        self.det_iou: float = float(cfg_first(self.cfg, iou_paths, default=0.70))
+        self.det_fp16: bool = bool(cfg_first(self.cfg, fp16_paths, default=True))
+        self.face_det_suppress_onnx_warnings: bool = _cfg_bool(
+            self.cfg,
+            [("face_detection", "suppress_onnx_warnings")],
+            default=False,
+        )
 
         self.roi_dilate: int = int(self.cfg.get("roi_dilate", default=0))
         self.use_seg_masks: bool = bool(self.cfg.get("use_seg_masks", default=True))
@@ -250,33 +330,88 @@ class Pipeline:
         self.sbs_layout: str = str(self.cfg.get("sbs_layout", default="lr")).lower()
         self.sbs_det_split: bool = bool(self.cfg.get("sbs_det_split", default=False))
 
-        self.rest_model: str = cfg_path(self.cfg, ("restoration", "rest_model_path"), default="")
-        self.rest_fp16: bool = bool(self.cfg.get("restoration", "fp16", default=True))
-        self.source_face_path: str = cfg_path(self.cfg, ("restoration", "source_face_path"), default="")
-        self.swap_model_path: str = cfg_path(self.cfg, ("restoration", "swap_model_path"), default="")
-        self.swap_input_size: int = int(self.cfg.get("restoration", "swap_input_size", default=128))
-        self.swap_provider: str = str(self.cfg.get("restoration", "swap_provider", default="auto") or "auto").lower()
-        self.face_enhancer_model_path: str = cfg_path(self.cfg, ("restoration", "face_enhancer_model_path"), default="")
-        self.face_enhancer_blend: int = int(self.cfg.get("restoration", "face_enhancer_blend", default=80))
-        self.rest_max_clip_length: int = int(self.cfg.get("restoration", "max_clip_length", default=30))
+        use_face_restoration_cfg = self.process == "face"
+        if use_face_restoration_cfg:
+            rest_paths = [("face_restoration", "rest_model_path"), ("restoration", "rest_model_path")]
+            fp16_rest_paths = [("face_restoration", "fp16"), ("restoration", "fp16")]
+            max_clip_paths = [("face_restoration", "max_clip_length"), ("restoration", "max_clip_length")]
+            clip_size_paths = [("face_restoration", "clip_size"), ("restoration", "clip_size")]
+            border_paths = [("face_restoration", "border_ratio"), ("restoration", "border_ratio")]
+            pad_paths = [("face_restoration", "pad_mode"), ("restoration", "pad_mode")]
+        else:
+            rest_paths = [("mosaic_restoration", "rest_model_path"), ("restoration", "rest_model_path")]
+            fp16_rest_paths = [("mosaic_restoration", "fp16"), ("restoration", "fp16")]
+            max_clip_paths = [("mosaic_restoration", "max_clip_length"), ("restoration", "max_clip_length")]
+            clip_size_paths = [("mosaic_restoration", "clip_size"), ("restoration", "clip_size")]
+            border_paths = [("mosaic_restoration", "border_ratio"), ("restoration", "border_ratio")]
+            pad_paths = [("mosaic_restoration", "pad_mode"), ("restoration", "pad_mode")]
 
-        self.rest_clip_size: int = int(self.cfg.get("restoration", "clip_size", default=256))
-        self.rest_border_ratio: float = float(self.cfg.get("restoration", "border_ratio", default=0.06))
-        self.rest_pad_mode: str = str(self.cfg.get("restoration", "pad_mode", default="reflect"))
-        self.feather_radius: int = int(self.cfg.get("restoration", "feather_radius", default=0))
-        self.rest_blendmask: str = str(self.cfg.get("restoration", "blendmask", default="none") or "none").lower()
+        self.rest_model: str = str(cfg_first(self.cfg, rest_paths, default="") or "")
+        self.rest_fp16: bool = bool(cfg_first(self.cfg, fp16_rest_paths, default=True))
+        self.source_face_path: str = str(cfg_first(self.cfg, [("face_restoration", "source_face_path"), ("restoration", "source_face_path")], default="") or "")
+        self.swap_model_path: str = str(cfg_first(self.cfg, [("face_restoration", "swap_model_path"), ("restoration", "swap_model_path")], default="") or "")
+        self.swap_input_size: int = int(cfg_first(self.cfg, [("face_restoration", "swap_input_size"), ("restoration", "swap_input_size")], default=128))
+        self.swap_provider: str = str(cfg_first(self.cfg, [("face_restoration", "provider"), ("restoration", "swap_provider")], default="auto") or "auto").lower()
+
+        self.face_enhancer_enabled: bool = _cfg_bool(self.cfg, [("enhancement", "enabled")], default=False)
+        self.face_enhancer_model_path: str = str(cfg_first(self.cfg, [("enhancement", "model_path"), ("restoration", "face_enhancer_model_path")], default="") or "")
+        self.face_enhancer_provider: str = str(cfg_first(self.cfg, [("enhancement", "provider"), ("face_restoration", "provider"), ("restoration", "swap_provider")], default=self.swap_provider) or self.swap_provider).lower()
+        self.face_enhancer_blend: int = int(cfg_first(self.cfg, [("enhancement", "blend"), ("restoration", "face_enhancer_blend")], default=80))
+
+        self.face_occluder_enabled: bool = _cfg_bool(self.cfg, [("occlusion", "enabled")], default=False)
+        self.face_occluder_model_path: str = str(cfg_first(self.cfg, [("occlusion", "model_path")], default="") or "")
+        self.face_occluder_provider: str = str(cfg_first(self.cfg, [("occlusion", "provider"), ("face_restoration", "provider"), ("restoration", "swap_provider")], default=self.swap_provider) or self.swap_provider).lower()
+        self.face_occluder_threshold: float = float(cfg_first(self.cfg, [("occlusion", "threshold")], default=0.5))
+        self.face_occluder_blur: int = int(cfg_first(self.cfg, [("occlusion", "blur")], default=5))
+        self.face_occluder_blend: int = int(cfg_first(self.cfg, [("occlusion", "blend")], default=100))
+        self.face_occluder_invert: bool = bool(cfg_first(self.cfg, [("occlusion", "invert")], default=False))
+
+        self.landmark_refiner_enabled: bool = _cfg_bool(
+            self.cfg,
+            [("face_restoration", "landmark_refiner_enabled")],
+            default=False,
+        )
+        self.landmark_refiner_model: str = str(
+            cfg_first(self.cfg, [("face_restoration", "landmark_model")], default="2dfan4") or "2dfan4"
+        )
+        self.landmark_refiner_model_path: str = str(
+            cfg_first(self.cfg, [("face_restoration", "landmark_model_path")], default="") or ""
+        )
+        self.landmark_refiner_provider: str = str(
+            cfg_first(
+                self.cfg,
+                [("face_restoration", "landmark_provider"), ("face_restoration", "provider"), ("restoration", "swap_provider")],
+                default=self.swap_provider,
+            )
+            or self.swap_provider
+        ).lower()
+        self.landmark_refiner_score: float = float(
+            cfg_first(self.cfg, [("face_restoration", "landmark_refiner_score"), ("face_restoration", "landmark_score")], default=0.5)
+        )
+
+        self.rest_max_clip_length: int = int(cfg_first(self.cfg, max_clip_paths, default=30))
+        self.rest_clip_size: int = int(cfg_first(self.cfg, clip_size_paths, default=256))
+        self.rest_border_ratio: float = float(cfg_first(self.cfg, border_paths, default=0.06))
+        self.rest_pad_mode: str = str(cfg_first(self.cfg, pad_paths, default="reflect"))
+
+        self.feather_radius: int = int(cfg_first(self.cfg, [("mosaic_restoration", "feather_radius"), ("restoration", "feather_radius")], default=0))
+        self.rest_blendmask: str = str(cfg_first(self.cfg, [("mosaic_restoration", "blendmask"), ("restoration", "blendmask")], default="none") or "none").lower()
         if self.rest_blendmask not in ("none", "facefusion"):
             raise ValueError(f"Invalid restoration.blendmask: {self.rest_blendmask!r}")
 
         self.rest_compositor_quantize_before_resize: bool = bool(
-            self.cfg.get("restoration", "compositor_quantize_before_resize", default=False)
+            cfg_first(self.cfg, [("mosaic_restoration", "compositor_quantize_before_resize"), ("restoration", "compositor_quantize_before_resize")], default=False)
         )
         self.rest_compositor_resize_backend: str = str(
-            self.cfg.get("restoration", "compositor_resize_backend", default="torch") or "torch"
+            cfg_first(self.cfg, [("mosaic_restoration", "compositor_resize_backend"), ("restoration", "compositor_resize_backend")], default="torch") or "torch"
         ).lower()
 
         self.analysis_use_synth_rois: bool = bool(
-            self.cfg.get("restoration", "analysis_use_synth_rois", default=False)
+            cfg_first(
+                self.cfg,
+                [("mosaic_restoration", "analysis_use_synth_rois"), ("restoration", "analysis_use_synth_rois")],
+                default=False,
+            )
         )
         _raw_synth_rois = self.cfg.get("synth_mosaic", "rois", default=[]) or []
         self.analysis_synth_rois: List[Tuple[int, int, int, int]] = []
@@ -288,7 +423,7 @@ class Pipeline:
         except Exception:
             self.analysis_synth_rois = []
 
-        self.store_max_frames: int = int(self.cfg.get("store_max_frames", default=0))
+        self.store_max_frames: int = int(cfg_first(self.cfg, [("runtime", "store_max_frames"), ("store_max_frames",)], default=0))
 
         self.enc_codec: str = str(self.cfg.get("encoder", "codec", default="hevc")).lower()
         self.enc_preset: str = str(self.cfg.get("encoder", "preset", default="P6"))
@@ -308,11 +443,54 @@ class Pipeline:
         self.mux_extra_args: str = str(self.cfg.get("encoder", "mux_extra_args", default="") or "")
         self.mp4_faststart: bool = bool(self.cfg.get("encoder", "mp4_faststart", default=True))
 
-        self.fs_trace_enabled: bool = str(os.getenv("GR_FS_TRACE", "0")).strip().lower() not in ("", "0", "false", "no")
-        self.fs_trace_dir: Path = Path(os.getenv("GR_FS_TRACE_DIR", "fs_debug"))
+        self.fs_trace_enabled: bool = _cfg_bool(
+            self.cfg,
+            [("debug", "face_swap", "trace"), ("debug", "face_swap", "trace_enabled")],
+            env_name="GR_FS_TRACE",
+            default=False,
+        )
+        self.fs_trace_dir: Path = Path(
+            _cfg_str(
+                self.cfg,
+                [("debug", "face_swap", "trace_dir")],
+                env_name="GR_FS_TRACE_DIR",
+                default="fs_debug",
+            )
+        )
         self.fs_trace_detector_path: Path = self.fs_trace_dir / "detector_rois.jsonl"
         if self.fs_trace_enabled:
             self.fs_trace_dir.mkdir(parents=True, exist_ok=True)
+
+        self.fs_debug_enabled: bool = _cfg_bool(
+            self.cfg,
+            [("debug", "face_swap", "enabled"), ("debug", "face_swap", "debug_images")],
+            env_name="GR_FS_DEBUG",
+            default=False,
+        )
+        self.fs_debug_dir: str = _cfg_str(
+            self.cfg,
+            [("debug", "face_swap", "debug_dir")],
+            env_name="GR_FS_DEBUG_DIR",
+            default="fs_debug",
+        )
+        self.fs_debug_start: int = _cfg_int(
+            self.cfg,
+            [("debug", "face_swap", "debug_start")],
+            env_name="GR_FS_DEBUG_START",
+            default=-1,
+        )
+        self.fs_debug_end: int = _cfg_int(
+            self.cfg,
+            [("debug", "face_swap", "debug_end")],
+            env_name="GR_FS_DEBUG_END",
+            default=-1,
+        )
+        self.fs_material_mad: float = _cfg_float(
+            self.cfg,
+            [("debug", "face_swap", "material_mad")],
+            env_name="GR_FS_MATERIAL_MAD",
+            default=1.0,
+        )
 
     def _build_detector(self):
         if self.mode == "none":
@@ -320,8 +498,7 @@ class Pipeline:
         if not self.det_model:
             raise FileNotFoundError("Detector model path is empty (check config.json or --det-model)")
 
-        det_type = str(self.cfg.get("detection", "det_type", default="yolo") or "yolo").lower()
-        print(f"[Detector] type={det_type}")
+        print(f"[Detector] type={self.det_type}")
 
         common = dict(
             model_path=self.det_model,
@@ -332,15 +509,15 @@ class Pipeline:
             fp16=self.det_fp16,
         )
 
-        if det_type == "yolo":
+        if self.det_type == "yolo":
             return YoloDetector(**common)
-        elif det_type in ("lada-yolo", "lada_yolo"):
+        elif self.det_type in ("lada-yolo", "lada_yolo"):
             from gRestorer.detector.lada_yolo import LadaYoloDetector
             return LadaYoloDetector(**common)
-        elif det_type == "face":
-            return FaceDetector(**common)
+        elif self.det_type == "face":
+            return FaceDetector(**common, suppress_onnx_warnings=self.face_det_suppress_onnx_warnings)
         else:
-            raise ValueError(f"Unknown detector_type: {det_type}")
+            raise ValueError(f"Unknown detector_type: {self.det_type}")
 
     def _build_restorer(self):
         if self.mode == "none":
@@ -366,8 +543,27 @@ class Pipeline:
                 swap_model_path=self.swap_model_path,
                 swap_input_size=self.swap_input_size,
                 provider=self.swap_provider,
+                face_enhancer_enabled=self.face_enhancer_enabled,
                 face_enhancer_model_path=self.face_enhancer_model_path,
+                face_enhancer_provider=self.face_enhancer_provider,
                 face_enhancer_blend=self.face_enhancer_blend,
+                face_occluder_enabled=self.face_occluder_enabled,
+                face_occluder_model_path=self.face_occluder_model_path,
+                face_occluder_provider=self.face_occluder_provider,
+                face_occluder_threshold=self.face_occluder_threshold,
+                face_occluder_blur=self.face_occluder_blur,
+                face_occluder_blend=self.face_occluder_blend,
+                face_occluder_invert=self.face_occluder_invert,
+                landmark_refiner_enabled=self.landmark_refiner_enabled,
+                landmark_model=self.landmark_refiner_model,
+                landmark_model_path=self.landmark_refiner_model_path,
+                landmark_provider=self.landmark_refiner_provider,
+                landmark_score=self.landmark_refiner_score,
+                debug_enabled=self.fs_debug_enabled,
+                debug_dir=self.fs_debug_dir,
+                debug_start=self.fs_debug_start,
+                debug_end=self.fs_debug_end,
+                material_change_mad_threshold=self.fs_material_mad,
             )
 
         if not self.rest_model:
@@ -939,6 +1135,7 @@ class Pipeline:
                 elapsed = metrics.wall_end - metrics.wall_start
                 print(f"[Pipeline] Wall clock: start={metrics.wall_start} end={metrics.wall_end} elapsed={elapsed}")
             print(f"[Pipeline] perf_counter elapsed = {t_total_with_mux:.2f}s")
+            self._print_face_swap_stats(restorer)
 
             if tc_path and not is_vfr:
                 try:
