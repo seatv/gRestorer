@@ -18,6 +18,7 @@ from gRestorer.restorer.face_occluder import FaceOccluder
 from gRestorer.restorer.face_landmarker import FaceLandmarker
 
 
+
 @dataclass
 class FaceSwapRestoreStats:
     clips_processed: int = 0
@@ -29,6 +30,11 @@ class FaceSwapRestoreStats:
     frames_landmarker_called: int = 0
     frames_landmarker_returned: int = 0
     frames_landmarker_failed: int = 0
+    frames_selector_called: int = 0
+    frames_selector_candidates_found: int = 0
+    frames_selector_replaced: int = 0
+    frames_selector_kept: int = 0
+    frames_selector_no_viable: int = 0
     frames_worker_called: int = 0
     frames_worker_returned: int = 0
     frames_worker_returned_none: int = 0
@@ -61,6 +67,7 @@ class FaceSwapClipRestorer(BaseClipRestorer):
     Policy lives here:
       - choose/stabilize the target face track within a clip
       - optional landmark refinement for the already chosen target face
+      - optional peer-normalized helper crop for contaminated ROI cases
       - repad/resize behavior for the clip interface
 
     Worker contract:
@@ -304,12 +311,179 @@ class FaceSwapClipRestorer(BaseClipRestorer):
 
         return selected
 
+    @staticmethod
+    def _clone_face_meta(face_meta: FaceMetadata) -> FaceMetadata:
+        kps = None
+        if face_meta.kps is not None:
+            kps = face_meta.kps.clone().to(dtype=torch.float32)
+        return FaceMetadata(
+            bbox_xyxy=tuple(float(v) for v in face_meta.bbox_xyxy),
+            kps=kps,
+            det_score=face_meta.det_score,
+        )
+
+
+    @staticmethod
+    def _face_metrics(face_meta: FaceMetadata, crop_shape: tuple[int, int, int]) -> dict[str, float]:
+        crop_h, crop_w = int(crop_shape[0]), int(crop_shape[1])
+        x1, y1, x2, y2 = [float(v) for v in face_meta.bbox_xyxy]
+        face_w = max(1.0, x2 - x1)
+        face_h = max(1.0, y2 - y1)
+        area = face_w * face_h
+        crop_area = float(max(1, crop_h * crop_w))
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        crop_cx = 0.5 * crop_w
+        crop_cy = 0.5 * crop_h
+        dx = cx - crop_cx
+        dy = cy - crop_cy
+        half_diag = max(1e-6, float(np.hypot(0.5 * crop_w, 0.5 * crop_h)))
+        center_dist_norm = float(np.hypot(dx, dy) / half_diag)
+        return {
+            "face_w": face_w,
+            "face_h": face_h,
+            "area": area,
+            "area_ratio": float(area / crop_area),
+            "w_ratio": float(face_w / max(1, crop_w)),
+            "h_ratio": float(face_h / max(1, crop_h)),
+            "center_dist_norm": center_dist_norm,
+        }
+
+    @staticmethod
+    def _face_from_app_candidate(candidate) -> Optional[FaceMetadata]:
+        try:
+            bbox = getattr(candidate, "bbox", None)
+            if bbox is None or len(bbox) < 4:
+                return None
+            x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+            kps = getattr(candidate, "kps", None)
+            if kps is not None:
+                kps = torch.as_tensor(np.asarray(kps, dtype=np.float32)).clone()
+            det_score = getattr(candidate, "det_score", None)
+            if det_score is not None:
+                det_score = float(det_score)
+            return FaceMetadata(
+                bbox_xyxy=(x1, y1, x2, y2),
+                kps=kps,
+                det_score=det_score,
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _selector_should_run(face_meta: FaceMetadata, crop_np: np.ndarray) -> tuple[bool, str]:
+        m = FaceSwapClipRestorer._face_metrics(face_meta, crop_np.shape)
+        suspicious = (
+            m["area_ratio"] < 0.05
+            or m["w_ratio"] < 0.18
+            or m["h_ratio"] < 0.18
+        )
+        if suspicious:
+            return True, (
+                f"suspicious_current:"
+                f"area_ratio={m['area_ratio']:.4f} "
+                f"w_ratio={m['w_ratio']:.4f} "
+                f"h_ratio={m['h_ratio']:.4f}"
+            )
+        return False, (
+            f"current_ok:"
+            f"area_ratio={m['area_ratio']:.4f} "
+            f"w_ratio={m['w_ratio']:.4f} "
+            f"h_ratio={m['h_ratio']:.4f}"
+        )
+
+    @staticmethod
+    def _selector_score(face_meta: FaceMetadata, crop_np: np.ndarray) -> float:
+        m = FaceSwapClipRestorer._face_metrics(face_meta, crop_np.shape)
+        det_score = float(face_meta.det_score) if face_meta.det_score is not None else 1.0
+        return (
+            2.0 * m["area_ratio"]
+            + 0.05 * det_score
+            - 0.15 * m["center_dist_norm"]
+        )
+
+    def _run_target_face_selector(
+        self,
+        crop_np: np.ndarray,
+        current_face_meta: FaceMetadata,
+        frame_num: int,
+    ) -> tuple[FaceMetadata, str]:
+        should_run, why = self._selector_should_run(current_face_meta, crop_np)
+        if not should_run:
+            return current_face_meta, f"selector_skip:{why}"
+
+        self.stats.frames_selector_called += 1
+        try:
+            raw_candidates = self.worker._app.get(crop_np)  # reuse worker's FaceAnalysis stack
+        except Exception as e:
+            self._save_debug_text(frame_num, f"selector_exception={e!r}")
+            self.stats.frames_selector_no_viable += 1
+            return current_face_meta, "selector_error"
+
+        candidates: list[FaceMetadata] = []
+        for cand in raw_candidates or []:
+            fm = self._face_from_app_candidate(cand)
+            if fm is not None:
+                candidates.append(fm)
+
+        self.stats.frames_selector_candidates_found += len(candidates)
+        if not candidates:
+            self.stats.frames_selector_no_viable += 1
+            return current_face_meta, "selector_no_candidates"
+
+        viable: list[tuple[float, FaceMetadata, dict[str, float]]] = []
+        for cand in candidates:
+            m = self._face_metrics(cand, crop_np.shape)
+            if m["area_ratio"] < 0.015:
+                continue
+            score = self._selector_score(cand, crop_np)
+            viable.append((score, cand, m))
+
+        if not viable:
+            self.stats.frames_selector_no_viable += 1
+            return current_face_meta, "selector_no_viable"
+
+        viable.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_face, best_metrics = viable[0]
+
+        cur_metrics = self._face_metrics(current_face_meta, crop_np.shape)
+        cur_score = self._selector_score(current_face_meta, crop_np)
+        area_gain = best_metrics["area"] / max(1.0, cur_metrics["area"])
+
+        replace = (
+            (cur_metrics["area_ratio"] < 0.05 and area_gain >= 3.0)
+            or (best_score > cur_score + 0.10 and area_gain >= 1.5)
+        )
+
+        if replace:
+            self.stats.frames_selector_replaced += 1
+            return best_face, (
+                f"selector_replaced:"
+                f"cur_area_ratio={cur_metrics['area_ratio']:.4f} "
+                f"best_area_ratio={best_metrics['area_ratio']:.4f} "
+                f"area_gain={area_gain:.2f} "
+                f"cur_score={cur_score:.4f} "
+                f"best_score={best_score:.4f}"
+            )
+
+        self.stats.frames_selector_kept += 1
+        return current_face_meta, (
+            f"selector_kept:"
+            f"cur_area_ratio={cur_metrics['area_ratio']:.4f} "
+            f"best_area_ratio={best_metrics['area_ratio']:.4f} "
+            f"area_gain={area_gain:.2f} "
+            f"cur_score={cur_score:.4f} "
+            f"best_score={best_score:.4f}"
+        )
+
     def get_stats_lines(self) -> List[str]:
         return [
             f"[FaceSwapStats] clips_processed={self.stats.clips_processed} frames_total={self.stats.frames_total}",
             f"[FaceSwapStats] detector_face_meta frames={self.stats.frames_with_detector_face_meta}/{self.stats.frames_total} missing={self.stats.frames_without_detector_face_meta}",
             f"[FaceSwapStats] gap_fill forward={self.stats.frames_gap_filled_forward} backward={self.stats.frames_gap_filled_backward}",
             f"[FaceSwapStats] landmarker_called={self.stats.frames_landmarker_called} returned={self.stats.frames_landmarker_returned} failed={self.stats.frames_landmarker_failed}",
+            f"[FaceSwapStats] selector_called={self.stats.frames_selector_called} candidates_found={self.stats.frames_selector_candidates_found} replaced={self.stats.frames_selector_replaced}",
+            f"[FaceSwapStats] selector_kept={self.stats.frames_selector_kept} selector_no_viable={self.stats.frames_selector_no_viable}",
             f"[FaceSwapStats] worker_called={self.stats.frames_worker_called} returned={self.stats.frames_worker_returned} returned_none={self.stats.frames_worker_returned_none}",
             f"[FaceSwapStats] materially_changed={self.stats.frames_materially_changed} mad_threshold={self.material_change_mad_threshold:.3f} avg_mad={self.stats.avg_mean_abs_diff():.4f}",
             f"[FaceSwapStats] enhancer_called={self.stats.frames_enhancer_called} returned={self.stats.frames_enhancer_returned} failed={self.stats.frames_enhancer_failed}",
@@ -317,6 +491,7 @@ class FaceSwapClipRestorer(BaseClipRestorer):
             f"[FaceSwapStats] occluder_called={self.stats.frames_occluder_called} returned={self.stats.frames_occluder_returned} failed={self.stats.frames_occluder_failed}",
             f"[FaceSwapStats] occluder_materially_changed={self.stats.frames_occluder_materially_changed} avg_occluder_mad={self.stats.avg_occluder_mean_abs_diff():.4f}",
         ]
+
 
     @torch.inference_mode()
     def restore_clip(self, clip: Clip) -> List[torch.Tensor]:
@@ -379,11 +554,17 @@ class FaceSwapClipRestorer(BaseClipRestorer):
             swapped_np = crop_np
 
             if face_meta is not None:
-                active_face_meta = face_meta
+                original_roi = crop_np.copy()
+                before = crop_np.copy()
+                active_face_meta = self._clone_face_meta(face_meta)
+
+                active_face_meta, selector_reason = self._run_target_face_selector(crop_np, active_face_meta, frame_num)
+                self._save_debug_text(frame_num, selector_reason)
+
                 if self.landmarker is not None:
                     self.stats.frames_landmarker_called += 1
                     try:
-                        refined = self.landmarker.refine(crop_np, face_meta)
+                        refined = self.landmarker.refine(crop_np, active_face_meta)
                     except Exception as e:
                         self.stats.frames_landmarker_failed += 1
                         self._save_debug_text(frame_num, f"landmarker_exception={e!r}")
@@ -400,8 +581,6 @@ class FaceSwapClipRestorer(BaseClipRestorer):
                 if active_face_meta.kps is not None:
                     self._save_debug_text(frame_num, f"target_face_kps_shape={tuple(active_face_meta.kps.shape)}")
 
-                original_roi = crop_np.copy()
-                before = crop_np.copy()
                 self.stats.frames_worker_called += 1
                 try:
                     out = self.worker.swap(crop_np, active_face_meta)
@@ -414,53 +593,56 @@ class FaceSwapClipRestorer(BaseClipRestorer):
                     self._save_debug_text(frame_num, "swap_returned=None")
                 else:
                     self.stats.frames_worker_returned += 1
-                    mad = float(np.mean(np.abs(out.astype(np.int16) - before.astype(np.int16))))
-                    self.stats.mean_abs_diff_accum += mad
-                    material = mad >= self.material_change_mad_threshold
-                    if material:
-                        self.stats.frames_materially_changed += 1
-                    self._save_debug_text(frame_num, f"mean_abs_diff={mad:.4f} material={material}")
                     self._save_debug_image(frame_num, "03_swap", out)
-                    self._save_debug_image(frame_num, "04_diff", self._diff_image(before, out))
-                    swapped_np = out
+
+                    stage_img = out
 
                     if self.enhancer is not None:
                         self.stats.frames_enhancer_called += 1
                         try:
-                            enhanced = self.enhancer.enhance(swapped_np, active_face_meta)
+                            enhanced = self.enhancer.enhance(stage_img, active_face_meta)
                         except Exception as e:
                             self.stats.frames_enhancer_failed += 1
                             self._save_debug_text(frame_num, f"enhancer_exception={e!r}")
                             enhanced = None
                         if enhanced is not None:
                             self.stats.frames_enhancer_returned += 1
-                            emad = float(np.mean(np.abs(enhanced.astype(np.int16) - swapped_np.astype(np.int16))))
+                            emad = float(np.mean(np.abs(enhanced.astype(np.int16) - stage_img.astype(np.int16))))
                             self.stats.enhancer_mean_abs_diff_accum += emad
                             if emad >= self.material_change_mad_threshold:
                                 self.stats.frames_enhancer_materially_changed += 1
                             self._save_debug_text(frame_num, f"enhancer_mean_abs_diff={emad:.4f}")
                             self._save_debug_image(frame_num, "03b_enhanced", enhanced)
-                            self._save_debug_image(frame_num, "04b_enhancer_diff", self._diff_image(swapped_np, enhanced))
-                            swapped_np = enhanced
+                            self._save_debug_image(frame_num, "04b_enhancer_diff", self._diff_image(stage_img, enhanced))
+                            stage_img = enhanced
 
                     if self.occluder is not None:
                         self.stats.frames_occluder_called += 1
                         try:
-                            occluded = self.occluder.preserve(original_roi, swapped_np, active_face_meta)
+                            occluded = self.occluder.preserve(original_roi, stage_img, active_face_meta)
                         except Exception as e:
                             self.stats.frames_occluder_failed += 1
                             self._save_debug_text(frame_num, f"occluder_exception={e!r}")
                             occluded = None
                         if occluded is not None:
                             self.stats.frames_occluder_returned += 1
-                            omad = float(np.mean(np.abs(occluded.astype(np.int16) - swapped_np.astype(np.int16))))
+                            omad = float(np.mean(np.abs(occluded.astype(np.int16) - stage_img.astype(np.int16))))
                             self.stats.occluder_mean_abs_diff_accum += omad
                             if omad >= self.material_change_mad_threshold:
                                 self.stats.frames_occluder_materially_changed += 1
                             self._save_debug_text(frame_num, f"occluder_mean_abs_diff={omad:.4f}")
                             self._save_debug_image(frame_num, "03c_occluded", occluded)
-                            self._save_debug_image(frame_num, "04c_occluder_diff", self._diff_image(swapped_np, occluded))
-                            swapped_np = occluded
+                            self._save_debug_image(frame_num, "04c_occluder_diff", self._diff_image(stage_img, occluded))
+                            stage_img = occluded
+
+                    swapped_np = stage_img
+                    mad = float(np.mean(np.abs(swapped_np.astype(np.int16) - before.astype(np.int16))))
+                    self.stats.mean_abs_diff_accum += mad
+                    material = mad >= self.material_change_mad_threshold
+                    if material:
+                        self.stats.frames_materially_changed += 1
+                    self._save_debug_text(frame_num, f"mean_abs_diff={mad:.4f} material={material}")
+                    self._save_debug_image(frame_num, "04_diff", self._diff_image(before, swapped_np))
             else:
                 self._save_debug_text(frame_num, "target_face_source=none")
 
@@ -479,6 +661,5 @@ class FaceSwapClipRestorer(BaseClipRestorer):
             out_frames.append(self._numpy_bgr_u8_to_tensor_hwc_float(swapped_clip_np))
 
         return out_frames
-
 
 __all__ = ["FaceSwapClipRestorer"]

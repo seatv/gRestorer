@@ -18,7 +18,7 @@ from gRestorer.core.scene_tracker import SceneTracker, TrackerConfig
 from gRestorer.detector.core import Detection, Detector as YoloDetector, FaceMetadata
 from gRestorer.detector.face_detector import FaceDetector
 from gRestorer.restorer.basicvsrpp_clip_restorer import BasicVSRPPClipRestorer
-from gRestorer.restorer.compositor import _composite_clip_into_store
+from gRestorer.restorer.compositor import _composite_clip_into_store, _composite_clip_into_store_laplacian
 from gRestorer.restorer.pseudo_clip_restorer import PseudoClipRestorer
 from gRestorer.restorer.face_swap_clip_restorer import FaceSwapClipRestorer
 
@@ -396,7 +396,7 @@ class Pipeline:
 
         self.feather_radius: int = int(cfg_first(self.cfg, [("mosaic_restoration", "feather_radius"), ("restoration", "feather_radius")], default=0))
         self.rest_blendmask: str = str(cfg_first(self.cfg, [("mosaic_restoration", "blendmask"), ("restoration", "blendmask")], default="none") or "none").lower()
-        if self.rest_blendmask not in ("none", "facefusion"):
+        if self.rest_blendmask not in ("none", "facefusion", "laplacian"):
             raise ValueError(f"Invalid restoration.blendmask: {self.rest_blendmask!r}")
 
         self.rest_compositor_quantize_before_resize: bool = bool(
@@ -620,6 +620,26 @@ class Pipeline:
         if callable(get_lines):
             for line in get_lines():
                 print(line)
+
+    def _annotate_peer_crop_shapes(self, clips) -> None:
+        if not clips:
+            return
+        frame_to_shapes: dict[int, list[tuple[int, int]]] = {}
+        for clip in clips:
+            try:
+                for fn, shape in zip(clip.frame_nums, clip.crop_shapes):
+                    ch, cw = int(shape[0]), int(shape[1])
+                    frame_to_shapes.setdefault(int(fn), []).append((ch, cw))
+            except Exception:
+                continue
+        for clip in clips:
+            try:
+                peer_map: dict[int, list[tuple[int, int]]] = {}
+                for fn in clip.frame_nums:
+                    peer_map[int(fn)] = list(frame_to_shapes.get(int(fn), []))
+                setattr(clip, "peer_crop_shapes_by_frame", peer_map)
+            except Exception:
+                continue
 
     def run(self) -> None:
         inp = Path(self.input_path)
@@ -881,6 +901,7 @@ class Pipeline:
                 metrics.t_track += (time.perf_counter() - t0)
 
                 if step.new_clips and restorer is not None:
+                    self._annotate_peer_crop_shapes(step.new_clips)
                     for clip in step.new_clips:
                         t0 = time.perf_counter()
                         restored = restorer.restore_clip(clip)
@@ -892,7 +913,12 @@ class Pipeline:
                                 model_dtype=restorer.model_dtype,
                             )
                         else:
-                            _composite_clip_into_store(
+                            compositor_fn = (
+                                _composite_clip_into_store_laplacian
+                                if self.rest_blendmask == "laplacian"
+                                else _composite_clip_into_store
+                            )
+                            compositor_fn(
                                 clip=clip,
                                 restored_frames=restored,
                                 store_bgr_u8=store.frames_bgr_u8,
@@ -1052,7 +1078,9 @@ class Pipeline:
                 raise prod_exc["e"]
 
             if tracker is not None and restorer is not None:
-                for clip in tracker.flush_eof():
+                eof_clips = tracker.flush_eof()
+                self._annotate_peer_crop_shapes(eof_clips)
+                for clip in eof_clips:
                     restored = restorer.restore_clip(clip)
                     if use_lada_restoration:
                         composite_lada_clip_into_store(
@@ -1062,7 +1090,12 @@ class Pipeline:
                             model_dtype=restorer.model_dtype,
                         )
                     else:
-                        _composite_clip_into_store(
+                        compositor_fn = (
+                            _composite_clip_into_store_laplacian
+                            if self.rest_blendmask == "laplacian"
+                            else _composite_clip_into_store
+                        )
+                        compositor_fn(
                             clip=clip,
                             restored_frames=restored,
                             store_bgr_u8=store.frames_bgr_u8,

@@ -110,7 +110,8 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--rest-border-ratio", type=float, default=None)
     p.add_argument("--rest-pad-mode", default=None)
     p.add_argument("--rest-feather-radius", type=int, default=None)
-    p.add_argument("--rest-blendmask", choices=["none", "facefusion"], default=None)
+    p.add_argument("--rest-blendmask", choices=["none", "facefusion", "laplacian"], default=None)
+    p.add_argument("--laplacian", action="store_true", help="Use laplacian pyramid compositor (sets --rest-blendmask laplacian)")
     p.add_argument("--source-face", default=None, help="Source/reference face image for face_swap restorer")
     p.add_argument("--swap-model", default=None, help="ONNX face swap model path")
     p.add_argument("--swap-input-size", type=int, default=None)
@@ -270,112 +271,26 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("encoder", "mux_extra_args"), args.mux_extra_args)
     _set_if_not_none(cfg, ("encoder", "mp4_faststart"), args.mp4_fast_start)
 
-    # Detection
-    _set_many_if_not_none(
-        cfg,
-        [
-            ("detection", "det_type"),
-            ("mosaic_detection", "det_type"),
-            ("face_detection", "det_type"),
-        ],
-        args.det_type,
-    )
-    _set_many_if_not_none(
-        cfg,
-        [
-            ("detection", "model_path"),
-            ("mosaic_detection", "model_path"),
-            ("face_detection", "model_path"),
-        ],
-        args.det_model,
-    )
-    _set_many_if_not_none(
-        cfg,
-        [
-            ("detection", "batch_size"),
-            ("mosaic_detection", "batch_size"),
-            ("face_detection", "batch_size"),
-        ],
-        args.det_batch_size,
-    )
-    _set_many_if_not_none(
-        cfg,
-        [
-            ("detection", "conf_threshold"),
-            ("mosaic_detection", "conf_threshold"),
-            ("face_detection", "conf_threshold"),
-        ],
-        args.det_conf,
-    )
-    _set_many_if_not_none(
-        cfg,
-        [
-            ("detection", "iou_threshold"),
-            ("mosaic_detection", "iou_threshold"),
-            ("face_detection", "iou_threshold"),
-        ],
-        args.det_iou,
-    )
-    _set_many_if_not_none(
-        cfg,
-        [
-            ("detection", "imgsz"),
-            ("mosaic_detection", "imgsz"),
-            ("face_detection", "imgsz"),
-        ],
-        args.det_imgsz,
-    )
-    _set_many_if_not_none(
-        cfg,
-        [
-            ("detection", "fp16"),
-            ("mosaic_detection", "fp16"),
-            ("face_detection", "fp16"),
-        ],
-        args.det_fp16,
-    )
+    _set_many_if_not_none(cfg, [("detection", "det_type"), ("mosaic_detection", "det_type"), ("face_detection", "det_type")], args.det_type)
+    _set_many_if_not_none(cfg, [("detection", "model_path"), ("mosaic_detection", "model_path"), ("face_detection", "model_path")], args.det_model)
+    _set_many_if_not_none(cfg, [("detection", "batch_size"), ("mosaic_detection", "batch_size"), ("face_detection", "batch_size")], args.det_batch_size)
+    _set_many_if_not_none(cfg, [("detection", "conf_threshold"), ("mosaic_detection", "conf_threshold"), ("face_detection", "conf_threshold")], args.det_conf)
+    _set_many_if_not_none(cfg, [("detection", "iou_threshold"), ("mosaic_detection", "iou_threshold"), ("face_detection", "iou_threshold")], args.det_iou)
+    _set_many_if_not_none(cfg, [("detection", "imgsz"), ("mosaic_detection", "imgsz"), ("face_detection", "imgsz")], args.det_imgsz)
+    _set_many_if_not_none(cfg, [("detection", "fp16"), ("mosaic_detection", "fp16"), ("face_detection", "fp16")], args.det_fp16)
 
     # Restoration
     _set_many_if_not_none(cfg, [("restoration", "rest_model_path"), ("mosaic_restoration", "rest_model_path")], args.rest_model)
     _set_many_if_not_none(cfg, [("restoration", "fp16"), ("mosaic_restoration", "fp16")], args.rest_fp16)
-    _set_many_if_not_none(
-        cfg,
-        [
-            ("restoration", "max_clip_length"),
-            ("mosaic_restoration", "max_clip_length"),
-            ("face_restoration", "max_clip_length"),
-        ],
-        args.rest_max_clip_length,
-    )
-    _set_many_if_not_none(
-        cfg,
-        [
-            ("restoration", "clip_size"),
-            ("mosaic_restoration", "clip_size"),
-            ("face_restoration", "clip_size"),
-        ],
-        args.rest_clip_size,
-    )
-    _set_many_if_not_none(
-        cfg,
-        [
-            ("restoration", "border_ratio"),
-            ("mosaic_restoration", "border_ratio"),
-            ("face_restoration", "border_ratio"),
-        ],
-        args.rest_border_ratio,
-    )
-    _set_many_if_not_none(
-        cfg,
-        [
-            ("restoration", "pad_mode"),
-            ("mosaic_restoration", "pad_mode"),
-            ("face_restoration", "pad_mode"),
-        ],
-        args.rest_pad_mode,
-    )
+    _set_many_if_not_none(cfg, [("restoration", "max_clip_length"), ("mosaic_restoration", "max_clip_length"), ("face_restoration", "max_clip_length")], args.rest_max_clip_length)
+    _set_many_if_not_none(cfg, [("restoration", "clip_size"), ("mosaic_restoration", "clip_size"), ("face_restoration", "clip_size")], args.rest_clip_size)
+    _set_many_if_not_none(cfg, [("restoration", "border_ratio"), ("mosaic_restoration", "border_ratio"), ("face_restoration", "border_ratio")], args.rest_border_ratio)
+    _set_many_if_not_none(cfg, [("restoration", "pad_mode"), ("mosaic_restoration", "pad_mode"), ("face_restoration", "pad_mode")], args.rest_pad_mode)
     _set_many_if_not_none(cfg, [("restoration", "feather_radius"), ("mosaic_restoration", "feather_radius")], args.rest_feather_radius)
     _set_many_if_not_none(cfg, [("restoration", "blendmask"), ("mosaic_restoration", "blendmask")], args.rest_blendmask)
+    if args.laplacian:
+        cfg.set("restoration", "blendmask", value="laplacian")
+        cfg.set("mosaic_restoration", "blendmask", value="laplacian")
     _set_many_if_not_none(cfg, [("restoration", "source_face_path"), ("face_restoration", "source_face_path")], args.source_face)
     _set_many_if_not_none(cfg, [("restoration", "swap_model_path"), ("face_restoration", "swap_model_path")], args.swap_model)
     _set_many_if_not_none(cfg, [("restoration", "swap_input_size"), ("face_restoration", "swap_input_size")], args.swap_input_size)

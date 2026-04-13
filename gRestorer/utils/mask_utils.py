@@ -196,3 +196,60 @@ def box_to_mask(box: Box, shape, mask_value: int):
     t, l, b, r = box
     mask[t:b + 1, l:r + 1] = mask_value
     return mask
+
+
+def laplacian_pyramid_blend(
+    original: torch.Tensor, 
+    swapped: torch.Tensor, 
+    mask: torch.Tensor, 
+    levels: int = 4
+) -> torch.Tensor:
+    """
+    Performs multi-band blending using Laplacian pyramids.
+    original/swapped: [H, W, C] float32 tensors [0,1]
+    mask: [H, W, 1] float32 tensor [0,1]
+    """
+    # Move to BCHW for PyTorch operations
+    o = original.permute(2, 0, 1).unsqueeze(0)
+    s = swapped.permute(2, 0, 1).unsqueeze(0)
+    m = mask.permute(2, 0, 1).unsqueeze(0)
+
+    def build_gauss(img, lvls):
+        G = [img]
+        for i in range(lvls):
+            # Anti-aliasing blur + downsample
+            down = F.interpolate(G[i], scale_factor=0.5, mode='bilinear', align_corners=False)
+            G.append(down)
+        return G
+
+    def build_laplacian(G, lvls):
+        L = []
+        for i in range(lvls):
+            size = (G[i].shape[2], G[i].shape[3])
+            # Upsample the lower level to match current level size
+            ge = F.interpolate(G[i+1], size=size, mode='bilinear', align_corners=False)
+            L.append(G[i] - ge)
+        L.append(G[lvls])
+        return L
+
+    # Build pyramids
+    gauss_o = build_gauss(o, levels)
+    gauss_s = build_gauss(s, levels)
+    gauss_m = build_gauss(m, levels)
+    
+    lap_o = build_laplacian(gauss_o, levels)
+    lap_s = build_laplacian(gauss_s, levels)
+    
+    # Blend each level of the Laplacian pyramid using the Gaussian mask pyramid
+    blended_lap = []
+    for i in range(levels + 1):
+        blended = lap_s[i] * gauss_m[i] + lap_o[i] * (1.0 - gauss_m[i])
+        blended_lap.append(blended)
+        
+    # Reconstruct
+    res = blended_lap[levels]
+    for i in range(levels - 1, -1, -1):
+        size = (blended_lap[i].shape[2], blended_lap[i].shape[3])
+        res = F.interpolate(res, size=size, mode='bilinear', align_corners=False) + blended_lap[i]
+        
+    return res.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0)
