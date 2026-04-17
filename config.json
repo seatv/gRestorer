@@ -72,7 +72,7 @@
 		"suppress_onnx_warnings": true
 	},
 	"face_restoration": {
-		"source_face_path": "D:\\FaceFusion\\real-photo.jpg",
+		"source_face_path": "D:\\FaceFusion\\source-image.jpg",
 		"swap_model_path": "D:\\Models\\face\\inswapper_128.onnx",
 		"swap_input_size": 128,
 		"swap_provider": "cuda",
@@ -93,12 +93,12 @@
 		"blend": 80
 	},
 	"occlusion": {
-		"enabled": false,
+		"enabled": true,
 		"model_path": "D:\\Models\\face\\xseg_2.onnx",
 		"threshold": 0.5,
 		"blur": 5,
 		"blend": 100,
-		"invert": false
+		"invert": true
 	},
 	"scene_tracking": {
 		"min_iou": 0.3,

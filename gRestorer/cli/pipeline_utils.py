@@ -354,11 +354,25 @@ def _get_debug_frames() -> set[int]:
 
     raw = str(os.getenv("GR_CORRUPT_DUMP_FRAMES", "") or "").strip()
     out: set[int] = set()
+
     if raw:
         for part in raw.replace(";", ",").split(","):
             part = part.strip()
             if not part:
                 continue
+
+            # support ranges like 1508-1514
+            if "-" in part:
+                try:
+                    a_str, b_str = part.split("-", 1)
+                    a = int(a_str.strip())
+                    b = int(b_str.strip())
+                    lo, hi = (a, b) if a <= b else (b, a)
+                    out.update(range(lo, hi + 1))
+                    continue
+                except Exception:
+                    pass
+
             try:
                 out.add(int(part))
             except Exception:
@@ -435,15 +449,31 @@ def drain_store_to_encoder(
     sync_before_encode: bool = True,
     pts_log: Optional[List[Tuple[int, Optional[int]]]] = None,
 ) -> int:
-
     """
     Encode and remove all frames with frame_num < safe_before.
     Returns number of frames encoded.
 
-    Notes:
-      - Keeps optional one-sync-per-drain behavior.
-      - Per-frame ownership/safety is handled inside Encoder.encode_frame().
+    Env controls:
+      GR_SKIP_ENCODE_FRAME=1511
+          Skip exactly one frame.
+
+      GR_REPLACE_ENCODE_RANGE=1511-1516
+      GR_REPLACE_ENCODE_MODE=last_good
+          For frames in that range, encode the last successfully encoded BGRA
+          frame instead of the current processed frame.
     """
+
+    def _parse_range(raw: str) -> Optional[Tuple[int, int]]:
+        raw = str(raw or "").strip()
+        if not raw:
+            return None
+        if "-" in raw:
+            a_str, b_str = raw.split("-", 1)
+            a = int(a_str.strip())
+            b = int(b_str.strip())
+            return (a, b) if a <= b else (b, a)
+        v = int(raw)
+        return (v, v)
 
     keys = store.keys_sorted()
     drain_keys = [k for k in keys if k < safe_before]
@@ -453,18 +483,106 @@ def drain_store_to_encoder(
     if sync_before_encode:
         sync_device(device)
 
+    skip_raw = str(os.getenv("GR_SKIP_ENCODE_FRAME", "") or "").strip()
+    skip_frame = int(skip_raw) if skip_raw else None
+
+    replace_range = _parse_range(os.getenv("GR_REPLACE_ENCODE_RANGE", ""))
+    replace_mode = str(os.getenv("GR_REPLACE_ENCODE_MODE", "last_good") or "last_good").strip().lower()
+
     count = 0
+    last_ok: Optional[int] = None
+    last_good_bgra: Optional[torch.Tensor] = None
+
     for k in drain_keys:
         frm_bgr, pts = store.pop_with_pts(k)
         _maybe_dump_preencode_frame(k, frm_bgr, pts)
+
         if pts_log is not None:
             pts_log.append((k, pts))
 
         bgra = bgr_u8_to_bgra_u8(frm_bgr).contiguous()
-        encoder.encode_frame(bgra)
-        count += 1
+
+        if _debug_enabled() and int(k) in _get_debug_frames():
+            print(f"[EncProbe] encoding frame={int(k)} pts={pts}")
+
+        try:
+            if skip_frame is not None and int(k) == skip_frame:
+                print(f"[EncProbe] SKIPPING frame={int(k)} pts={pts}")
+                last_ok = int(k)
+                count += 1
+                continue
+
+            in_replace_range = (
+                replace_range is not None
+                and replace_range[0] <= int(k) <= replace_range[1]
+            )
+
+            if in_replace_range:
+                if replace_mode != "last_good":
+                    raise ValueError(
+                        f"Unsupported GR_REPLACE_ENCODE_MODE={replace_mode!r}; only 'last_good' is supported"
+                    )
+                if last_good_bgra is None:
+                    raise RuntimeError(
+                        f"GR_REPLACE_ENCODE_RANGE hit frame={int(k)} before any last_good_bgra was available"
+                    )
+
+                print(f"[EncProbe] REPLACING frame={int(k)} with last_good_bgra from frame={last_ok}")
+                encoder.encode_frame(last_good_bgra.clone().contiguous())
+                last_ok = int(k)
+                count += 1
+                continue
+
+            encoder.encode_frame(bgra)
+
+            last_good_bgra = bgra.clone().contiguous()
+            last_ok = int(k)
+            count += 1
+
+        except Exception as e:
+            dump_dir = _get_debug_dump_dir()
+
+            if dump_dir is not None:
+                try:
+                    xbgr = frm_bgr.detach()
+                    if xbgr.device.type != "cpu":
+                        xbgr = xbgr.cpu()
+                    arr_bgr = xbgr.contiguous().numpy()
+                    cv2.imwrite(str(dump_dir / f"FAILED_preencode_f{int(k):06d}.png"), arr_bgr)
+
+                    xbgra = bgra.detach()
+                    if xbgra.device.type != "cpu":
+                        xbgra = xbgra.cpu()
+                    arr_bgra = xbgra.contiguous().numpy()
+                    cv2.imwrite(str(dump_dir / f"FAILED_bgra_f{int(k):06d}.png"), arr_bgra)
+
+                    checksum_bgr = int(arr_bgr.astype("uint64").sum() % (1 << 32))
+                    checksum_bgra = int(arr_bgra.astype("uint64").sum() % (1 << 32))
+
+                    with open(dump_dir / f"FAILED_f{int(k):06d}.txt", "w", encoding="utf-8") as f:
+                        f.write(f"frame_num={int(k)}\n")
+                        f.write(f"pts={pts}\n")
+                        f.write(f"last_ok={last_ok}\n")
+                        f.write(f"safe_before={int(safe_before)}\n")
+                        f.write(f"error={repr(e)}\n")
+                        f.write(f"bgr_shape={tuple(arr_bgr.shape)}\n")
+                        f.write(f"bgr_dtype={arr_bgr.dtype}\n")
+                        f.write(f"bgra_shape={tuple(arr_bgra.shape)}\n")
+                        f.write(f"bgra_dtype={arr_bgra.dtype}\n")
+                        f.write(f"device_bgr={frm_bgr.device}\n")
+                        f.write(f"device_bgra={bgra.device}\n")
+                        f.write(f"checksum32_bgr={checksum_bgr}\n")
+                        f.write(f"checksum32_bgra={checksum_bgra}\n")
+                        f.write(f"bgr_min={int(arr_bgr.min())} bgr_max={int(arr_bgr.max())}\n")
+                        f.write(f"bgra_min={int(arr_bgra.min())} bgra_max={int(arr_bgra.max())}\n")
+                except Exception as dump_e:
+                    print(f"[EncProbe] dump failed for frame={int(k)}: {dump_e!r}")
+
+            print(f"[EncProbe] FAILED on frame={int(k)} last_ok={last_ok} pts={pts}: {e!r}")
+            raise
 
     return count
+
 
 # ---------------------------------------------------------------------------
 # [CHANGE 4] Timecodes v2 file writer

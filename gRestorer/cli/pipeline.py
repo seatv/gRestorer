@@ -20,7 +20,8 @@ from gRestorer.detector.face_detector import FaceDetector
 from gRestorer.restorer.basicvsrpp_clip_restorer import BasicVSRPPClipRestorer
 from gRestorer.restorer.compositor import _composite_clip_into_store, _composite_clip_into_store_laplacian
 from gRestorer.restorer.pseudo_clip_restorer import PseudoClipRestorer
-from gRestorer.restorer.face_swap_clip_restorer import FaceSwapClipRestorer
+from gRestorer.restorer.inswapper_clip_restorer import InSwapperClipRestorer
+from gRestorer.restorer.simswap_clip_restorer import SimSwapClipRestorer
 
 from gRestorer.core.lada_clip import LadaClip
 from gRestorer.restorer.lada_basicvsrpp_clip_restorer import LadaBasicVSRPPClipRestorer
@@ -150,6 +151,18 @@ class PipelineMetrics:
         return self.t_decode + self.t_det + self.t_track + self.t_restore + self.t_encode
 
 
+
+
+def _detect_face_swap_backend(model_path: str, configured_backend: str = "auto") -> str:
+    b = str(configured_backend or "auto").strip().lower()
+    if b in ("inswapper", "simswap"):
+        return b
+    name = Path(str(model_path or "")).name.lower()
+    if "simswap" in name:
+        return "simswap"
+    return "inswapper"
+
+
 def _pick_device(gpu_id: int) -> torch.device:
     if torch.cuda.is_available():
         return torch.device(f"cuda:{gpu_id}")
@@ -256,6 +269,79 @@ def _compute_emergency_store_max(
     ceiling = max(base, min(abs_cap, cap_by_mem if cap_by_mem > 0 else abs_cap))
     return max(base, min(target, ceiling))
 
+def _device_mem_snapshot(device: torch.device) -> dict:
+    snap = {"device": str(device), "type": getattr(device, "type", "unknown")}
+    try:
+        if getattr(device, "type", None) == "cuda" and torch.cuda.is_available():
+            idx = device.index if device.index is not None else torch.cuda.current_device()
+            snap.update(
+                {
+                    "allocated_mb": round(torch.cuda.memory_allocated(idx) / (1024.0 * 1024.0), 2),
+                    "reserved_mb": round(torch.cuda.memory_reserved(idx) / (1024.0 * 1024.0), 2),
+                    "max_allocated_mb": round(torch.cuda.max_memory_allocated(idx) / (1024.0 * 1024.0), 2),
+                    "max_reserved_mb": round(torch.cuda.max_memory_reserved(idx) / (1024.0 * 1024.0), 2),
+                }
+            )
+        elif getattr(device, "type", None) == "xpu" and hasattr(torch, "xpu"):
+            mem_getter = getattr(torch.xpu, "memory_allocated", None)
+            if callable(mem_getter):
+                idx = device.index if device.index is not None else 0
+                snap["allocated_mb"] = round(float(mem_getter(idx)) / (1024.0 * 1024.0), 2)
+    except Exception as e:
+        snap["mem_error"] = repr(e)
+    return snap
+
+
+def _store_snapshot(store: FrameStore) -> dict:
+    frames = getattr(store, "frames_bgr_u8", None)
+    if not isinstance(frames, dict):
+        return {"max_frames": int(getattr(store, "max_frames", -1)), "len": None}
+
+    keys = sorted(int(k) for k in frames.keys())
+    out = {
+        "max_frames": int(getattr(store, "max_frames", -1)),
+        "len": int(len(keys)),
+        "oldest": (keys[0] if keys else None),
+        "newest": (keys[-1] if keys else None),
+        "head": keys[:4],
+        "tail": keys[-4:] if len(keys) > 4 else keys,
+    }
+    try:
+        out["est_vram_mb"] = round(float(store.vram_mb()), 2)
+    except Exception:
+        pass
+    return out
+
+
+def _tracker_snapshot(tracker) -> dict:
+    if tracker is None:
+        return {"enabled": False}
+
+    scene_count = None
+    for name in ("active_scenes", "_active_scenes", "scenes", "_scenes"):
+        value = getattr(tracker, name, None)
+        if value is None:
+            continue
+        try:
+            scene_count = len(value)
+            break
+        except Exception:
+            pass
+
+    min_active_start = None
+    try:
+        fn = getattr(tracker, "min_active_start", None)
+        if callable(fn):
+            min_active_start = fn()
+    except Exception:
+        pass
+
+    return {
+        "enabled": True,
+        "scene_count": scene_count,
+        "min_active_start": (None if min_active_start is None else int(min_active_start)),
+    }
+
 
 @dataclass
 class Pipeline:
@@ -352,6 +438,7 @@ class Pipeline:
         self.swap_model_path: str = str(cfg_first(self.cfg, [("face_restoration", "swap_model_path"), ("restoration", "swap_model_path")], default="") or "")
         self.swap_input_size: int = int(cfg_first(self.cfg, [("face_restoration", "swap_input_size"), ("restoration", "swap_input_size")], default=128))
         self.swap_provider: str = str(cfg_first(self.cfg, [("face_restoration", "provider"), ("restoration", "swap_provider")], default="auto") or "auto").lower()
+        self.swap_backend: str = str(cfg_first(self.cfg, [("face_restoration", "swap_backend"), ("restoration", "swap_backend")], default="auto") or "auto").lower()
 
         self.face_enhancer_enabled: bool = _cfg_bool(self.cfg, [("enhancement", "enabled")], default=False)
         self.face_enhancer_model_path: str = str(cfg_first(self.cfg, [("enhancement", "model_path"), ("restoration", "face_enhancer_model_path")], default="") or "")
@@ -537,7 +624,12 @@ class Pipeline:
                 raise FileNotFoundError("Source face path is empty (check config.json or --source-face)")
             if not self.swap_model_path:
                 raise FileNotFoundError("Swap model path is empty (check config.json or --swap-model)")
-            return FaceSwapClipRestorer(
+
+            swap_backend = _detect_face_swap_backend(self.swap_model_path, self.swap_backend)
+            print(f"[FaceSwap] backend={swap_backend}")
+
+            restorer_cls = SimSwapClipRestorer if swap_backend == "simswap" else InSwapperClipRestorer
+            return restorer_cls(
                 device=self.device,
                 source_face_path=self.source_face_path,
                 swap_model_path=self.swap_model_path,
@@ -735,10 +827,125 @@ class Pipeline:
         else:
             print("[FrameStore] max_frames=unlimited")
 
+        def _composite_selected(clip, restored):
+            if use_lada_restoration:
+                composite_lada_clip_into_store(
+                    clip=clip,
+                    restored_frames_u8=restored,
+                    store_bgr_u8=store.frames_bgr_u8,
+                    model_dtype=restorer.model_dtype,
+                )
+                return
+
+            if self.rest_blendmask == "laplacian":
+                _composite_clip_into_store_laplacian(
+                    clip=clip,
+                    restored_frames=restored,
+                    store_bgr_u8=store.frames_bgr_u8,
+                    feather_radius=int(self.feather_radius),
+                    quantize_before_resize=bool(self.rest_compositor_quantize_before_resize),
+                    resize_backend=str(self.rest_compositor_resize_backend),
+                )
+            else:
+                _composite_clip_into_store(
+                    clip=clip,
+                    restored_frames=restored,
+                    store_bgr_u8=store.frames_bgr_u8,
+                    feather_radius=int(self.feather_radius),
+                    quantize_before_resize=bool(self.rest_compositor_quantize_before_resize),
+                    resize_backend=str(self.rest_compositor_resize_backend),
+                    blendmask_mode=self.rest_blendmask,
+                )
+
+
         pts_log: List[Tuple[int, Optional[int]]] = []
         pbar_total = (self.max_frames if self.max_frames is not None else (total_frames if total_frames > 0 else None))
         pbar = tqdm(total=pbar_total, disable=self.debug)
         frame_num = 0
+
+        store_debug = _truthy_env("GRESTORER_DEBUG_STORE", "0")
+        store_debug_every = max(1, int(os.getenv("GRESTORER_DEBUG_STORE_EVERY", "100")))
+        store_debug_verbose = _truthy_env("GRESTORER_DEBUG_STORE_VERBOSE", "0")
+
+        def _emit_store_debug(
+            tag: str,
+            *,
+            reason: str = "",
+            safe_before: Optional[int] = None,
+            extra: Optional[dict] = None,
+        ) -> None:
+            if not store_debug:
+                return
+            payload = {
+                "tag": tag,
+                "reason": reason,
+                "frame_num": int(frame_num),
+                "safe_before": (None if safe_before is None else int(safe_before)),
+                "processed_frames": int(metrics.processed_frames),
+                "backpressure_waits": int(metrics.backpressure_waits),
+                "store": _store_snapshot(store),
+                "tracker": _tracker_snapshot(tracker),
+                "device_mem": _device_mem_snapshot(self.device),
+            }
+            if extra:
+                payload.update(extra)
+            print("[StoreDebug] " + json.dumps(payload, sort_keys=True, default=str))
+
+        def _drain_store(reason: str, safe_before: int) -> float:
+            t0_drain = time.perf_counter()
+            before = _store_snapshot(store)
+
+            if store_debug and store_debug_verbose:
+                _emit_store_debug(
+                    "pre_drain",
+                    reason=reason,
+                    safe_before=safe_before,
+                    extra={"store_before": before},
+                )
+
+            try:
+                drain_store_to_encoder(
+                    store=store,
+                    safe_before=int(safe_before),
+                    encoder=encoder,
+                    device=self.device,
+                    sync_before_encode=self.enc_sync_before_encode,
+                    pts_log=pts_log,
+                )
+            except Exception as e:
+                after_exc = _store_snapshot(store)
+                _emit_store_debug(
+                    "drain_exception",
+                    reason=reason,
+                    safe_before=safe_before,
+                    extra={
+                        "error": repr(e),
+                        "store_before": before,
+                        "store_after": after_exc,
+                    },
+                )
+                raise
+
+            elapsed = time.perf_counter() - t0_drain
+            after = _store_snapshot(store)
+            drained = None
+            if before.get("len") is not None and after.get("len") is not None:
+                drained = int(before["len"]) - int(after["len"])
+
+            if store_debug and (store_debug_verbose or drained not in (None, 0)):
+                _emit_store_debug(
+                    "post_drain",
+                    reason=reason,
+                    safe_before=safe_before,
+                    extra={
+                        "elapsed_ms": round(elapsed * 1000.0, 2),
+                        "drained": drained,
+                        "store_before": before,
+                        "store_after": after,
+                    },
+                )
+            return elapsed
+
         use_thread_prefetch = getattr(decoder, "_ffmpeg_proc", None) is not None
         stop = _threading.Event()
         prod_exc: dict[str, BaseException] = {}
@@ -905,28 +1112,7 @@ class Pipeline:
                     for clip in step.new_clips:
                         t0 = time.perf_counter()
                         restored = restorer.restore_clip(clip)
-                        if use_lada_restoration:
-                            composite_lada_clip_into_store(
-                                clip=clip,
-                                restored_frames_u8=restored,
-                                store_bgr_u8=store.frames_bgr_u8,
-                                model_dtype=restorer.model_dtype,
-                            )
-                        else:
-                            compositor_fn = (
-                                _composite_clip_into_store_laplacian
-                                if self.rest_blendmask == "laplacian"
-                                else _composite_clip_into_store
-                            )
-                            compositor_fn(
-                                clip=clip,
-                                restored_frames=restored,
-                                store_bgr_u8=store.frames_bgr_u8,
-                                feather_radius=int(self.feather_radius),
-                                quantize_before_resize=bool(self.rest_compositor_quantize_before_resize),
-                                resize_backend=str(self.rest_compositor_resize_backend),
-                                blendmask_mode=self.rest_blendmask,
-                            )
+                        _composite_selected(clip, restored)
                         metrics.t_restore += (time.perf_counter() - t0)
 
                 min_start = tracker.min_active_start()
@@ -941,16 +1127,14 @@ class Pipeline:
                 pbar.update(1)
 
             t0 = time.perf_counter()
-            drain_store_to_encoder(
-                store=store,
-                safe_before=int(safe_before_batch),
-                encoder=encoder,
-                device=self.device,
-                sync_before_encode=self.enc_sync_before_encode,
-                pts_log=pts_log,
-            )
-            metrics.t_encode += (time.perf_counter() - t0)
+            metrics.t_encode += _drain_store("batch", int(safe_before_batch))
 
+            if store_debug and (metrics.processed_frames % store_debug_every == 0):
+                _emit_store_debug(
+                    "heartbeat",
+                    reason="periodic",
+                    safe_before=int(safe_before_batch),
+                )
         try:
             if use_thread_prefetch:
                 q = _queue.Queue(maxsize=2)
@@ -1013,8 +1197,19 @@ class Pipeline:
                                         print(f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); raising max_frames {old_max}->{new_max} (~{mb:.0f} MB est in-use)")
                                     except Exception:
                                         print(f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); raising max_frames {old_max}->{new_max}")
+
+                                    _emit_store_debug(
+                                        "grow_store",
+                                        reason="backpressure_grow",
+                                        safe_before=sb,
+                                        extra={
+                                            "oldest": int(oldest),
+                                            "old_max_frames": int(old_max),
+                                            "new_max_frames": int(new_max),
+                                        },
+                                    )
                                     continue
-                        time.sleep(0.001)
+                                    time.sleep(0.001)
 
                     t0 = time.perf_counter()
                     batch = q.get()
@@ -1052,8 +1247,19 @@ class Pipeline:
                                         print(f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); raising max_frames {old_max}->{new_max} (~{mb:.0f} MB est in-use)")
                                     except Exception:
                                         print(f"[FrameStore] backpressure: active scene blocks drain (oldest={oldest}, safe_before={sb}); raising max_frames {old_max}->{new_max}")
+
+                                    _emit_store_debug(
+                                        "grow_store",
+                                        reason="backpressure_grow",
+                                        safe_before=sb,
+                                        extra={
+                                            "oldest": int(oldest),
+                                            "old_max_frames": int(old_max),
+                                            "new_max_frames": int(new_max),
+                                        },
+                                    )
                                     continue
-                        time.sleep(0.001)
+                                    time.sleep(0.001)
 
                     t0 = time.perf_counter()
                     batch0, batch_pts_raw = decoder.read_batch_with_pts()
@@ -1082,37 +1288,8 @@ class Pipeline:
                 self._annotate_peer_crop_shapes(eof_clips)
                 for clip in eof_clips:
                     restored = restorer.restore_clip(clip)
-                    if use_lada_restoration:
-                        composite_lada_clip_into_store(
-                            clip=clip,
-                            restored_frames_u8=restored,
-                            store_bgr_u8=store.frames_bgr_u8,
-                            model_dtype=restorer.model_dtype,
-                        )
-                    else:
-                        compositor_fn = (
-                            _composite_clip_into_store_laplacian
-                            if self.rest_blendmask == "laplacian"
-                            else _composite_clip_into_store
-                        )
-                        compositor_fn(
-                            clip=clip,
-                            restored_frames=restored,
-                            store_bgr_u8=store.frames_bgr_u8,
-                            feather_radius=int(self.feather_radius),
-                            quantize_before_resize=bool(self.rest_compositor_quantize_before_resize),
-                            resize_backend=str(self.rest_compositor_resize_backend),
-                            blendmask_mode=self.rest_blendmask,
-                        )
-
-            drain_store_to_encoder(
-                store=store,
-                safe_before=10**18,
-                encoder=encoder,
-                device=self.device,
-                sync_before_encode=self.enc_sync_before_encode,
-                pts_log=pts_log,
-            )
+                    _composite_selected(clip, restored)
+            _drain_store("final_flush", 10**18)
 
             t_total_no_mux = time.perf_counter() - t0_all
             tc_path: Optional[str] = None

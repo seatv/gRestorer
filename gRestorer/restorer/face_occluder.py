@@ -52,6 +52,11 @@ class FaceOccluder:
         self.input_size = self._infer_input_size(self._input.shape)
         self.input_layout = self._infer_input_layout(self._input.shape)
 
+        print(
+            f"[FaceOccluder] provider={self.provider} input_size={self.input_size} "
+            f"layout={self.input_layout} input={self._input_name} output={self._output_name}"
+        )
+
     @staticmethod
     def _providers_for(provider: str, device: torch.device) -> List[str]:
         p = str(provider or "auto").lower()
@@ -65,9 +70,23 @@ class FaceOccluder:
 
     @staticmethod
     def _infer_input_size(shape) -> int:
-        dims = [int(v) for v in shape if isinstance(v, int) and v > 0]
+        # NCHW: [N,3,H,W] -> size is W/H
+        # NHWC: [N,H,W,3] -> size is H/W, not the trailing channel dim.
+        if len(shape) == 4:
+            if isinstance(shape[1], int) and int(shape[1]) == 3:
+                hw = [int(v) for v in shape[2:] if isinstance(v, int) and int(v) > 0]
+                if hw:
+                    return int(hw[-1])
+            if isinstance(shape[-1], int) and int(shape[-1]) == 3:
+                hw = [int(v) for v in shape[1:3] if isinstance(v, int) and int(v) > 0]
+                if hw:
+                    return int(hw[-1])
+        dims = [int(v) for v in shape if isinstance(v, int) and int(v) > 0]
         if not dims:
             return 256
+        for v in reversed(dims):
+            if v > 4:
+                return int(v)
         return int(dims[-1])
 
     @staticmethod
@@ -125,32 +144,39 @@ class FaceOccluder:
         return M.astype(np.float32)
 
     def _prepare_input(self, aligned_bgr_u8: np.ndarray) -> np.ndarray:
-        rgb = cv2.cvtColor(aligned_bgr_u8, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        # XSeg-style occluder models expect the resized crop scaled to [0,1].
+        # Keep channel order as BGR; do not convert to RGB here.
+        x = aligned_bgr_u8.astype(np.float32) / 255.0
         if self.input_layout == "nchw":
-            return np.transpose(rgb, (2, 0, 1))[None, ...].astype(np.float32, copy=False)
-        return rgb[None, ...].astype(np.float32, copy=False)
+            return np.transpose(x, (2, 0, 1))[None, ...].astype(np.float32, copy=False)
+        return x[None, ...].astype(np.float32, copy=False)
 
     def _run_model(self, aligned_bgr_u8: np.ndarray) -> np.ndarray:
         inp = self._prepare_input(aligned_bgr_u8)
         out = self._session.run([self._output_name], {self._input_name: inp})[0]
-        out = np.asarray(out)
-        if out.ndim == 4:
-            out = out[0]
-        if out.ndim == 3:
-            if out.shape[0] in (1, 2, 3):
-                out = out[0] if out.shape[0] == 1 else np.max(out, axis=0)
-            elif out.shape[-1] in (1, 2, 3):
-                out = out[..., 0] if out.shape[-1] == 1 else np.max(out, axis=-1)
-        if out.ndim != 2:
-            raise RuntimeError(f"Unsupported occluder output shape: {tuple(np.asarray(out).shape)}")
+        arr = np.asarray(out)
+        if arr.ndim == 4:
+            arr = arr[0]
+        if arr.ndim == 3:
+            if arr.shape[0] in (1, 2, 3):
+                arr = arr[0] if arr.shape[0] == 1 else np.max(arr, axis=0)
+            elif arr.shape[-1] in (1, 2, 3):
+                arr = arr[..., 0] if arr.shape[-1] == 1 else np.max(arr, axis=-1)
+        if arr.ndim != 2:
+            raise RuntimeError(f"Unsupported occluder output shape: {tuple(np.asarray(arr).shape)}")
 
-        out = out.astype(np.float32)
-        if float(out.min()) < -0.25:
-            out = (out + 1.0) * 0.5
-        elif float(out.max()) > 1.25:
-            out = out / 255.0
-        out = np.clip(out, 0.0, 1.0)
-        return out
+        arr = arr.astype(np.float32)
+        # Common output conventions: logits, [-1,1], [0,255], or [0,1]
+        if float(arr.min()) < -0.25 and float(arr.max()) <= 1.25:
+            arr = (arr + 1.0) * 0.5
+        elif float(arr.max()) > 1.25:
+            # Prefer sigmoid for logits-like outputs; fall back to /255 for mask-like outputs.
+            if float(arr.max()) > 20.0 or float(arr.min()) < -2.0:
+                arr = 1.0 / (1.0 + np.exp(-arr))
+            else:
+                arr = arr / 255.0
+        arr = np.clip(arr, 0.0, 1.0)
+        return arr
 
     def _postprocess_mask(self, mask: np.ndarray) -> np.ndarray:
         if self.invert:

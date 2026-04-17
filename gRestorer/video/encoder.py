@@ -714,41 +714,50 @@ class Encoder:
         """
         Encode a single BGRA frame.
 
-        Fixes:
-          - Ensures encoder gets its own memory (no aliasing / reuse issues)
-          - Optional sync for safety (can be disabled later)
+        Safety goals:
+          - Ensure encoder sees stable, owned memory
+          - Optionally synchronize producer work before handing frame to NVENC
 
         Env controls:
-          GR_ENC_SAFE=1   -> enable clone + sync (default ON for now)
-          GR_ENC_SYNC=1   -> force sync (default ON when SAFE=1)
-          Above were commented out in code below as testing showed, sync was needed to avoid corruption
+          GR_ENC_SAFE=1  -> enable protective clone/copy path (default ON)
+          GR_ENC_SYNC=1  -> enable synchronize-before-encode (default ON)
         """
 
         import os
         import torch
+        import numpy as np
 
         if frame is None:
             return
 
-        # ---- config knobs (env-driven) ----
-        #safe_mode = str(os.getenv("GR_ENC_SAFE", "1")).lower() not in ("0", "false", "no")
-        #sync_mode = str(os.getenv("GR_ENC_SYNC", "1")).lower() not in ("0", "false", "no")
-        #if sync_mode:
+        safe_mode = str(os.getenv("GR_ENC_SAFE", "1")).lower() not in ("0", "false", "no")
+        sync_mode = str(os.getenv("GR_ENC_SYNC", "1")).lower() not in ("0", "false", "no")
 
+        # Torch tensor path (CUDA / XPU / CPU tensor)
+        if isinstance(frame, torch.Tensor):
+            frame = frame.contiguous()
+            if safe_mode:
+                frame = frame.clone()
 
-        if frame.device.type == "cuda":
-            torch.cuda.synchronize(device=frame.device)
-        elif frame.device.type == "xpu" and hasattr(torch, "xpu"):
-            torch.xpu.synchronize(device=frame.device)
+            if sync_mode:
+                if frame.device.type == "cuda":
+                    torch.cuda.synchronize(device=frame.device)
+                elif frame.device.type == "xpu" and hasattr(torch, "xpu"):
+                    torch.xpu.synchronize(device=frame.device)
 
-        # ---- actual encode ----
+        # NumPy / CPU path
+        elif isinstance(frame, np.ndarray):
+            frame = np.ascontiguousarray(frame)
+            if safe_mode:
+                frame = frame.copy()
+
+        # Fallback: leave unknown types untouched
         bitstream = self._encoder.Encode(frame)
 
         if bitstream:
             self._file.write(bytearray(bitstream))
 
-        self._frames_encoded += 1 #bump the encoded frame count
-
+        self._frames_encoded += 1
     # Thin wrapper, calls encode_frame
     def encode_frames(self, frames: Iterable[Any]) -> None:
         for fr in frames:

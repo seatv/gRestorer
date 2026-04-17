@@ -116,6 +116,7 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--swap-model", default=None, help="ONNX face swap model path")
     p.add_argument("--swap-input-size", type=int, default=None)
     p.add_argument("--swap-provider", choices=["auto", "cuda", "cpu"], default=None)
+    p.add_argument("--swap-backend", choices=["auto", "inswapper", "simswap"], default=None, help="Face swap backend override (default: auto by model path)")
     p.add_argument("--face-enhancer-model", default=None, help="Optional ONNX face enhancer model path (GFPGAN-like single-input model)")
     p.add_argument("--face-enhancer-blend", type=int, default=None, help="Optional face enhancer blend 0..100")
     p.add_argument("--rest-compositor-quantize-before-resize", action=argparse.BooleanOptionalAction, default=None)
@@ -295,6 +296,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_many_if_not_none(cfg, [("restoration", "swap_model_path"), ("face_restoration", "swap_model_path")], args.swap_model)
     _set_many_if_not_none(cfg, [("restoration", "swap_input_size"), ("face_restoration", "swap_input_size")], args.swap_input_size)
     _set_many_if_not_none(cfg, [("restoration", "swap_provider"), ("face_restoration", "provider")], args.swap_provider)
+    _set_many_if_not_none(cfg, [("restoration", "swap_backend"), ("face_restoration", "swap_backend")], args.swap_backend)
     _set_many_if_not_none(cfg, [("restoration", "face_enhancer_model_path"), ("enhancement", "model_path")], args.face_enhancer_model)
     _set_many_if_not_none(cfg, [("restoration", "face_enhancer_blend"), ("enhancement", "blend")], args.face_enhancer_blend)
     if args.face_enhancer_model is not None:
