@@ -12,10 +12,11 @@ import torch
 from gRestorer.core.scene import Clip, face_meta_clip_to_crop
 from gRestorer.detector.core import FaceMetadata
 from gRestorer.restorer.clip_restorer import BaseClipRestorer
+from gRestorer.restorer.face_compositor import FaceCompositor
 from gRestorer.restorer.face_enhancer import FaceEnhancer
 from gRestorer.restorer.face_occluder import FaceOccluder
 from gRestorer.restorer.face_landmarker import FaceLandmarker
-
+from gRestorer.restorer.face_types import FaceCompositorConfig, FaceSwapBackendResult
 
 
 @dataclass
@@ -66,11 +67,15 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
     Policy lives here:
       - choose/stabilize the target face track within a clip
       - optional landmark refinement for the already chosen target face
-      - optional peer-normalized helper crop for contaminated ROI cases
+      - shared face compositor for backends that can return aligned swap results
       - repad/resize behavior for the clip interface
 
-    Worker contract:
-      swap(one_original_crop_image, one_target_face_metadata_in_that_crop_space)
+    Worker contracts:
+      legacy:
+          swap(one_original_crop_image, one_target_face_metadata_in_that_crop_space)
+      new-style:
+          swap_result(one_original_crop_image, one_target_face_metadata_in_that_crop_space)
+          -> FaceSwapBackendResult
     """
 
     def __init__(
@@ -141,6 +146,20 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
 
         self.worker = self._build_worker()
 
+        self.face_compositor = FaceCompositor(
+            FaceCompositorConfig(
+                mask_mode="geom_backend_intersection",
+                geom_expand=1.05,
+                mask_erode=0,
+                mask_dilate=2,
+                mask_blur=5,
+                blend_mode="alpha",
+                color_transfer="none",
+                face_scale=0.0,
+                debug=self.debug_enabled,
+            )
+        )
+
         self.landmarker = None
         if self.landmark_refiner_enabled:
             if not self.landmark_model_path:
@@ -176,6 +195,9 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
 
     def _build_worker(self):
         raise NotImplementedError("Subclasses must create the concrete face-swap worker.")
+
+    def _worker_supports_backend_result(self) -> bool:
+        return hasattr(self.worker, "swap_result") and callable(getattr(self.worker, "swap_result"))
 
     @staticmethod
     def _tensor_hwc_float_to_numpy_bgr_u8(x: torch.Tensor) -> np.ndarray:
@@ -231,6 +253,44 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
         out = self.debug_dir / f"f{frame_num:06d}.txt"
         with open(out, "a", encoding="utf-8") as f:
             f.write(text + "\n")
+
+    def _save_debug_mask(self, frame_num: int, name: str, mask: np.ndarray) -> None:
+        if not self._debug_this_frame(frame_num):
+            return
+        arr = np.asarray(mask)
+        if arr.ndim == 3 and arr.shape[2] == 1:
+            arr = arr[..., 0]
+        if arr.ndim != 2:
+            return
+        if arr.dtype != np.uint8:
+            y = arr.astype(np.float32, copy=False)
+            if y.max() <= 1.0:
+                y = y * 255.0
+            y = np.clip(y, 0.0, 255.0).round().astype(np.uint8)
+        else:
+            y = arr
+        out = self.debug_dir / f"f{frame_num:06d}_{name}.png"
+        cv2.imwrite(str(out), y)
+
+    def _save_backend_result_debug(self, frame_num: int, result: FaceSwapBackendResult) -> None:
+        if not self._debug_this_frame(frame_num):
+            return
+        try:
+            if result.aligned_target_bgr_u8 is not None:
+                self._save_debug_image(frame_num, "03a_aligned_target", result.aligned_target_bgr_u8)
+            self._save_debug_image(frame_num, "03b_aligned_swapped", result.aligned_swapped_bgr_u8)
+            if result.aligned_backend_mask_f32 is not None:
+                self._save_debug_mask(frame_num, "03c_backend_mask", result.aligned_backend_mask_f32)
+            self._save_debug_text(
+                frame_num,
+                f"backend_result aligned_size={int(result.aligned_size)} "
+                f"has_target={result.aligned_target_bgr_u8 is not None} "
+                f"has_backend_mask={result.aligned_backend_mask_f32 is not None}",
+            )
+            if result.debug:
+                self._save_debug_text(frame_num, f"backend_debug={result.debug}")
+        except Exception as e:
+            self._save_debug_text(frame_num, f"backend_result_debug_exception={e!r}")
 
     @staticmethod
     def _diff_image(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -318,7 +378,6 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
             kps=kps,
             det_score=face_meta.det_score,
         )
-
 
     @staticmethod
     def _face_metrics(face_meta: FaceMetadata, crop_shape: tuple[int, int, int]) -> dict[str, float]:
@@ -489,7 +548,6 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
             f"[FaceSwapStats] occluder_materially_changed={self.stats.frames_occluder_materially_changed} avg_occluder_mad={self.stats.avg_occluder_mean_abs_diff():.4f}",
         ]
 
-
     @torch.inference_mode()
     def restore_clip(self, clip: Clip) -> List[torch.Tensor]:
         self.stats.clips_processed += 1
@@ -579,11 +637,36 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
                     self._save_debug_text(frame_num, f"target_face_kps_shape={tuple(active_face_meta.kps.shape)}")
 
                 self.stats.frames_worker_called += 1
-                try:
-                    out = self.worker.swap(crop_np, active_face_meta)
-                except Exception as e:
-                    self._save_debug_text(frame_num, f"swap_exception={e!r}")
-                    out = None
+                out = None
+                backend_result: Optional[FaceSwapBackendResult] = None
+
+                if self._worker_supports_backend_result():
+                    try:
+                        backend_result = self.worker.swap_result(crop_np, active_face_meta)
+                    except Exception as e:
+                        self._save_debug_text(frame_num, f"swap_result_exception={e!r}")
+                        backend_result = None
+
+                    if backend_result is not None:
+                        self._save_backend_result_debug(frame_num, backend_result)
+                        try:
+                            out = self.face_compositor.compose(
+                                original_roi_bgr_u8=crop_np,
+                                target_face_meta=active_face_meta,
+                                backend_result=backend_result,
+                                occlusion_keep_mask_f32=None,
+                            )
+                        except Exception as e:
+                            self._save_debug_text(frame_num, f"face_compositor_exception={e!r}")
+                            out = None
+                    else:
+                        self._save_debug_text(frame_num, "swap_result_returned=None")
+                else:
+                    try:
+                        out = self.worker.swap(crop_np, active_face_meta)
+                    except Exception as e:
+                        self._save_debug_text(frame_num, f"swap_exception={e!r}")
+                        out = None
 
                 if out is None:
                     self.stats.frames_worker_returned_none += 1
@@ -658,5 +741,6 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
             out_frames.append(self._numpy_bgr_u8_to_tensor_hwc_float(swapped_clip_np))
 
         return out_frames
+
 
 __all__ = ["BaseFaceSwapClipRestorer", "FaceSwapRestoreStats"]

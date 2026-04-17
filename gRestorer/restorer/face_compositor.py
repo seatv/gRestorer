@@ -1,0 +1,379 @@
+# gRestorer/restorer/face_types.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Optional
+import numpy as np
+
+
+@dataclass
+class FaceSwapBackendResult:
+    aligned_swapped_bgr_u8: np.ndarray
+    aligned_target_bgr_u8: Optional[np.ndarray]
+    aligned_backend_mask_f32: Optional[np.ndarray]
+    roi_to_aligned: np.ndarray
+    aligned_to_roi: np.ndarray
+    aligned_size: int
+    debug: Optional[dict[str, Any]] = None
+
+
+@dataclass
+class FaceCompositorConfig:
+    mask_mode: str = "geom_backend_intersection"
+    geom_expand: float = 1.05
+    mask_erode: int = 0
+    mask_dilate: int = 2
+    mask_blur: int = 5
+    blend_mode: str = "alpha"
+    color_transfer: str = "none"
+    face_scale: float = 0.0
+    debug: bool = False
+
+
+__all__ = ["FaceSwapBackendResult", "FaceCompositorConfig"]
+
+
+from typing import Optional
+
+import cv2
+import numpy as np
+import torch
+
+from gRestorer.detector.core import FaceMetadata
+from gRestorer.restorer.face_types import FaceSwapBackendResult, FaceCompositorConfig
+
+
+class FaceCompositor:
+    def __init__(self, cfg: FaceCompositorConfig) -> None:
+        self.cfg = cfg
+
+    @staticmethod
+    def _arcface_template(size: int) -> np.ndarray:
+        tmpl = np.array(
+            [
+                [38.2946, 51.6963],
+                [73.5318, 51.5014],
+                [56.0252, 71.7366],
+                [41.5493, 92.3655],
+                [70.7299, 92.2041],
+            ],
+            dtype=np.float32,
+        )
+        return tmpl * (float(size) / 112.0)
+
+    @staticmethod
+    def _bbox_to_five_points(face_meta: FaceMetadata) -> np.ndarray:
+        x1, y1, x2, y2 = [float(v) for v in face_meta.bbox_xyxy]
+        w = max(1.0, x2 - x1)
+        h = max(1.0, y2 - y1)
+        return np.array(
+            [
+                [x1 + 0.32 * w, y1 + 0.38 * h],
+                [x1 + 0.68 * w, y1 + 0.38 * h],
+                [x1 + 0.50 * w, y1 + 0.56 * h],
+                [x1 + 0.37 * w, y1 + 0.75 * h],
+                [x1 + 0.63 * w, y1 + 0.75 * h],
+            ],
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _five_points(face_meta: FaceMetadata) -> np.ndarray:
+        if face_meta.kps is not None:
+            kps = face_meta.kps
+            if isinstance(kps, torch.Tensor):
+                kps = kps.detach().cpu().numpy()
+            kps = np.asarray(kps, dtype=np.float32)
+            if kps.ndim == 2 and kps.shape == (5, 2):
+                return kps.copy()
+        return FaceCompositor._bbox_to_five_points(face_meta)
+
+    @staticmethod
+    def _ensure_hwc_u8(img: np.ndarray) -> np.ndarray:
+        arr = np.asarray(img)
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            raise ValueError(f"Expected HWC BGR image, got shape={tuple(arr.shape)}")
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).round().astype(np.uint8)
+        return np.ascontiguousarray(arr)
+
+    @staticmethod
+    def _ensure_mask_f32(mask: Optional[np.ndarray], *, shape_hw: tuple[int, int] | None = None) -> Optional[np.ndarray]:
+        if mask is None:
+            return None
+        arr = np.asarray(mask)
+        if arr.ndim == 3:
+            if arr.shape[2] == 1:
+                arr = arr[..., 0]
+            elif arr.shape[2] == 3:
+                arr = np.max(arr, axis=2)
+            else:
+                arr = arr[..., 0]
+        if arr.ndim != 2:
+            raise ValueError(f"Expected HW mask, got shape={tuple(arr.shape)}")
+        arr = arr.astype(np.float32, copy=False)
+        if arr.max() > 1.0:
+            arr = arr / 255.0
+        arr = np.clip(arr, 0.0, 1.0)
+        if shape_hw is not None and (arr.shape[0] != shape_hw[0] or arr.shape[1] != shape_hw[1]):
+            arr = cv2.resize(arr, (int(shape_hw[1]), int(shape_hw[0])), interpolation=cv2.INTER_LINEAR)
+            arr = np.clip(arr, 0.0, 1.0)
+        return np.ascontiguousarray(arr)
+
+    @staticmethod
+    def _transform_points(pts_xy: np.ndarray, M_2x3: np.ndarray) -> np.ndarray:
+        pts = np.asarray(pts_xy, dtype=np.float32).reshape(-1, 1, 2)
+        return cv2.transform(pts, M_2x3).reshape(-1, 2)
+
+    def _build_geom_mask_aligned(
+        self,
+        face_meta: FaceMetadata,
+        roi_to_aligned: np.ndarray,
+        aligned_size: int,
+    ) -> np.ndarray:
+        size = int(aligned_size)
+        mask = np.zeros((size, size), dtype=np.float32)
+
+        try:
+            pts5 = self._five_points(face_meta)
+            pts_aligned = self._transform_points(pts5, roi_to_aligned)
+
+            if float(self.cfg.geom_expand) != 1.0:
+                center = np.mean(pts_aligned, axis=0, keepdims=True)
+                pts_aligned = center + (pts_aligned - center) * float(self.cfg.geom_expand)
+
+            hull = cv2.convexHull(pts_aligned.astype(np.float32))
+            cv2.fillConvexPoly(mask, hull.astype(np.int32), 1.0)
+
+            k = max(5, int(size * 0.08))
+            if k % 2 == 0:
+                k += 1
+            mask = cv2.GaussianBlur(mask, (k, k), 0)
+            return np.clip(mask, 0.0, 1.0)
+        except Exception:
+            pass
+
+        x1, y1, x2, y2 = [float(v) for v in face_meta.bbox_xyxy]
+        box_pts = np.array(
+            [
+                [x1, y1],
+                [x2, y1],
+                [x2, y2],
+                [x1, y2],
+            ],
+            dtype=np.float32,
+        )
+        box_aligned = self._transform_points(box_pts, roi_to_aligned)
+
+        xs = box_aligned[:, 0]
+        ys = box_aligned[:, 1]
+        x1a = float(np.min(xs))
+        x2a = float(np.max(xs))
+        y1a = float(np.min(ys))
+        y2a = float(np.max(ys))
+
+        cx = 0.5 * (x1a + x2a)
+        cy = 0.5 * (y1a + y2a)
+        rx = max(1.0, 0.5 * (x2a - x1a) * float(self.cfg.geom_expand))
+        ry = max(1.0, 0.5 * (y2a - y1a) * float(self.cfg.geom_expand))
+
+        cv2.ellipse(
+            mask,
+            center=(int(round(cx)), int(round(cy))),
+            axes=(int(round(rx)), int(round(ry))),
+            angle=0.0,
+            startAngle=0.0,
+            endAngle=360.0,
+            color=1.0,
+            thickness=-1,
+        )
+
+        k = max(5, int(size * 0.08))
+        if k % 2 == 0:
+            k += 1
+        mask = cv2.GaussianBlur(mask, (k, k), 0)
+        return np.clip(mask, 0.0, 1.0)
+
+    def _combine_masks(
+        self,
+        geom_mask_f32: Optional[np.ndarray],
+        backend_mask_f32: Optional[np.ndarray],
+    ) -> np.ndarray:
+        g = self._ensure_mask_f32(geom_mask_f32)
+        b = self._ensure_mask_f32(backend_mask_f32, shape_hw=(g.shape[0], g.shape[1]) if g is not None else None)
+
+        mode = str(self.cfg.mask_mode or "geom_backend_intersection").strip().lower()
+
+        if g is None and b is None:
+            raise ValueError("Both geom and backend masks are None")
+
+        if mode in ("geom", "geometric"):
+            return g if g is not None else b
+        if mode in ("backend", "pred", "predicted"):
+            return b if b is not None else g
+        if mode in ("union", "geom_backend_union"):
+            if g is None:
+                return b
+            if b is None:
+                return g
+            return np.maximum(g, b)
+        if mode in ("intersection", "geom_backend_intersection", "geom*backend"):
+            if g is None:
+                return b
+            if b is None:
+                return g
+            return np.minimum(g, b)
+
+        if g is None:
+            return b
+        if b is None:
+            return g
+        return np.minimum(g, b)
+
+    def _postprocess_mask(self, mask_f32: np.ndarray) -> np.ndarray:
+        m = np.clip(mask_f32.astype(np.float32, copy=False), 0.0, 1.0)
+
+        if self.cfg.mask_erode > 0:
+            k = int(self.cfg.mask_erode)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k * 2 + 1, k * 2 + 1))
+            m = cv2.erode(m, kernel, iterations=1)
+
+        if self.cfg.mask_dilate > 0:
+            k = int(self.cfg.mask_dilate)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k * 2 + 1, k * 2 + 1))
+            m = cv2.dilate(m, kernel, iterations=1)
+
+        if self.cfg.mask_blur > 0:
+            k = int(self.cfg.mask_blur)
+            if k % 2 == 0:
+                k += 1
+            m = cv2.GaussianBlur(m, (k, k), 0)
+
+        return np.clip(m, 0.0, 1.0)
+
+    @staticmethod
+    def _warp_aligned_face_to_roi(
+        aligned_face_bgr_u8: np.ndarray,
+        aligned_to_roi: np.ndarray,
+        roi_w: int,
+        roi_h: int,
+    ) -> np.ndarray:
+        return cv2.warpAffine(
+            aligned_face_bgr_u8,
+            aligned_to_roi,
+            (roi_w, roi_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
+
+    @staticmethod
+    def _warp_aligned_mask_to_roi(
+        aligned_mask_f32: np.ndarray,
+        aligned_to_roi: np.ndarray,
+        roi_w: int,
+        roi_h: int,
+    ) -> np.ndarray:
+        return cv2.warpAffine(
+            aligned_mask_f32.astype(np.float32, copy=False),
+            aligned_to_roi,
+            (roi_w, roi_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+
+    def _maybe_color_transfer(
+        self,
+        aligned_target_bgr_u8: Optional[np.ndarray],
+        aligned_swapped_bgr_u8: np.ndarray,
+        aligned_mask_f32: np.ndarray,
+    ) -> np.ndarray:
+        mode = str(self.cfg.color_transfer or "none").strip().lower()
+        if mode in ("", "none", "off"):
+            return aligned_swapped_bgr_u8
+
+        # Phase-1: keep this conservative. We can add Reinhard later.
+        return aligned_swapped_bgr_u8
+
+    @staticmethod
+    def _blend_alpha(
+        base_bgr_u8: np.ndarray,
+        over_bgr_u8: np.ndarray,
+        alpha_f32: np.ndarray,
+    ) -> np.ndarray:
+        alpha = np.clip(alpha_f32.astype(np.float32, copy=False), 0.0, 1.0)[..., None]
+        base = base_bgr_u8.astype(np.float32)
+        over = over_bgr_u8.astype(np.float32)
+        out = base * (1.0 - alpha) + over * alpha
+        return np.clip(out, 0.0, 255.0).round().astype(np.uint8)
+
+    def compose(
+        self,
+        *,
+        original_roi_bgr_u8: np.ndarray,
+        target_face_meta: FaceMetadata,
+        backend_result: FaceSwapBackendResult,
+        occlusion_keep_mask_f32: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        roi = self._ensure_hwc_u8(original_roi_bgr_u8)
+        aligned_swapped = self._ensure_hwc_u8(backend_result.aligned_swapped_bgr_u8)
+
+        roi_h, roi_w = int(roi.shape[0]), int(roi.shape[1])
+        aligned_size = int(backend_result.aligned_size or aligned_swapped.shape[0])
+
+        if aligned_swapped.shape[0] != aligned_size or aligned_swapped.shape[1] != aligned_size:
+            aligned_swapped = cv2.resize(
+                aligned_swapped,
+                (aligned_size, aligned_size),
+                interpolation=cv2.INTER_LINEAR,
+            )
+
+        geom_mask = self._build_geom_mask_aligned(
+            target_face_meta,
+            np.asarray(backend_result.roi_to_aligned, dtype=np.float32),
+            aligned_size,
+        )
+
+        backend_mask = self._ensure_mask_f32(
+            backend_result.aligned_backend_mask_f32,
+            shape_hw=(aligned_size, aligned_size),
+        )
+        combined_mask = self._combine_masks(geom_mask, backend_mask)
+        combined_mask = self._postprocess_mask(combined_mask)
+
+        aligned_swapped = self._maybe_color_transfer(
+            backend_result.aligned_target_bgr_u8,
+            aligned_swapped,
+            combined_mask,
+        )
+
+        warped_face = self._warp_aligned_face_to_roi(
+            aligned_swapped,
+            np.asarray(backend_result.aligned_to_roi, dtype=np.float32),
+            roi_w,
+            roi_h,
+        )
+        warped_alpha = self._warp_aligned_mask_to_roi(
+            combined_mask,
+            np.asarray(backend_result.aligned_to_roi, dtype=np.float32),
+            roi_w,
+            roi_h,
+        )
+
+        if occlusion_keep_mask_f32 is not None:
+            keep_mask = self._ensure_mask_f32(occlusion_keep_mask_f32, shape_hw=(roi_h, roi_w))
+            warped_alpha = warped_alpha * (1.0 - keep_mask)
+
+        warped_alpha = np.clip(warped_alpha, 0.0, 1.0)
+
+        blend_mode = str(self.cfg.blend_mode or "alpha").strip().lower()
+        if blend_mode not in ("alpha", "", "default"):
+            # Phase-1: unsupported modes fall back to alpha.
+            blend_mode = "alpha"
+
+        out = self._blend_alpha(roi, warped_face, warped_alpha)
+        return np.ascontiguousarray(out)
+
+
+__all__ = ["FaceCompositor"]
