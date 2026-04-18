@@ -1,37 +1,4 @@
-# gRestorer/restorer/face_types.py
 from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Any, Optional
-import numpy as np
-
-
-@dataclass
-class FaceSwapBackendResult:
-    aligned_swapped_bgr_u8: np.ndarray
-    aligned_target_bgr_u8: Optional[np.ndarray]
-    aligned_backend_mask_f32: Optional[np.ndarray]
-    roi_to_aligned: np.ndarray
-    aligned_to_roi: np.ndarray
-    aligned_size: int
-    debug: Optional[dict[str, Any]] = None
-
-
-@dataclass
-class FaceCompositorConfig:
-    mask_mode: str = "geom_backend_intersection"
-    geom_expand: float = 1.05
-    mask_erode: int = 0
-    mask_dilate: int = 2
-    mask_blur: int = 5
-    blend_mode: str = "alpha"
-    color_transfer: str = "none"
-    face_scale: float = 0.0
-    debug: bool = False
-
-
-__all__ = ["FaceSwapBackendResult", "FaceCompositorConfig"]
-
 
 from typing import Optional
 
@@ -126,61 +93,31 @@ class FaceCompositor:
         return cv2.transform(pts, M_2x3).reshape(-1, 2)
 
     def _build_geom_mask_aligned(
-        self,
-        face_meta: FaceMetadata,
-        roi_to_aligned: np.ndarray,
-        aligned_size: int,
+            self,
+            face_meta: FaceMetadata,
+            roi_to_aligned: np.ndarray,
+            aligned_size: int,
     ) -> np.ndarray:
         size = int(aligned_size)
         mask = np.zeros((size, size), dtype=np.float32)
 
-        try:
-            pts5 = self._five_points(face_meta)
-            pts_aligned = self._transform_points(pts5, roi_to_aligned)
+        # Stable canonical aligned-space face mask.
+        # Landmarks are still used upstream for alignment; this mask is only for
+        # deciding how much of the aligned swapped face we trust during paste-back.
+        expand = float(self.cfg.geom_expand) if float(self.cfg.geom_expand) > 0.0 else 1.0
 
-            if float(self.cfg.geom_expand) != 1.0:
-                center = np.mean(pts_aligned, axis=0, keepdims=True)
-                pts_aligned = center + (pts_aligned - center) * float(self.cfg.geom_expand)
+        # Canonical face-shaped ellipse in aligned space.
+        # Tuned to cover most of the face while avoiding hair/ears/background.
 
-            hull = cv2.convexHull(pts_aligned.astype(np.float32))
-            cv2.fillConvexPoly(mask, hull.astype(np.int32), 1.0)
-
-            k = max(5, int(size * 0.08))
-            if k % 2 == 0:
-                k += 1
-            mask = cv2.GaussianBlur(mask, (k, k), 0)
-            return np.clip(mask, 0.0, 1.0)
-        except Exception:
-            pass
-
-        x1, y1, x2, y2 = [float(v) for v in face_meta.bbox_xyxy]
-        box_pts = np.array(
-            [
-                [x1, y1],
-                [x2, y1],
-                [x2, y2],
-                [x1, y2],
-            ],
-            dtype=np.float32,
-        )
-        box_aligned = self._transform_points(box_pts, roi_to_aligned)
-
-        xs = box_aligned[:, 0]
-        ys = box_aligned[:, 1]
-        x1a = float(np.min(xs))
-        x2a = float(np.max(xs))
-        y1a = float(np.min(ys))
-        y2a = float(np.max(ys))
-
-        cx = 0.5 * (x1a + x2a)
-        cy = 0.5 * (y1a + y2a)
-        rx = max(1.0, 0.5 * (x2a - x1a) * float(self.cfg.geom_expand))
-        ry = max(1.0, 0.5 * (y2a - y1a) * float(self.cfg.geom_expand))
+        cx = 0.50 * size
+        cy = 0.55 * size
+        rx = 0.27 * size * expand
+        ry = 0.34 * size * expand
 
         cv2.ellipse(
             mask,
             center=(int(round(cx)), int(round(cy))),
-            axes=(int(round(rx)), int(round(ry))),
+            axes=(max(1, int(round(rx))), max(1, int(round(ry)))),
             angle=0.0,
             startAngle=0.0,
             endAngle=360.0,
@@ -188,10 +125,12 @@ class FaceCompositor:
             thickness=-1,
         )
 
-        k = max(5, int(size * 0.08))
+        # Gentle soften before later postprocess blur/dilate.
+        k = max(5, int(size * 0.05))
         if k % 2 == 0:
             k += 1
         mask = cv2.GaussianBlur(mask, (k, k), 0)
+
         return np.clip(mask, 0.0, 1.0)
 
     def _combine_masks(
@@ -292,8 +231,6 @@ class FaceCompositor:
         mode = str(self.cfg.color_transfer or "none").strip().lower()
         if mode in ("", "none", "off"):
             return aligned_swapped_bgr_u8
-
-        # Phase-1: keep this conservative. We can add Reinhard later.
         return aligned_swapped_bgr_u8
 
     @staticmethod
@@ -308,14 +245,14 @@ class FaceCompositor:
         out = base * (1.0 - alpha) + over * alpha
         return np.clip(out, 0.0, 255.0).round().astype(np.uint8)
 
-    def compose(
+    def compose_debug(
         self,
         *,
         original_roi_bgr_u8: np.ndarray,
         target_face_meta: FaceMetadata,
         backend_result: FaceSwapBackendResult,
         occlusion_keep_mask_f32: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
         roi = self._ensure_hwc_u8(original_roi_bgr_u8)
         aligned_swapped = self._ensure_hwc_u8(backend_result.aligned_swapped_bgr_u8)
 
@@ -339,6 +276,7 @@ class FaceCompositor:
             backend_result.aligned_backend_mask_f32,
             shape_hw=(aligned_size, aligned_size),
         )
+
         combined_mask = self._combine_masks(geom_mask, backend_mask)
         combined_mask = self._postprocess_mask(combined_mask)
 
@@ -361,19 +299,41 @@ class FaceCompositor:
             roi_h,
         )
 
+        keep_mask = None
         if occlusion_keep_mask_f32 is not None:
             keep_mask = self._ensure_mask_f32(occlusion_keep_mask_f32, shape_hw=(roi_h, roi_w))
             warped_alpha = warped_alpha * (1.0 - keep_mask)
 
         warped_alpha = np.clip(warped_alpha, 0.0, 1.0)
-
-        blend_mode = str(self.cfg.blend_mode or "alpha").strip().lower()
-        if blend_mode not in ("alpha", "", "default"):
-            # Phase-1: unsupported modes fall back to alpha.
-            blend_mode = "alpha"
-
         out = self._blend_alpha(roi, warped_face, warped_alpha)
-        return np.ascontiguousarray(out)
+
+        debug = {
+            "aligned_geom_mask_f32": geom_mask,
+            "aligned_backend_mask_f32": backend_mask if backend_mask is not None else np.zeros_like(combined_mask),
+            "aligned_combined_mask_f32": combined_mask,
+            "roi_warped_alpha_f32": warped_alpha,
+            "roi_warped_face_bgr_u8": warped_face,
+        }
+        if keep_mask is not None:
+            debug["roi_keep_mask_f32"] = keep_mask
+
+        return np.ascontiguousarray(out), debug
+
+    def compose(
+        self,
+        *,
+        original_roi_bgr_u8: np.ndarray,
+        target_face_meta: FaceMetadata,
+        backend_result: FaceSwapBackendResult,
+        occlusion_keep_mask_f32: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        out, _ = self.compose_debug(
+            original_roi_bgr_u8=original_roi_bgr_u8,
+            target_face_meta=target_face_meta,
+            backend_result=backend_result,
+            occlusion_keep_mask_f32=occlusion_keep_mask_f32,
+        )
+        return out
 
 
 __all__ = ["FaceCompositor"]

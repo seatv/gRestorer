@@ -440,6 +440,108 @@ class Pipeline:
         self.swap_provider: str = str(cfg_first(self.cfg, [("face_restoration", "provider"), ("restoration", "swap_provider")], default="auto") or "auto").lower()
         self.swap_backend: str = str(cfg_first(self.cfg, [("face_restoration", "swap_backend"), ("restoration", "swap_backend")], default="auto") or "auto").lower()
 
+        self.face_comp_mask_mode: str = str(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "compositor", "mask_mode"),
+                    ("face_restoration", "compositor_mask_mode"),
+                ],
+                default="geom_backend_intersection",
+            )
+            or "geom_backend_intersection"
+        ).lower()
+
+        self.face_comp_geom_expand: float = float(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "compositor", "geom_expand"),
+                    ("face_restoration", "compositor_geom_expand"),
+                ],
+                default=1.05,
+            )
+        )
+
+        self.face_comp_mask_erode: int = int(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "compositor", "mask_erode"),
+                    ("face_restoration", "compositor_mask_erode"),
+                ],
+                default=0,
+            )
+        )
+
+        self.face_comp_mask_dilate: int = int(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "compositor", "mask_dilate"),
+                    ("face_restoration", "compositor_mask_dilate"),
+                ],
+                default=2,
+            )
+        )
+
+        self.face_comp_mask_blur: int = int(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "compositor", "mask_blur"),
+                    ("face_restoration", "compositor_mask_blur"),
+                ],
+                default=5,
+            )
+        )
+
+        self.face_comp_blend_mode: str = str(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "compositor", "blend_mode"),
+                    ("face_restoration", "compositor_blend_mode"),
+                ],
+                default="alpha",
+            )
+            or "alpha"
+        ).lower()
+
+        self.face_comp_color_transfer: str = str(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "compositor", "color_transfer"),
+                    ("face_restoration", "compositor_color_transfer"),
+                ],
+                default="none",
+            )
+            or "none"
+        ).lower()
+
+        self.face_comp_face_scale: float = float(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "compositor", "face_scale"),
+                    ("face_restoration", "compositor_face_scale"),
+                ],
+                default=0.0,
+            )
+        )
+
+        self.face_comp_debug: bool = bool(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "compositor", "debug"),
+                    ("face_restoration", "compositor_debug"),
+                ],
+                default=False,
+            )
+        )
+
         self.face_enhancer_enabled: bool = _cfg_bool(self.cfg, [("enhancement", "enabled")], default=False)
         self.face_enhancer_model_path: str = str(cfg_first(self.cfg, [("enhancement", "model_path"), ("restoration", "face_enhancer_model_path")], default="") or "")
         self.face_enhancer_provider: str = str(cfg_first(self.cfg, [("enhancement", "provider"), ("face_restoration", "provider"), ("restoration", "swap_provider")], default=self.swap_provider) or self.swap_provider).lower()
@@ -635,6 +737,15 @@ class Pipeline:
                 swap_model_path=self.swap_model_path,
                 swap_input_size=self.swap_input_size,
                 provider=self.swap_provider,
+                face_comp_mask_mode=self.face_comp_mask_mode,
+                face_comp_geom_expand=self.face_comp_geom_expand,
+                face_comp_mask_erode=self.face_comp_mask_erode,
+                face_comp_mask_dilate=self.face_comp_mask_dilate,
+                face_comp_mask_blur=self.face_comp_mask_blur,
+                face_comp_blend_mode=self.face_comp_blend_mode,
+                face_comp_color_transfer=self.face_comp_color_transfer,
+                face_comp_face_scale=self.face_comp_face_scale,
+                face_comp_debug=self.face_comp_debug,
                 face_enhancer_enabled=self.face_enhancer_enabled,
                 face_enhancer_model_path=self.face_enhancer_model_path,
                 face_enhancer_provider=self.face_enhancer_provider,

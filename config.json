@@ -9,9 +9,10 @@
 		"save_detection_json": false,
 		"output_dir": "debug_output",
 		"face_swap": {
+			"enabled": true,
 			"trace": false,
 			"trace_dir": "D:\\Temp\\fs_trace",
-			"debug_images": false,
+			"debug_images": true,
 			"debug_dir": "D:\\Temp\\fs_debug",
 			"material_mad": 1.0
 		}
@@ -84,7 +85,18 @@
 		"landmark_model": "2dfan4",
 		"landmark_model_path": "D:\\Models\\face\\2dfan4.onnx",
 		"landmark_provider": "cuda",
-		"landmark_refiner_score": 0.5
+		"landmark_refiner_score": 0.5,
+		"compositor": {
+			"mask_mode": "geom",
+			"geom_expand": 1.00,
+			"mask_erode": 0,
+			"mask_dilate": 0,
+			"mask_blur": 3,
+			"blend_mode": "alpha",
+			"color_transfer": "none",
+			"face_scale": 0.0,
+			"debug": true
+		}
 	},
 	"enhancement": {
 		"enabled": true,

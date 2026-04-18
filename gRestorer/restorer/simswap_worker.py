@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from gRestorer.detector.core import FaceMetadata
+from gRestorer.restorer.face_types import FaceSwapBackendResult
 
 
 class SimSwapWorker:
@@ -18,7 +19,7 @@ class SimSwapWorker:
       - target face alignment
       - ONNX inference
       - output decode
-      - inverse warp / paste-back
+      - backend-result construction
 
     It knows nothing about clip-level policy, target selection, or adjacent frames.
     """
@@ -312,16 +313,44 @@ class SimSwapWorker:
         out = roi_bgr_u8.astype(np.float32) * (1.0 - mask_warp) + warped.astype(np.float32) * mask_warp
         return np.clip(out, 0.0, 255.0).round().astype(np.uint8)
 
-    def swap(self, roi_bgr_u8: np.ndarray, target_face_meta: FaceMetadata) -> Optional[np.ndarray]:
+    def swap_result(
+        self,
+        roi_bgr_u8: np.ndarray,
+        target_face_meta: FaceMetadata,
+    ) -> Optional[FaceSwapBackendResult]:
         if roi_bgr_u8 is None:
             return None
+
         kps5 = self._extract_target_kps5(target_face_meta)
         aligned, M = self._align_face(roi_bgr_u8, kps5)
         img_in = self._prepare_simswap_image(aligned)
         emb_in = self._src_embedding
         raw = self._run_simswap_once(img_in, emb_in)
         swapped_aligned = self._decode_simswap_output(raw)
-        return self._paste_aligned_face_back(roi_bgr_u8, swapped_aligned, M)
 
+        return FaceSwapBackendResult(
+            aligned_swapped_bgr_u8=swapped_aligned,
+            aligned_target_bgr_u8=aligned,
+            aligned_backend_mask_f32=self._make_face_mask(int(swapped_aligned.shape[0])),
+            roi_to_aligned=np.asarray(M, dtype=np.float32),
+            aligned_to_roi=np.asarray(cv2.invertAffineTransform(M), dtype=np.float32),
+            aligned_size=int(swapped_aligned.shape[0]),
+            debug={
+                "backend": "simswap",
+                "image_size": int(self._image_size),
+                "provider": self.provider,
+            },
+        )
+
+
+    def swap(self, roi_bgr_u8: np.ndarray, target_face_meta: FaceMetadata) -> Optional[np.ndarray]:
+        result = self.swap_result(roi_bgr_u8, target_face_meta)
+        if result is None:
+            return None
+        return self._paste_aligned_face_back(
+            roi_bgr_u8,
+            result.aligned_swapped_bgr_u8,
+            result.roi_to_aligned,
+        )
 
 __all__ = ["SimSwapWorker"]

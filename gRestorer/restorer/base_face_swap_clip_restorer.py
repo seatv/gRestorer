@@ -86,6 +86,15 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
         *,
         swap_input_size: int = 128,
         provider: str = "auto",
+        face_comp_mask_mode: str = "geom_backend_intersection",
+        face_comp_geom_expand: float = 1.05,
+        face_comp_mask_erode: int = 0,
+        face_comp_mask_dilate: int = 2,
+        face_comp_mask_blur: int = 5,
+        face_comp_blend_mode: str = "alpha",
+        face_comp_color_transfer: str = "none",
+        face_comp_face_scale: float = 0.0,
+        face_comp_debug: bool = False,
         face_enhancer_enabled: bool = False,
         face_enhancer_model_path: str = "",
         face_enhancer_provider: str = "auto",
@@ -148,18 +157,17 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
 
         self.face_compositor = FaceCompositor(
             FaceCompositorConfig(
-                mask_mode="geom_backend_intersection",
-                geom_expand=1.05,
-                mask_erode=0,
-                mask_dilate=2,
-                mask_blur=5,
-                blend_mode="alpha",
-                color_transfer="none",
-                face_scale=0.0,
-                debug=self.debug_enabled,
+                mask_mode=str(face_comp_mask_mode or "geom_backend_intersection").lower(),
+                geom_expand=float(face_comp_geom_expand),
+                mask_erode=int(face_comp_mask_erode),
+                mask_dilate=int(face_comp_mask_dilate),
+                mask_blur=int(face_comp_mask_blur),
+                blend_mode=str(face_comp_blend_mode or "alpha").lower(),
+                color_transfer=str(face_comp_color_transfer or "none").lower(),
+                face_scale=float(face_comp_face_scale),
+                debug=bool(face_comp_debug),
             )
         )
-
         self.landmarker = None
         if self.landmark_refiner_enabled:
             if not self.landmark_model_path:
@@ -548,6 +556,64 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
             f"[FaceSwapStats] occluder_materially_changed={self.stats.frames_occluder_materially_changed} avg_occluder_mad={self.stats.avg_occluder_mean_abs_diff():.4f}",
         ]
 
+    def _save_compositor_debug(self, frame_num: int, debug: dict[str, np.ndarray]) -> None:
+        if not (self.face_compositor.cfg.debug or self.debug_enabled):
+            return
+        if self.debug_start >= 0 and frame_num < self.debug_start:
+            return
+        if self.debug_end >= 0 and frame_num > self.debug_end:
+            return
+
+        self.debug_dir.mkdir(parents=True, exist_ok=True)
+
+        def _save_mask(name: str, mask: np.ndarray) -> None:
+            arr = np.asarray(mask)
+            if arr.ndim == 3 and arr.shape[2] == 1:
+                arr = arr[..., 0]
+            if arr.ndim != 2:
+                return
+            if arr.dtype != np.uint8:
+                y = arr.astype(np.float32, copy=False)
+                if y.max() <= 1.0:
+                    y = y * 255.0
+                y = np.clip(y, 0.0, 255.0).round().astype(np.uint8)
+            else:
+                y = arr
+            out = self.debug_dir / f"f{frame_num:06d}_{name}.png"
+            cv2.imwrite(str(out), y)
+
+        def _save_img(name: str, img: np.ndarray) -> None:
+            arr = np.asarray(img)
+            if arr.ndim != 3 or arr.shape[2] != 3:
+                return
+            if arr.dtype != np.uint8:
+                arr = np.clip(arr, 0.0, 255.0).round().astype(np.uint8)
+            out = self.debug_dir / f"f{frame_num:06d}_{name}.png"
+            cv2.imwrite(str(out), np.ascontiguousarray(arr))
+
+        try:
+            if "aligned_geom_mask_f32" in debug:
+                _save_mask("03d_geom_mask", debug["aligned_geom_mask_f32"])
+            if "aligned_backend_mask_f32" in debug:
+                _save_mask("03e_backend_mask_compositor", debug["aligned_backend_mask_f32"])
+            if "aligned_combined_mask_f32" in debug:
+                _save_mask("03f_combined_mask", debug["aligned_combined_mask_f32"])
+            if "roi_warped_alpha_f32" in debug:
+                _save_mask("03g_warped_alpha", debug["roi_warped_alpha_f32"])
+            if "roi_warped_face_bgr_u8" in debug:
+                _save_img("03h_warped_face", debug["roi_warped_face_bgr_u8"])
+            if "roi_keep_mask_f32" in debug:
+                _save_mask("03i_keep_mask", debug["roi_keep_mask_f32"])
+
+            txt_path = self.debug_dir / f"f{frame_num:06d}.txt"
+            with open(txt_path, "a", encoding="utf-8") as f:
+                f.write(f"compositor_debug_keys={sorted(debug.keys())}\n")
+        except Exception as e:
+            txt_path = self.debug_dir / f"f{frame_num:06d}.txt"
+            with open(txt_path, "a", encoding="utf-8") as f:
+                f.write(f"compositor_debug_exception={e!r}\n")
+
+
     @torch.inference_mode()
     def restore_clip(self, clip: Clip) -> List[torch.Tensor]:
         self.stats.clips_processed += 1
@@ -640,7 +706,17 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
                 out = None
                 backend_result: Optional[FaceSwapBackendResult] = None
 
+                self._save_debug_text(
+                    frame_num,
+                    "worker_runtime="
+                    f"{type(self.worker).__module__}.{type(self.worker).__name__} "
+                    f"has_swap={hasattr(self.worker, 'swap')} "
+                    f"has_swap_result={hasattr(self.worker, 'swap_result')}"
+                )
+
                 if self._worker_supports_backend_result():
+                    self._save_debug_text(frame_num, "worker_branch=backend_result")
+
                     try:
                         backend_result = self.worker.swap_result(crop_np, active_face_meta)
                     except Exception as e:
@@ -650,18 +726,30 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
                     if backend_result is not None:
                         self._save_backend_result_debug(frame_num, backend_result)
                         try:
-                            out = self.face_compositor.compose(
-                                original_roi_bgr_u8=crop_np,
-                                target_face_meta=active_face_meta,
-                                backend_result=backend_result,
-                                occlusion_keep_mask_f32=None,
-                            )
+                            if self.face_compositor.cfg.debug or self.debug_enabled:
+                                out, comp_debug = self.face_compositor.compose_debug(
+                                    original_roi_bgr_u8=crop_np,
+                                    target_face_meta=active_face_meta,
+                                    backend_result=backend_result,
+                                    occlusion_keep_mask_f32=None,
+                                )
+                                self._save_compositor_debug(frame_num, comp_debug)
+                                self._save_debug_text(frame_num, f"compositor_debug_keys={sorted(comp_debug.keys())}")
+                            else:
+                                out = self.face_compositor.compose(
+                                    original_roi_bgr_u8=crop_np,
+                                    target_face_meta=active_face_meta,
+                                    backend_result=backend_result,
+                                    occlusion_keep_mask_f32=None,
+                                )
                         except Exception as e:
                             self._save_debug_text(frame_num, f"face_compositor_exception={e!r}")
                             out = None
                     else:
                         self._save_debug_text(frame_num, "swap_result_returned=None")
                 else:
+                    self._save_debug_text(frame_num, "worker_branch=legacy_swap")
+
                     try:
                         out = self.worker.swap(crop_np, active_face_meta)
                     except Exception as e:
