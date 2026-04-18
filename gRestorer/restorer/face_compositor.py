@@ -101,32 +101,70 @@ class FaceCompositor:
         size = int(aligned_size)
         mask = np.zeros((size, size), dtype=np.float32)
 
-        # Stable canonical aligned-space face mask.
-        # Landmarks are still used upstream for alignment; this mask is only for
-        # deciding how much of the aligned swapped face we trust during paste-back.
+        # Stable aligned-space feature-priority mask.
+        # Landmarks are still used upstream for alignment; here we only decide
+        # which aligned regions of the swapped face are trusted during paste-back.
         expand = float(self.cfg.geom_expand) if float(self.cfg.geom_expand) > 0.0 else 1.0
 
-        # Canonical face-shaped ellipse in aligned space.
-        # Tuned to cover most of the face while avoiding hair/ears/background.
+        def _ellipse(cx_f: float, cy_f: float, rx_f: float, ry_f: float) -> None:
+            cx = int(round(cx_f * size))
+            cy = int(round(cy_f * size))
+            rx = max(1, int(round(rx_f * size * expand)))
+            ry = max(1, int(round(ry_f * size * expand)))
+            cv2.ellipse(
+                mask,
+                center=(cx, cy),
+                axes=(rx, ry),
+                angle=0.0,
+                startAngle=0.0,
+                endAngle=360.0,
+                color=1.0,
+                thickness=-1,
+            )
 
-        cx = 0.50 * size
-        cy = 0.55 * size
-        rx = 0.27 * size * expand
-        ry = 0.34 * size * expand
+        # Eyes: prioritize identity-critical regions, but keep them compact.
+        _ellipse(0.37, 0.40, 0.115, 0.090)
+        _ellipse(0.63, 0.40, 0.115, 0.090)
 
-        cv2.ellipse(
-            mask,
-            center=(int(round(cx)), int(round(cy))),
-            axes=(max(1, int(round(rx))), max(1, int(round(ry)))),
-            angle=0.0,
-            startAngle=0.0,
-            endAngle=360.0,
-            color=1.0,
-            thickness=-1,
-        )
+        # Nose / central face bridge.
+        _ellipse(0.50, 0.53, 0.110, 0.145)
 
-        # Gentle soften before later postprocess blur/dilate.
-        k = max(5, int(size * 0.05))
+        # Mouth / philtrum / lower face.
+        _ellipse(0.50, 0.67, 0.180, 0.110)
+
+        # Chin support so lower face does not cut off too abruptly.
+        _ellipse(0.50, 0.79, 0.135, 0.080)
+
+        # Soft bridges so the mask does not look like disconnected blobs.
+        # Vertical bridge through center face.
+        bridge_w = max(1, int(round(0.18 * size * expand)))
+        bridge_h = max(1, int(round(0.36 * size * expand)))
+        bx1 = int(round(0.50 * size - 0.5 * bridge_w))
+        by1 = int(round(0.46 * size - 0.5 * bridge_h))
+        bx2 = bx1 + bridge_w
+        by2 = by1 + bridge_h
+        cv2.rectangle(mask, (bx1, by1), (bx2, by2), 1.0, thickness=-1)
+
+        # Subtle eye-to-nose bridges.
+        cheek_w = max(1, int(round(0.10 * size * expand)))
+        cheek_h = max(1, int(round(0.14 * size * expand)))
+
+        # Left bridge
+        lx1 = int(round(0.42 * size - 0.5 * cheek_w))
+        ly1 = int(round(0.47 * size - 0.5 * cheek_h))
+        lx2 = lx1 + cheek_w
+        ly2 = ly1 + cheek_h
+        cv2.rectangle(mask, (lx1, ly1), (lx2, ly2), 1.0, thickness=-1)
+
+        # Right bridge
+        rx1 = int(round(0.58 * size - 0.5 * cheek_w))
+        ry1 = int(round(0.47 * size - 0.5 * cheek_h))
+        rx2 = rx1 + cheek_w
+        ry2 = ry1 + cheek_h
+        cv2.rectangle(mask, (rx1, ry1), (rx2, ry2), 1.0, thickness=-1)
+
+        # Gentle soften before later postprocess blur.
+        k = max(7, int(size * 0.06))
         if k % 2 == 0:
             k += 1
         mask = cv2.GaussianBlur(mask, (k, k), 0)
