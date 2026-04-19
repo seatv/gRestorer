@@ -11,6 +11,7 @@ from gRestorer.detector.core import FaceMetadata
 from gRestorer.restorer.face_types import FaceSwapBackendResult
 
 
+
 class SimSwapWorker:
     """Pure SimSwap worker.
 
@@ -35,6 +36,23 @@ class SimSwapWorker:
         ],
         dtype=np.float32,
     )
+
+    @staticmethod
+    def _u8_to_f32(img: np.ndarray) -> np.ndarray:
+        arr = np.asarray(img)
+        if arr.dtype == np.uint8:
+            return np.ascontiguousarray(arr.astype(np.float32) / 255.0)
+        arr = arr.astype(np.float32, copy=False)
+        if arr.max() > 1.0:
+            arr = arr / 255.0
+        return np.ascontiguousarray(np.clip(arr, 0.0, 1.0))
+
+    @staticmethod
+    def _f32_to_u8(img: np.ndarray) -> np.ndarray:
+        arr = np.asarray(img, dtype=np.float32)
+        if arr.max() <= 1.0:
+            arr = arr * 255.0
+        return np.ascontiguousarray(np.clip(arr, 0.0, 255.0).round().astype(np.uint8))
 
     def __init__(
         self,
@@ -107,6 +125,23 @@ class SimSwapWorker:
             f"layout={self._image_input_layout} image_input={self._image_input_name} "
             f"embedding_input={self._embedding_input_name} converter={'yes' if self._embedding_converter is not None else 'no'}"
         )
+
+    @staticmethod
+    def _u8_to_f32(img: np.ndarray) -> np.ndarray:
+        arr = np.asarray(img)
+        if arr.dtype == np.uint8:
+            return np.ascontiguousarray(arr.astype(np.float32) / 255.0)
+        arr = arr.astype(np.float32, copy=False)
+        if arr.max() > 1.0:
+            arr = arr / 255.0
+        return np.ascontiguousarray(np.clip(arr, 0.0, 1.0))
+
+    @staticmethod
+    def _f32_to_u8(img: np.ndarray) -> np.ndarray:
+        arr = np.asarray(img, dtype=np.float32)
+        if arr.max() <= 1.0:
+            arr = arr * 255.0
+        return np.ascontiguousarray(np.clip(arr, 0.0, 255.0).round().astype(np.uint8))
 
     @staticmethod
     def _providers_for(provider: str, device: torch.device) -> List[str]:
@@ -342,6 +377,47 @@ class SimSwapWorker:
             },
         )
 
+    def swap_result(
+        self,
+        roi_bgr_u8: np.ndarray,
+        target_face_meta: FaceMetadata,
+    ) -> Optional[FaceSwapBackendResult]:
+        if roi_bgr_u8 is None:
+            return None
+
+        kps5 = self._extract_target_kps5(target_face_meta)
+        aligned, M = self._align_face(roi_bgr_u8, kps5)
+        img_in = self._prepare_simswap_image(aligned)
+        emb_in = self._src_embedding
+        raw = self._run_simswap_once(img_in, emb_in)
+        swapped_aligned = self._decode_simswap_output(raw)
+
+        target_landmarks_aligned = cv2.transform(
+            kps5.reshape(-1, 1, 2).astype(np.float32),
+            M.astype(np.float32),
+        ).reshape(-1, 2)
+
+        pred_src = self._make_face_mask(int(swapped_aligned.shape[0]))
+        pred_dst = pred_src.copy()
+
+        return FaceSwapBackendResult(
+            swapped_face_f32=self._u8_to_f32(swapped_aligned),
+            pred_src_mask_f32=np.ascontiguousarray(pred_src.astype(np.float32)),
+            pred_dst_mask_f32=np.ascontiguousarray(pred_dst.astype(np.float32)),
+            aligned_target_f32=self._u8_to_f32(aligned),
+            target_landmarks_aligned=np.ascontiguousarray(target_landmarks_aligned.astype(np.float32)),
+            source_landmarks_aligned=None,
+            roi_to_aligned=np.asarray(M, dtype=np.float32),
+            aligned_to_roi=np.asarray(cv2.invertAffineTransform(M), dtype=np.float32),
+            aligned_size=int(swapped_aligned.shape[0]),
+            quality=None,
+            backend="simswap",
+            debug={
+                "backend": "simswap",
+                "image_size": int(self._image_size),
+                "provider": self.provider,
+            },
+        )
 
     def swap(self, roi_bgr_u8: np.ndarray, target_face_meta: FaceMetadata) -> Optional[np.ndarray]:
         result = self.swap_result(roi_bgr_u8, target_face_meta)
@@ -349,8 +425,7 @@ class SimSwapWorker:
             return None
         return self._paste_aligned_face_back(
             roi_bgr_u8,
-            result.aligned_swapped_bgr_u8,
+            self._f32_to_u8(result.swapped_face_f32),
             result.roi_to_aligned,
         )
-
 __all__ = ["SimSwapWorker"]

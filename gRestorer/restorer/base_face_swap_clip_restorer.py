@@ -60,7 +60,6 @@ class FaceSwapRestoreStats:
     def avg_occluder_mean_abs_diff(self) -> float:
         return self.occluder_mean_abs_diff_accum / max(1, self.frames_occluder_returned)
 
-
 class BaseFaceSwapClipRestorer(BaseClipRestorer):
     """ROI-authoritative face-swap wrapper with enhancer and optional occluder.
 
@@ -592,22 +591,26 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
             cv2.imwrite(str(out), np.ascontiguousarray(arr))
 
         try:
+
             if "aligned_geom_mask_f32" in debug:
                 _save_mask("03d_geom_mask", debug["aligned_geom_mask_f32"])
-            if "aligned_backend_mask_f32" in debug:
-                _save_mask("03e_backend_mask_compositor", debug["aligned_backend_mask_f32"])
+            if "aligned_pred_src_mask_f32" in debug:
+                _save_mask("03e_pred_src_mask", debug["aligned_pred_src_mask_f32"])
+            if "aligned_pred_dst_mask_f32" in debug:
+                _save_mask("03f_pred_dst_mask", debug["aligned_pred_dst_mask_f32"])
             if "aligned_combined_mask_f32" in debug:
-                _save_mask("03f_combined_mask", debug["aligned_combined_mask_f32"])
+                _save_mask("03g_combined_mask", debug["aligned_combined_mask_f32"])
             if "roi_warped_alpha_f32" in debug:
-                _save_mask("03g_warped_alpha", debug["roi_warped_alpha_f32"])
+                _save_mask("03h_warped_alpha", debug["roi_warped_alpha_f32"])
             if "roi_warped_face_bgr_u8" in debug:
-                _save_img("03h_warped_face", debug["roi_warped_face_bgr_u8"])
+                _save_img("03i_warped_face", debug["roi_warped_face_bgr_u8"])
             if "roi_keep_mask_f32" in debug:
-                _save_mask("03i_keep_mask", debug["roi_keep_mask_f32"])
+                _save_mask("03j_keep_mask", debug["roi_keep_mask_f32"])
 
             txt_path = self.debug_dir / f"f{frame_num:06d}.txt"
             with open(txt_path, "a", encoding="utf-8") as f:
                 f.write(f"compositor_debug_keys={sorted(debug.keys())}\n")
+
         except Exception as e:
             txt_path = self.debug_dir / f"f{frame_num:06d}.txt"
             with open(txt_path, "a", encoding="utf-8") as f:

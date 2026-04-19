@@ -171,41 +171,79 @@ class FaceCompositor:
 
         return np.clip(mask, 0.0, 1.0)
 
+    @staticmethod
+    def _ensure_hwc_f32(img: np.ndarray) -> np.ndarray:
+        arr = np.asarray(img)
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            raise ValueError(f"Expected HWC image, got shape={tuple(arr.shape)}")
+        arr = arr.astype(np.float32, copy=False)
+        if arr.max() > 1.0:
+            arr = arr / 255.0
+        return np.ascontiguousarray(np.clip(arr, 0.0, 1.0))
+
+    @staticmethod
+    def _f32_to_u8(img: np.ndarray) -> np.ndarray:
+        arr = np.asarray(img, dtype=np.float32)
+        if arr.max() <= 1.0:
+            arr = arr * 255.0
+        return np.ascontiguousarray(np.clip(arr, 0.0, 255.0).round().astype(np.uint8))
+
+
+
     def _combine_masks(
         self,
         geom_mask_f32: Optional[np.ndarray],
-        backend_mask_f32: Optional[np.ndarray],
+        pred_src_mask_f32: Optional[np.ndarray],
+        pred_dst_mask_f32: Optional[np.ndarray],
     ) -> np.ndarray:
         g = self._ensure_mask_f32(geom_mask_f32)
-        b = self._ensure_mask_f32(backend_mask_f32, shape_hw=(g.shape[0], g.shape[1]) if g is not None else None)
 
-        mode = str(self.cfg.mask_mode or "geom_backend_intersection").strip().lower()
+        shape_hw = None if g is None else (g.shape[0], g.shape[1])
+        s = self._ensure_mask_f32(pred_src_mask_f32, shape_hw=shape_hw)
+        d = self._ensure_mask_f32(pred_dst_mask_f32, shape_hw=shape_hw if shape_hw is not None else (s.shape[0], s.shape[1]) if s is not None else None)
 
-        if g is None and b is None:
-            raise ValueError("Both geom and backend masks are None")
+        mode = str(self.cfg.mask_mode or "geom").strip().lower()
+
+        def _pred_both() -> Optional[np.ndarray]:
+            if s is None and d is None:
+                return None
+            if s is None:
+                return d
+            if d is None:
+                return s
+            return np.minimum(s, d)
+
+        p = _pred_both()
 
         if mode in ("geom", "geometric"):
-            return g if g is not None else b
-        if mode in ("backend", "pred", "predicted"):
-            return b if b is not None else g
-        if mode in ("union", "geom_backend_union"):
-            if g is None:
-                return b
-            if b is None:
-                return g
-            return np.maximum(g, b)
-        if mode in ("intersection", "geom_backend_intersection", "geom*backend"):
-            if g is None:
-                return b
-            if b is None:
-                return g
-            return np.minimum(g, b)
+            return g if g is not None else (p if p is not None else s if s is not None else d)
 
-        if g is None:
-            return b
-        if b is None:
-            return g
-        return np.minimum(g, b)
+        if mode in ("pred_src", "src", "predicted_src"):
+            return s if s is not None else (g if g is not None else d)
+
+        if mode in ("pred_dst", "dst", "predicted_dst"):
+            return d if d is not None else (g if g is not None else s)
+
+        if mode in ("pred_both", "pred_src_dst", "predicted_both"):
+            return p if p is not None else (g if g is not None else s if s is not None else d)
+
+        if mode in ("geom_pred_intersection", "intersection"):
+            if g is None:
+                return p if p is not None else s if s is not None else d
+            q = p if p is not None else s if s is not None else d
+            if q is None:
+                return g
+            return np.minimum(g, q)
+
+        if mode in ("geom_pred_union", "union"):
+            if g is None:
+                return p if p is not None else s if s is not None else d
+            q = p if p is not None else s if s is not None else d
+            if q is None:
+                return g
+            return np.maximum(g, q)
+
+        return g if g is not None else (p if p is not None else s if s is not None else d)
 
     def _postprocess_mask(self, mask_f32: np.ndarray) -> np.ndarray:
         m = np.clip(mask_f32.astype(np.float32, copy=False), 0.0, 1.0)
@@ -291,18 +329,14 @@ class FaceCompositor:
         backend_result: FaceSwapBackendResult,
         occlusion_keep_mask_f32: Optional[np.ndarray] = None,
     ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-        roi = self._ensure_hwc_u8(original_roi_bgr_u8)
-        aligned_swapped = self._ensure_hwc_u8(backend_result.aligned_swapped_bgr_u8)
+        roi_u8 = self._ensure_hwc_u8(original_roi_bgr_u8)
+        roi_h, roi_w = int(roi_u8.shape[0]), int(roi_u8.shape[1])
 
-        roi_h, roi_w = int(roi.shape[0]), int(roi.shape[1])
-        aligned_size = int(backend_result.aligned_size or aligned_swapped.shape[0])
+        swapped_f32 = self._ensure_hwc_f32(backend_result.swapped_face_f32)
+        aligned_size = int(backend_result.aligned_size or swapped_f32.shape[0])
 
-        if aligned_swapped.shape[0] != aligned_size or aligned_swapped.shape[1] != aligned_size:
-            aligned_swapped = cv2.resize(
-                aligned_swapped,
-                (aligned_size, aligned_size),
-                interpolation=cv2.INTER_LINEAR,
-            )
+        if swapped_f32.shape[0] != aligned_size or swapped_f32.shape[1] != aligned_size:
+            swapped_f32 = cv2.resize(swapped_f32, (aligned_size, aligned_size), interpolation=cv2.INTER_LINEAR)
 
         geom_mask = self._build_geom_mask_aligned(
             target_face_meta,
@@ -310,22 +344,21 @@ class FaceCompositor:
             aligned_size,
         )
 
-        backend_mask = self._ensure_mask_f32(
-            backend_result.aligned_backend_mask_f32,
-            shape_hw=(aligned_size, aligned_size),
-        )
+        pred_src = self._ensure_mask_f32(backend_result.pred_src_mask_f32, shape_hw=(aligned_size, aligned_size))
+        pred_dst = self._ensure_mask_f32(backend_result.pred_dst_mask_f32, shape_hw=(aligned_size, aligned_size))
 
-        combined_mask = self._combine_masks(geom_mask, backend_mask)
+        combined_mask = self._combine_masks(geom_mask, pred_src, pred_dst)
         combined_mask = self._postprocess_mask(combined_mask)
 
-        aligned_swapped = self._maybe_color_transfer(
-            backend_result.aligned_target_bgr_u8,
-            aligned_swapped,
-            combined_mask,
-        )
+        aligned_target_u8 = None
+        if backend_result.aligned_target_f32 is not None:
+            aligned_target_u8 = self._f32_to_u8(self._ensure_hwc_f32(backend_result.aligned_target_f32))
+
+        swapped_u8 = self._f32_to_u8(swapped_f32)
+        swapped_u8 = self._maybe_color_transfer(aligned_target_u8, swapped_u8, combined_mask)
 
         warped_face = self._warp_aligned_face_to_roi(
-            aligned_swapped,
+            swapped_u8,
             np.asarray(backend_result.aligned_to_roi, dtype=np.float32),
             roi_w,
             roi_h,
@@ -343,11 +376,12 @@ class FaceCompositor:
             warped_alpha = warped_alpha * (1.0 - keep_mask)
 
         warped_alpha = np.clip(warped_alpha, 0.0, 1.0)
-        out = self._blend_alpha(roi, warped_face, warped_alpha)
+        out = self._blend_alpha(roi_u8, warped_face, warped_alpha)
 
         debug = {
             "aligned_geom_mask_f32": geom_mask,
-            "aligned_backend_mask_f32": backend_mask if backend_mask is not None else np.zeros_like(combined_mask),
+            "aligned_pred_src_mask_f32": pred_src if pred_src is not None else np.zeros_like(combined_mask),
+            "aligned_pred_dst_mask_f32": pred_dst if pred_dst is not None else np.zeros_like(combined_mask),
             "aligned_combined_mask_f32": combined_mask,
             "roi_warped_alpha_f32": warped_alpha,
             "roi_warped_face_bgr_u8": warped_face,
@@ -356,6 +390,7 @@ class FaceCompositor:
             debug["roi_keep_mask_f32"] = keep_mask
 
         return np.ascontiguousarray(out), debug
+
 
     def compose(
         self,
