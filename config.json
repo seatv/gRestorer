@@ -9,7 +9,7 @@
 		"save_detection_json": false,
 		"output_dir": "debug_output",
 		"face_swap": {
-			"enabled": true,
+			"enabled": false,
 			"trace": false,
 			"trace_dir": "D:\\Temp\\fs_trace",
 			"debug_images": true,
@@ -95,7 +95,7 @@
 			"blend_mode": "alpha",
 			"color_transfer": "none",
 			"face_scale": 0.0,
-			"debug": true
+			"debug": false
 		}
 	},
 	"enhancement": {
