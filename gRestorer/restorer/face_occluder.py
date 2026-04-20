@@ -29,6 +29,9 @@ class FaceOccluder:
         blur: int = 5,
         blend: int = 100,
         invert: bool = False,
+        video_memory_strategy: str = "strict",
+        gpu_mem_limit_mb: int = 256,
+        cuda_use_max_workspace: bool = False,
     ) -> None:
         self.device = device
         self.occluder_model_path = str(occluder_model_path)
@@ -37,14 +40,36 @@ class FaceOccluder:
         self.blur = int(max(0, blur))
         self.blend = int(max(0, min(100, blend)))
         self.invert = bool(invert)
+        self.video_memory_strategy = str(video_memory_strategy or "strict").lower()
+        self.gpu_mem_limit_mb = int(gpu_mem_limit_mb)
+        self.cuda_use_max_workspace = bool(cuda_use_max_workspace)
 
         try:
             import onnxruntime as ort
         except Exception as e:
             raise ImportError("FaceOccluder requires onnxruntime / onnxruntime-gpu in the gRestorer environment.") from e
 
-        providers = self._providers_for(self.provider, self.device)
-        self._session = ort.InferenceSession(self.occluder_model_path, providers=providers)
+        strat_limit_mb, strat_workspace = self._memory_strategy_defaults(self.video_memory_strategy)
+        if self.gpu_mem_limit_mb <= 0:
+            self.gpu_mem_limit_mb = strat_limit_mb
+        if not self.cuda_use_max_workspace:
+            self.cuda_use_max_workspace = strat_workspace
+
+        providers, provider_options = self._provider_config(
+            self.provider,
+            self.device,
+            gpu_mem_limit_mb=self.gpu_mem_limit_mb,
+            use_max_workspace=self.cuda_use_max_workspace,
+        )
+
+        self._providers = providers
+        self._provider_options = provider_options
+
+        self._session = ort.InferenceSession(
+            self.occluder_model_path,
+            providers=providers,
+            provider_options=provider_options,
+        )
         self._input = self._session.get_inputs()[0]
         self._output = self._session.get_outputs()[0]
         self._input_name = self._input.name
@@ -54,19 +79,48 @@ class FaceOccluder:
 
         print(
             f"[FaceOccluder] provider={self.provider} input_size={self.input_size} "
-            f"layout={self.input_layout} input={self._input_name} output={self._output_name}"
+            f"layout={self.input_layout} input={self._input_name} output={self._output_name} "
+            f"memory_strategy={self.video_memory_strategy} gpu_mem_limit_mb={self.gpu_mem_limit_mb} "
+            f"max_workspace={self.cuda_use_max_workspace}"
         )
 
     @staticmethod
-    def _providers_for(provider: str, device: torch.device) -> List[str]:
+    def _memory_strategy_defaults(strategy: str) -> tuple[int, bool]:
+        s = str(strategy or "strict").lower()
+        if s == "tolerant":
+            return 512, True
+        if s == "moderate":
+            return 384, False
+        return 256, False
+
+    @staticmethod
+    def _provider_config(
+        provider: str,
+        device: torch.device,
+        *,
+        gpu_mem_limit_mb: int,
+        use_max_workspace: bool,
+    ) -> tuple[List[str], List[dict]]:
         p = str(provider or "auto").lower()
-        if p == "cpu":
-            return ["CPUExecutionProvider"]
-        if p == "cuda":
-            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        if device.type == "cuda":
-            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        return ["CPUExecutionProvider"]
+        if p == "cpu" or device.type != "cuda":
+            return ["CPUExecutionProvider"], [{}]
+
+        device_id = 0 if device.index is None else int(device.index)
+        limit_bytes = int(max(0, gpu_mem_limit_mb)) * 1024 * 1024
+
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        provider_options = [
+            {
+                "device_id": str(device_id),
+                "gpu_mem_limit": str(limit_bytes),
+                "arena_extend_strategy": "kSameAsRequested",
+                "cudnn_conv_algo_search": "DEFAULT",
+                "cudnn_conv_use_max_workspace": "1" if use_max_workspace else "0",
+                "do_copy_in_default_stream": "1",
+            },
+            {},
+        ]
+        return providers, provider_options
 
     @staticmethod
     def _infer_input_size(shape) -> int:

@@ -115,6 +115,10 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
         debug_start: int = -1,
         debug_end: int = -1,
         material_change_mad_threshold: float = 1.0,
+        face_video_memory_strategy: str = "strict",
+        face_simswap_gpu_mem_limit_mb: int = 1024,
+        face_aux_gpu_mem_limit_mb: int = 256,
+        face_cuda_use_max_workspace: bool = False,
         **_ignored_kwargs,
     ) -> None:
         super().__init__(device=device)
@@ -141,6 +145,11 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
         self.landmark_model_path = str(landmark_model_path or "")
         self.landmark_provider = str(landmark_provider or self.provider or "auto").lower()
         self.landmark_score = float(max(0.0, min(1.0, landmark_score)))
+
+        self.face_video_memory_strategy = str(face_video_memory_strategy or "strict").lower()
+        self.face_simswap_gpu_mem_limit_mb = int(face_simswap_gpu_mem_limit_mb)
+        self.face_aux_gpu_mem_limit_mb = int(face_aux_gpu_mem_limit_mb)
+        self.face_cuda_use_max_workspace = bool(face_cuda_use_max_workspace)
 
         self.debug_enabled = bool(debug_enabled)
         self.debug_dir = Path(debug_dir)

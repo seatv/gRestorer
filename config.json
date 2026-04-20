@@ -86,6 +86,16 @@
 		"landmark_model_path": "D:\\Models\\face\\2dfan4.onnx",
 		"landmark_provider": "cuda",
 		"landmark_refiner_score": 0.5,
+		"video_memory_strategy": "strict",
+		"simswap_gpu_mem_limit_mb": 1024,
+		"aux_gpu_mem_limit_mb": 256,
+		"cuda_use_max_workspace": false,
+		"store_budget_mb": 1536,
+  		"store_hard_cap_mb": 2048,
+		"detector_video_memory_strategy": "strict",
+  		"detector_gpu_mem_limit_mb": 512,
+  		"detector_cuda_use_max_workspace": false,
+
 		"compositor": {
 			"mask_mode": "geom",
 			"geom_expand": 1.00,
@@ -126,7 +136,7 @@
 		"fill_opacity": 0.5
 	},
 	"batch_processing": {
-			"video_extensions": [ ".mp4", ".mkv", ".avi", ".mov" ],
-		"skip_existing": false
-	}
+      "skip_existing": false,
+      "video_extensions": [ ".mp4", ".mkv", ".avi", ".mov" ]
+    }
 }

@@ -41,6 +41,9 @@ class FaceDetector:
         classes: Optional[Sequence[int]] = None,
         fp16: bool = True,
         suppress_onnx_warnings: bool = False,
+        video_memory_strategy: str = "strict",
+        detector_gpu_mem_limit_mb: int = 512,
+        cuda_use_max_workspace: bool = False,
     ) -> None:
         self.model_path = str(model_path)
         self.imgsz = int(imgsz)
@@ -49,6 +52,9 @@ class FaceDetector:
         self.classes = classes
         self.fp16 = bool(fp16)
         self.suppress_onnx_warnings = bool(suppress_onnx_warnings)
+        self.video_memory_strategy = str(video_memory_strategy or "strict").lower()
+        self.detector_gpu_mem_limit_mb = int(detector_gpu_mem_limit_mb)
+        self.cuda_use_max_workspace = bool(cuda_use_max_workspace)
 
         # ROI expansion factors used only for tracker/crop boxes.
         self.top_expand = 0.05
@@ -58,6 +64,7 @@ class FaceDetector:
         if self.suppress_onnx_warnings:
             try:
                 import onnxruntime as ort
+
                 ort.set_default_logger_severity(3)  # errors only
             except Exception:
                 pass
@@ -77,8 +84,68 @@ class FaceDetector:
         else:
             ctx_id = -1
 
-        self.model = get_model(self.model_path)
+        strat_limit_mb, strat_workspace = self._memory_strategy_defaults(self.video_memory_strategy)
+
+        if self.detector_gpu_mem_limit_mb <= 0:
+            self.detector_gpu_mem_limit_mb = strat_limit_mb
+        if not self.cuda_use_max_workspace:
+            self.cuda_use_max_workspace = strat_workspace
+
+        providers, provider_options = self._cuda_provider_config(
+            gpu_mem_limit_mb=self.detector_gpu_mem_limit_mb,
+            use_max_workspace=self.cuda_use_max_workspace,
+        )
+        self._providers = providers
+        self._provider_options = provider_options
+
+        self.model = get_model(
+            self.model_path,
+            providers=providers,
+            provider_options=provider_options,
+        )
         self.model.prepare(ctx_id=ctx_id)
+
+        print(
+            f"[FaceDetector] provider={'cuda' if self.device.type == 'cuda' else 'cpu'} "
+            f"memory_strategy={self.video_memory_strategy} "
+            f"detector_limit_mb={self.detector_gpu_mem_limit_mb} "
+            f"max_workspace={self.cuda_use_max_workspace}"
+        )
+
+    def _cuda_provider_config(
+        self,
+        *,
+        gpu_mem_limit_mb: int,
+        use_max_workspace: bool,
+    ) -> tuple[list, list]:
+        if self.device.type != "cuda":
+            return ["CPUExecutionProvider"], [{}]
+
+        device_id = 0 if self.device.index is None else int(self.device.index)
+        limit_bytes = int(max(0, gpu_mem_limit_mb)) * 1024 * 1024
+
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        provider_options = [
+            {
+                "device_id": str(device_id),
+                "gpu_mem_limit": str(limit_bytes),
+                "arena_extend_strategy": "kSameAsRequested",
+                "cudnn_conv_algo_search": "DEFAULT",
+                "cudnn_conv_use_max_workspace": "1" if use_max_workspace else "0",
+                "do_copy_in_default_stream": "1",
+            },
+            {},
+        ]
+        return providers, provider_options
+
+    @staticmethod
+    def _memory_strategy_defaults(strategy: str) -> tuple[int, bool]:
+        s = str(strategy or "strict").lower()
+        if s == "tolerant":
+            return 1024, True
+        if s == "moderate":
+            return 768, False
+        return 512, False
 
     @staticmethod
     def _to_numpy_bgr_u8(frame: torch.Tensor) -> np.ndarray:

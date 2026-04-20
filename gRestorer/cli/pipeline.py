@@ -230,6 +230,41 @@ def _compute_default_store_max(width: int, height: int, max_clip_length: int) ->
     min_frames = max(max_clip_length * 2 + 32, 64)
     return max(min_frames, min(budget_frames, 600))
 
+def _compute_store_max_from_budget_mb(
+    width: int,
+    height: int,
+    budget_mb: int,
+    *,
+    floor_frames: int = 32,
+    abs_cap: int = 600,
+) -> int:
+    frame_bytes = int(width) * int(height) * 3
+    if frame_bytes <= 0:
+        return max(1, floor_frames)
+
+    budget_bytes = int(max(1, budget_mb)) * 1024 * 1024
+    budget_frames = max(1, int(budget_bytes // frame_bytes))
+
+    return max(1, min(abs_cap, max(floor_frames, budget_frames)))
+
+
+def _compute_emergency_store_max_from_budget_mb(
+    width: int,
+    height: int,
+    current_max_frames: int,
+    budget_mb: int,
+    *,
+    abs_cap: int = 600,
+) -> int:
+    frame_bytes = int(width) * int(height) * 3
+    if frame_bytes <= 0:
+        return int(current_max_frames)
+
+    budget_bytes = int(max(1, budget_mb)) * 1024 * 1024
+    budget_frames = max(1, int(budget_bytes // frame_bytes))
+
+    return max(int(current_max_frames), min(abs_cap, budget_frames))
+
 
 def _compute_emergency_store_max(
     width: int,
@@ -439,6 +474,28 @@ class Pipeline:
         self.swap_input_size: int = int(cfg_first(self.cfg, [("face_restoration", "swap_input_size"), ("restoration", "swap_input_size")], default=128))
         self.swap_provider: str = str(cfg_first(self.cfg, [("face_restoration", "provider"), ("restoration", "swap_provider")], default="auto") or "auto").lower()
         self.swap_backend: str = str(cfg_first(self.cfg, [("face_restoration", "swap_backend"), ("restoration", "swap_backend")], default="auto") or "auto").lower()
+
+        self.face_store_budget_mb: int = int(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "store_budget_mb"),
+                    ("face_restoration", "memory", "store_budget_mb"),
+                ],
+                default=1536,
+            )
+        )
+
+        self.face_store_hard_cap_mb: int = int(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "store_hard_cap_mb"),
+                    ("face_restoration", "memory", "store_hard_cap_mb"),
+                ],
+                default=2048,
+            )
+        )
 
         self.face_comp_mask_mode: str = str(
             cfg_first(
@@ -681,6 +738,85 @@ class Pipeline:
             default=1.0,
         )
 
+        self.face_video_memory_strategy: str = str(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "video_memory_strategy"),
+                    ("face_restoration", "memory", "video_memory_strategy"),
+                ],
+                default="strict",
+            )
+            or "strict"
+        ).lower()
+
+        self.face_simswap_gpu_mem_limit_mb: int = int(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "simswap_gpu_mem_limit_mb"),
+                    ("face_restoration", "memory", "simswap_gpu_mem_limit_mb"),
+                ],
+                default=1024,
+            )
+        )
+
+        self.face_aux_gpu_mem_limit_mb: int = int(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "aux_gpu_mem_limit_mb"),
+                    ("face_restoration", "memory", "aux_gpu_mem_limit_mb"),
+                ],
+                default=256,
+            )
+        )
+
+        self.face_cuda_use_max_workspace: bool = bool(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "cuda_use_max_workspace"),
+                    ("face_restoration", "memory", "cuda_use_max_workspace"),
+                ],
+                default=False,
+            )
+        )
+
+        self.face_detector_video_memory_strategy: str = str(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "detector_video_memory_strategy"),
+                    ("face_restoration", "memory", "detector_video_memory_strategy"),
+                ],
+                default="strict",
+            )
+            or "strict"
+        ).lower()
+
+        self.face_detector_gpu_mem_limit_mb: int = int(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "detector_gpu_mem_limit_mb"),
+                    ("face_restoration", "memory", "detector_gpu_mem_limit_mb"),
+                ],
+                default=512,
+            )
+        )
+
+        self.face_detector_cuda_use_max_workspace: bool = bool(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "detector_cuda_use_max_workspace"),
+                    ("face_restoration", "memory", "detector_cuda_use_max_workspace"),
+                ],
+                default=False,
+            )
+        )
+
     def _build_detector(self):
         if self.mode == "none":
             return None
@@ -704,7 +840,13 @@ class Pipeline:
             from gRestorer.detector.lada_yolo import LadaYoloDetector
             return LadaYoloDetector(**common)
         elif self.det_type == "face":
-            return FaceDetector(**common, suppress_onnx_warnings=self.face_det_suppress_onnx_warnings)
+            return FaceDetector(
+                **common,
+                suppress_onnx_warnings=self.face_det_suppress_onnx_warnings,
+                video_memory_strategy=self.face_detector_video_memory_strategy,
+                detector_gpu_mem_limit_mb=self.face_detector_gpu_mem_limit_mb,
+                cuda_use_max_workspace=self.face_detector_cuda_use_max_workspace,
+            )
         else:
             raise ValueError(f"Unknown detector_type: {self.det_type}")
 
@@ -737,15 +879,10 @@ class Pipeline:
                 swap_model_path=self.swap_model_path,
                 swap_input_size=self.swap_input_size,
                 provider=self.swap_provider,
-                face_comp_mask_mode=self.face_comp_mask_mode,
-                face_comp_geom_expand=self.face_comp_geom_expand,
-                face_comp_mask_erode=self.face_comp_mask_erode,
-                face_comp_mask_dilate=self.face_comp_mask_dilate,
-                face_comp_mask_blur=self.face_comp_mask_blur,
-                face_comp_blend_mode=self.face_comp_blend_mode,
-                face_comp_color_transfer=self.face_comp_color_transfer,
-                face_comp_face_scale=self.face_comp_face_scale,
-                face_comp_debug=self.face_comp_debug,
+                face_video_memory_strategy=self.face_video_memory_strategy,
+                face_simswap_gpu_mem_limit_mb=self.face_simswap_gpu_mem_limit_mb,
+                face_aux_gpu_mem_limit_mb=self.face_aux_gpu_mem_limit_mb,
+                face_cuda_use_max_workspace=self.face_cuda_use_max_workspace,
                 face_enhancer_enabled=self.face_enhancer_enabled,
                 face_enhancer_model_path=self.face_enhancer_model_path,
                 face_enhancer_provider=self.face_enhancer_provider,
@@ -925,7 +1062,16 @@ class Pipeline:
                 tracker = SceneTracker(cfg=tracker_cfg)
 
         if self.store_max_frames == 0:
-            computed_max = _compute_default_store_max(w, h, self.rest_max_clip_length)
+            if self.process == "face":
+                computed_max = _compute_store_max_from_budget_mb(
+                    w,
+                    h,
+                    self.face_store_budget_mb,
+                    floor_frames=32,
+                    abs_cap=600,
+                )
+            else:
+                computed_max = _compute_default_store_max(w, h, self.rest_max_clip_length)
             store = FrameStore(max_frames=computed_max)
         elif self.store_max_frames < 0:
             store = FrameStore(max_frames=0)
@@ -1299,7 +1445,24 @@ class Pipeline:
                         if store.max_frames > 0 and min_start is not None and len(store.frames_bgr_u8) > 0:
                             oldest = min(store.frames_bgr_u8.keys())
                             if sb <= oldest:
-                                new_max = _compute_emergency_store_max(w, h, self.rest_max_clip_length, store.max_frames, self.device)
+                                new_max = (
+                                    _compute_emergency_store_max_from_budget_mb(
+                                        w,
+                                        h,
+                                        store.max_frames,
+                                        self.face_store_hard_cap_mb,
+                                        abs_cap=600,
+                                    )
+                                    if self.process == "face"
+                                    else _compute_emergency_store_max(
+                                        w,
+                                        h,
+                                        self.rest_max_clip_length,
+                                        store.max_frames,
+                                        self.device,
+                                    )
+                                )
+
                                 if new_max > store.max_frames:
                                     old_max = store.max_frames
                                     store.max_frames = new_max
@@ -1349,7 +1512,24 @@ class Pipeline:
                         if store.max_frames > 0 and min_start is not None and len(store.frames_bgr_u8) > 0:
                             oldest = min(store.frames_bgr_u8.keys())
                             if sb <= oldest:
-                                new_max = _compute_emergency_store_max(w, h, self.rest_max_clip_length, store.max_frames, self.device)
+                                new_max = (
+                                    _compute_emergency_store_max_from_budget_mb(
+                                        w,
+                                        h,
+                                        store.max_frames,
+                                        self.face_store_hard_cap_mb,
+                                        abs_cap=600,
+                                    )
+                                    if self.process == "face"
+                                    else _compute_emergency_store_max(
+                                        w,
+                                        h,
+                                        self.rest_max_clip_length,
+                                        store.max_frames,
+                                        self.device,
+                                    )
+                                )
+
                                 if new_max > store.max_frames:
                                     old_max = store.max_frames
                                     store.max_frames = new_max

@@ -62,11 +62,29 @@ class SimSwapWorker:
         *,
         provider: str = "auto",
         embedding_converter_path: str | None = None,
+        video_memory_strategy: str = "strict",
+        simswap_gpu_mem_limit_mb: int = 1024,
+        aux_gpu_mem_limit_mb: int = 256,
+        cuda_use_max_workspace: bool = False,
     ) -> None:
         self.device = device
         self.source_face_path = str(source_face_path)
         self.swap_model_path = str(swap_model_path)
         self.provider = str(provider or "auto").lower()
+        self.video_memory_strategy = str(video_memory_strategy or "strict").lower()
+        self.simswap_gpu_mem_limit_mb = int(simswap_gpu_mem_limit_mb)
+        self.aux_gpu_mem_limit_mb = int(aux_gpu_mem_limit_mb)
+        self.cuda_use_max_workspace = bool(cuda_use_max_workspace)
+
+
+        strat_main_mb, strat_aux_mb, strat_workspace = self._memory_strategy_defaults(self.video_memory_strategy)
+
+        if self.simswap_gpu_mem_limit_mb <= 0:
+            self.simswap_gpu_mem_limit_mb = strat_main_mb
+        if self.aux_gpu_mem_limit_mb <= 0:
+            self.aux_gpu_mem_limit_mb = strat_aux_mb
+        if not self.cuda_use_max_workspace:
+            self.cuda_use_max_workspace = strat_workspace
 
         try:
             from insightface.app import FaceAnalysis
@@ -82,13 +100,21 @@ class SimSwapWorker:
                 "SimSwapWorker requires onnxruntime / onnxruntime-gpu in the gRestorer environment."
             ) from e
 
-        providers = self._providers_for(self.provider, self.device)
-        self._providers = providers
+        providers_main = self._cuda_provider_options(
+            gpu_mem_limit_mb=self.simswap_gpu_mem_limit_mb,
+            use_max_workspace=self.cuda_use_max_workspace,
+        )
+        providers_aux = self._cuda_provider_options(
+            gpu_mem_limit_mb=self.aux_gpu_mem_limit_mb,
+            use_max_workspace=False,
+        )
 
-        self._app = FaceAnalysis(name="buffalo_l", providers=providers)
+        self._providers = providers_main
+        self._providers_aux = providers_aux
+
+        self._app = FaceAnalysis(name="buffalo_l", providers=providers_aux)
         ctx_id = 0 if self.device.type == "cuda" else -1
         self._app.prepare(ctx_id=ctx_id, det_size=(640, 640))
-
         src = cv2.imread(self.source_face_path, cv2.IMREAD_COLOR)
         if src is None:
             raise FileNotFoundError(f"Failed to read source face image: {self.source_face_path}")
@@ -102,7 +128,8 @@ class SimSwapWorker:
             key=lambda f: float((f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])),
         )
 
-        self._session = ort.InferenceSession(self.swap_model_path, providers=providers)
+        self._session = ort.InferenceSession(self.swap_model_path, providers=providers_main)
+
         self._output_name = None
         self._image_input_name = None
         self._embedding_input_name = None
@@ -116,16 +143,18 @@ class SimSwapWorker:
         self._embedding_converter_path = self._resolve_embedding_converter_path(embedding_converter_path)
         self._embedding_converter = None
         if self._embedding_converter_path:
-            self._embedding_converter = ort.InferenceSession(self._embedding_converter_path, providers=providers)
+            self._embedding_converter = ort.InferenceSession( self._embedding_converter_path, providers=providers_aux, )
 
         self._src_embedding = self._prepare_simswap_embedding()
 
         print(
             f"[SimSwapWorker] provider={self.provider} image_size={self._image_size} "
             f"layout={self._image_input_layout} image_input={self._image_input_name} "
-            f"embedding_input={self._embedding_input_name} converter={'yes' if self._embedding_converter is not None else 'no'}"
+            f"embedding_input={self._embedding_input_name} converter={'yes' if self._embedding_converter is not None else 'no'} "
+            f"memory_strategy={self.video_memory_strategy} "
+            f"main_limit_mb={self.simswap_gpu_mem_limit_mb} aux_limit_mb={self.aux_gpu_mem_limit_mb} "
+            f"max_workspace={self.cuda_use_max_workspace}"
         )
-
     @staticmethod
     def _u8_to_f32(img: np.ndarray) -> np.ndarray:
         arr = np.asarray(img)
@@ -153,6 +182,41 @@ class SimSwapWorker:
         if device.type == "cuda":
             return ["CUDAExecutionProvider", "CPUExecutionProvider"]
         return ["CPUExecutionProvider"]
+
+    def _cuda_provider_options(
+        self,
+        *,
+        gpu_mem_limit_mb: int,
+        use_max_workspace: bool,
+    ) -> list:
+        if self.device.type != "cuda":
+            return ["CPUExecutionProvider"]
+
+        limit_bytes = int(max(0, gpu_mem_limit_mb)) * 1024 * 1024
+
+        return [
+            (
+                "CUDAExecutionProvider",
+                {
+                    "device_id": 0,
+                    "gpu_mem_limit": str(limit_bytes),
+                    "arena_extend_strategy": "kSameAsRequested",
+                    "cudnn_conv_algo_search": "DEFAULT",
+                    "cudnn_conv_use_max_workspace": "1" if use_max_workspace else "0",
+                    "do_copy_in_default_stream": "1",
+                },
+            ),
+            "CPUExecutionProvider",
+        ]
+
+    @staticmethod
+    def _memory_strategy_defaults(strategy: str) -> tuple[int, int, bool]:
+        s = str(strategy or "strict").lower()
+        if s == "tolerant":
+            return 2048, 512, True
+        if s == "moderate":
+            return 1536, 384, False
+        return 1024, 256, False
 
     def _resolve_embedding_converter_path(self, explicit: str | None) -> str:
         if explicit:
