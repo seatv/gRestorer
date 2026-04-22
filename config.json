@@ -87,14 +87,14 @@
 		"landmark_provider": "cuda",
 		"landmark_refiner_score": 0.5,
 		"compositor": {
-			"mask_mode": "geom",
+			"mask_mode": "geom_backend_union",
 			"geom_expand": 1.00,
 			"mask_erode": 0,
 			"mask_dilate": 0,
 			"mask_blur": 3,
 			"blend_mode": "alpha",
 			"color_transfer": "none",
-			"face_scale": 0.0,
+			"face_scale": 0.1,
 			"debug": false
 		}
 	},

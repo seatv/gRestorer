@@ -1,8 +1,7 @@
-# gRestorer/restorer/simswap_worker.py
+# gRestorer/restorer/hyperswap_worker.py
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import List, Optional, Tuple
 
 import cv2
@@ -12,28 +11,31 @@ import torch
 from gRestorer.detector.core import FaceMetadata
 
 
-class SimSwapWorker:
+class HyperSwapWorker:
     """
-    Native SimSwap worker.
+    Native HyperSwap worker.
 
     Design goal:
-    - follow FaceFusion-style native SimSwap flow
+    - follow the FaceFusion-style native flow for HyperSwap
     - do NOT return FaceSwapBackendResult
     - do native warp -> infer -> mask -> paste-back in swap()
     - bypass the shared compositor entirely
     """
 
-    ARC_DST_5_V1 = np.array(
+    # FaceFusion arcface_128 normalized template.
+    ARC_TEMPLATE_128 = np.array(
         [
-            [39.7300, 51.1380],
-            [72.2700, 51.1380],
-            [56.0000, 68.4930],
-            [42.4630, 87.0100],
-            [69.5370, 87.0100],
+            [0.36167656, 0.40387734],
+            [0.63696719, 0.40235469],
+            [0.50019687, 0.56044219],
+            [0.38710391, 0.72160547],
+            [0.61507734, 0.72034453],
         ],
         dtype=np.float32,
     )
 
+    # Native mask defaults.
+    # These are intentionally conservative and easy to tune later.
     BOX_MASK_BLUR = 0.30
     BOX_MASK_PADDING = (0, 0, 0, 0)  # top, right, bottom, left in percent
     USE_AREA_MASK_IF_68 = True
@@ -45,26 +47,27 @@ class SimSwapWorker:
         source_face_path: str,
         swap_model_path: str,
         *,
+        swap_input_size: int = 256,
         provider: str = "auto",
-        embedding_converter_path: str | None = None,
     ) -> None:
         self.device = device
         self.source_face_path = str(source_face_path)
         self.swap_model_path = str(swap_model_path)
         self.provider = str(provider or "auto").lower()
+        self.requested_swap_input_size = int(swap_input_size)
 
         try:
             from insightface.app import FaceAnalysis
         except Exception as e:
             raise ImportError(
-                "SimSwapWorker requires `insightface` in the gRestorer environment."
+                "HyperSwapWorker requires `insightface` in the gRestorer environment."
             ) from e
 
         try:
             import onnxruntime as ort
         except Exception as e:
             raise ImportError(
-                "SimSwapWorker requires onnxruntime / onnxruntime-gpu in the gRestorer environment."
+                "HyperSwapWorker requires `onnxruntime` / `onnxruntime-gpu` in the gRestorer environment."
             ) from e
 
         providers = self._providers_for(self.provider, self.device)
@@ -88,27 +91,22 @@ class SimSwapWorker:
         )
 
         self._session = ort.InferenceSession(self.swap_model_path, providers=providers)
-        self._output_name: str | None = None
-        self._image_input_name: str | None = None
-        self._embedding_input_name: str | None = None
-        self._image_input_layout = "nchw"
-        self._image_size = 256
-        self._model_mean = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-        self._model_std = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-        self._init_simswap_contract()
 
-        self._embedding_converter_path = self._resolve_embedding_converter_path(embedding_converter_path)
-        self._embedding_converter = None
-        if self._embedding_converter_path:
-            self._embedding_converter = ort.InferenceSession(self._embedding_converter_path, providers=providers)
+        self._source_input_name: str = ""
+        self._target_input_name: str = ""
+        self._image_output_name: Optional[str] = None
+        self._mask_output_name: Optional[str] = None  # discovered but intentionally unused for native path
+        self._target_input_layout: str = "nchw"
+        self._target_size: int = self.requested_swap_input_size
 
-        self._src_embedding = self._prepare_simswap_embedding()
+        self._init_model_contract()
+        self._src_embedding = self._prepare_source_embedding()
 
         print(
-            f"[SimSwapWorker] provider={self.provider} image_size={self._image_size} "
-            f"layout={self._image_input_layout} image_input={self._image_input_name} "
-            f"embedding_input={self._embedding_input_name} "
-            f"converter={'yes' if self._embedding_converter is not None else 'no'}"
+            f"[HyperSwapWorker] provider={self.provider} "
+            f"size={self._target_size} layout={self._target_input_layout} "
+            f"source_input={self._source_input_name} target_input={self._target_input_name} "
+            f"image_output={self._image_output_name or '-'}"
         )
 
     @staticmethod
@@ -124,96 +122,113 @@ class SimSwapWorker:
             return ["CUDAExecutionProvider", "CPUExecutionProvider"]
         return ["CPUExecutionProvider"]
 
-    def _resolve_embedding_converter_path(self, explicit: str | None) -> str:
-        if explicit:
-            p = Path(explicit)
-            return str(p) if p.exists() else ""
-
-        model_path = Path(self.swap_model_path)
-        candidates = [
-            model_path.with_name("crossface_simswap.onnx"),
-            model_path.with_name("arcface_converter_simswap.onnx"),
-            model_path.parent / "crossface_simswap.onnx",
-            model_path.parent / "arcface_converter_simswap.onnx",
-            model_path.parent / ".assets" / "models" / "crossface_simswap.onnx",
-            model_path.parent / ".assets" / "models" / "arcface_converter_simswap.onnx",
-        ]
-        for cand in candidates:
-            if cand.exists():
-                return str(cand)
-        return ""
-
-    def _init_simswap_contract(self) -> None:
+    def _init_model_contract(self) -> None:
         inputs = list(self._session.get_inputs())
         outputs = list(self._session.get_outputs())
+
         if not inputs or not outputs:
-            raise RuntimeError("SimSwap ONNX session has no inputs or outputs.")
+            raise RuntimeError("HyperSwap ONNX session has no inputs or outputs.")
 
-        self._output_name = outputs[0].name
+        source_input = None
+        target_input = None
 
-        image_input = None
-        emb_input = None
         for inp in inputs:
+            nm = str(inp.name).lower()
             shape = tuple(inp.shape)
-            if len(shape) == 4 and image_input is None:
-                image_input = inp
-            elif len(shape) == 2 and emb_input is None:
-                emb_input = inp
+            if source_input is None and ("source" in nm or "embed" in nm or "id" in nm):
+                source_input = inp
+            if target_input is None and ("target" in nm or "image" in nm or "input" in nm):
+                if len(shape) == 4:
+                    target_input = inp
 
-        if image_input is None or emb_input is None:
+        if source_input is None:
             for inp in inputs:
-                nm = str(inp.name).lower()
-                if image_input is None and any(tok in nm for tok in ("target", "input", "img", "image")):
-                    image_input = inp
-                if emb_input is None and any(tok in nm for tok in ("source", "id", "latent", "embed")):
-                    emb_input = inp
+                if len(tuple(inp.shape)) == 2:
+                    source_input = inp
+                    break
 
-        if image_input is None or emb_input is None:
+        if target_input is None:
+            for inp in inputs:
+                if len(tuple(inp.shape)) == 4:
+                    target_input = inp
+                    break
+
+        if source_input is None or target_input is None:
             raise RuntimeError(
-                f"Could not identify SimSwap ONNX inputs: {[(i.name, tuple(i.shape)) for i in inputs]}"
+                f"Could not identify HyperSwap inputs: {[(i.name, tuple(i.shape)) for i in inputs]}"
             )
 
-        self._image_input_name = image_input.name
-        self._embedding_input_name = emb_input.name
+        self._source_input_name = source_input.name
+        self._target_input_name = target_input.name
 
-        ishape = tuple(image_input.shape)
-        if len(ishape) != 4:
-            raise RuntimeError(f"Unexpected SimSwap image input shape: {ishape}")
+        tshape = tuple(target_input.shape)
+        if len(tshape) != 4:
+            raise RuntimeError(f"Unexpected HyperSwap target input shape: {tshape}")
 
-        if isinstance(ishape[1], int) and int(ishape[1]) == 3:
-            self._image_input_layout = "nchw"
-            self._image_size = int(ishape[-1]) if isinstance(ishape[-1], int) else 256
-        elif isinstance(ishape[-1], int) and int(ishape[-1]) == 3:
-            self._image_input_layout = "nhwc"
-            self._image_size = int(ishape[1]) if isinstance(ishape[1], int) else 256
+        if isinstance(tshape[1], int) and int(tshape[1]) == 3:
+            self._target_input_layout = "nchw"
+            if isinstance(tshape[-1], int) and int(tshape[-1]) > 0:
+                self._target_size = int(tshape[-1])
+        elif isinstance(tshape[-1], int) and int(tshape[-1]) == 3:
+            self._target_input_layout = "nhwc"
+            if isinstance(tshape[1], int) and int(tshape[1]) > 0:
+                self._target_size = int(tshape[1])
         else:
-            dims = [int(v) for v in ishape if isinstance(v, int) and v > 0]
-            self._image_input_layout = "nchw"
-            self._image_size = dims[-1] if dims else 256
+            self._target_input_layout = "nchw"
 
-        name = Path(self.swap_model_path).name.lower()
-        if "unofficial_512" in name or "512_unofficial" in name:
-            self._model_mean = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-            self._model_std = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-        else:
-            self._model_mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-            self._model_std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        out_img = None
+        out_mask = None
 
-    def _prepare_simswap_embedding(self) -> np.ndarray:
-        emb = getattr(self._src_face, "embedding", None)
+        for out in outputs:
+            nm = str(out.name).lower()
+            shape = tuple(out.shape)
+            if out_img is None and ("output" in nm or "image" in nm or "face" in nm):
+                if len(shape) == 4:
+                    out_img = out
+            if out_mask is None and ("mask" in nm or "alpha" in nm):
+                out_mask = out
+
+        if out_img is None:
+            for out in outputs:
+                shape = tuple(out.shape)
+                if len(shape) != 4:
+                    continue
+                c = None
+                if isinstance(shape[1], int):
+                    c = int(shape[1])
+                elif isinstance(shape[-1], int):
+                    c = int(shape[-1])
+                if c == 3:
+                    out_img = out
+                    break
+
+        if out_img is None:
+            for out in outputs:
+                if len(tuple(out.shape)) == 4:
+                    out_img = out
+                    break
+
+        if out_img is None:
+            raise RuntimeError(
+                f"Could not identify HyperSwap image output: {[(o.name, tuple(o.shape)) for o in outputs]}"
+            )
+
+        self._image_output_name = out_img.name
+        self._mask_output_name = out_mask.name if out_mask is not None else None
+
+    def _prepare_source_embedding(self) -> np.ndarray:
+        emb = getattr(self._src_face, "normed_embedding", None)
         if emb is None:
-            emb = getattr(self._src_face, "normed_embedding", None)
+            emb = getattr(self._src_face, "embedding_norm", None)
+        if emb is None:
+            emb = getattr(self._src_face, "embedding", None)
         if emb is None:
             raise RuntimeError("Source face embedding missing from insightface result.")
 
         emb = np.asarray(emb, dtype=np.float32).reshape(1, -1)
+        if emb.shape[1] != 512:
+            raise RuntimeError(f"Unexpected HyperSwap source embedding shape: {tuple(emb.shape)}")
 
-        if self._embedding_converter is not None:
-            conv_inputs = self._embedding_converter.get_inputs()
-            conv_name = conv_inputs[0].name if conv_inputs else "input"
-            emb = self._embedding_converter.run(None, {conv_name: emb})[0]
-
-        emb = np.asarray(emb, dtype=np.float32).reshape(1, -1)
         norm = float(np.linalg.norm(emb))
         if norm > 0.0:
             emb = emb / norm
@@ -250,64 +265,87 @@ class SimSwapWorker:
             return np.ascontiguousarray(kps[:68].astype(np.float32, copy=True))
         return None
 
-    def _align_face(self, roi_bgr_u8: np.ndarray, kps5: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        dst = self.ARC_DST_5_V1.copy()
-        if self._image_size != 112:
-            dst *= float(self._image_size) / 112.0
-
-        M, _ = cv2.estimateAffinePartial2D(
+    def _estimate_roi_to_aligned(self, kps5: np.ndarray, aligned_size: int) -> np.ndarray:
+        dst = self.ARC_TEMPLATE_128 * float(aligned_size)
+        M = cv2.estimateAffinePartial2D(
             kps5.astype(np.float32),
             dst.astype(np.float32),
-            method=cv2.LMEDS,
-        )
+            method=cv2.RANSAC,
+            ransacReprojThreshold=100.0,
+        )[0]
         if M is None:
-            raise RuntimeError("Failed to estimate affine transform for SimSwap alignment.")
+            raise RuntimeError("Failed to estimate affine transform for HyperSwap alignment.")
+        return np.ascontiguousarray(M.astype(np.float32))
 
-        aligned = cv2.warpAffine(
+    @staticmethod
+    def _warp_face_by_landmark_5(
+        roi_bgr_u8: np.ndarray,
+        kps5: np.ndarray,
+        aligned_size: int,
+        template_norm: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        dst = template_norm * float(aligned_size)
+        M = cv2.estimateAffinePartial2D(
+            kps5.astype(np.float32),
+            dst.astype(np.float32),
+            method=cv2.RANSAC,
+            ransacReprojThreshold=100.0,
+        )[0]
+        if M is None:
+            raise RuntimeError("Failed to estimate affine transform for HyperSwap alignment.")
+        crop = cv2.warpAffine(
             roi_bgr_u8,
             M,
-            (self._image_size, self._image_size),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT_101,
+            (aligned_size, aligned_size),
+            flags=cv2.INTER_AREA,
+            borderMode=cv2.BORDER_REPLICATE,
         )
-        return np.ascontiguousarray(aligned), np.ascontiguousarray(M.astype(np.float32))
+        return np.ascontiguousarray(crop), np.ascontiguousarray(M.astype(np.float32))
 
-    def _prepare_simswap_image(self, aligned_bgr_u8: np.ndarray) -> np.ndarray:
+    def _prepare_target_tensor(self, aligned_bgr_u8: np.ndarray) -> np.ndarray:
         rgb = cv2.cvtColor(aligned_bgr_u8, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        rgb = (rgb - self._model_mean) / self._model_std
-        if self._image_input_layout == "nchw":
+        rgb = (rgb - 0.5) / 0.5
+
+        if self._target_input_layout == "nchw":
             rgb = np.transpose(rgb, (2, 0, 1))[None, ...]
         else:
             rgb = rgb[None, ...]
+
         return np.ascontiguousarray(rgb.astype(np.float32, copy=False))
 
     @staticmethod
-    def _decode_simswap_output(out: np.ndarray) -> np.ndarray:
-        arr = np.asarray(out)
+    def _decode_output_bgr_u8(raw_out: np.ndarray, size: int) -> np.ndarray:
+        arr = np.asarray(raw_out)
         if arr.ndim == 4:
             arr = arr[0]
+
         if arr.ndim != 3:
-            raise RuntimeError(f"Unexpected SimSwap output shape: {tuple(np.asarray(out).shape)}")
-        if arr.shape[0] == 3:
+            raise RuntimeError(f"Unexpected HyperSwap output shape: {tuple(np.asarray(raw_out).shape)}")
+
+        if arr.shape[0] == 3 and arr.shape[-1] != 3:
             arr = np.transpose(arr, (1, 2, 0))
-        y = np.clip(arr.astype(np.float32), 0.0, 1.0)
-        y = (y * 255.0).round().astype(np.uint8)
-        y = cv2.cvtColor(y, cv2.COLOR_RGB2BGR)
-        return np.ascontiguousarray(y)
 
-    def _run_simswap_once(self, img_in: np.ndarray, emb_in: np.ndarray) -> np.ndarray:
-        return self._session.run(
-            [self._output_name],
-            {
-                self._image_input_name: img_in,
-                self._embedding_input_name: emb_in,
-            },
-        )[0]
+        arr = arr.astype(np.float32, copy=False)
+        arr = arr * 0.5 + 0.5
+        arr = np.clip(arr, 0.0, 1.0)
 
-    @staticmethod
-    def _transform_points(pts_xy: np.ndarray, M_2x3: np.ndarray) -> np.ndarray:
-        pts = np.asarray(pts_xy, dtype=np.float32).reshape(-1, 1, 2)
-        return cv2.transform(pts, M_2x3).reshape(-1, 2)
+        if arr.shape[0] != size or arr.shape[1] != size:
+            arr = cv2.resize(arr, (size, size), interpolation=cv2.INTER_LINEAR)
+            arr = np.clip(arr, 0.0, 1.0)
+
+        rgb_u8 = (arr * 255.0).round().astype(np.uint8)
+        bgr_u8 = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
+        return np.ascontiguousarray(bgr_u8)
+
+    def _run_model_image_only(self, target_tensor: np.ndarray) -> np.ndarray:
+        feeds = {
+            self._source_input_name: self._src_embedding,
+            self._target_input_name: target_tensor,
+        }
+        outs = self._session.run(None, feeds)
+        if not outs:
+            raise RuntimeError("HyperSwap ONNX session returned no outputs.")
+        return outs[0]
 
     @staticmethod
     def _create_box_mask(
@@ -319,6 +357,7 @@ class SimSwapWorker:
         blur_amount = int(crop_w * 0.5 * float(face_mask_blur))
         blur_area = max(blur_amount // 2, 1)
 
+        # mask shape follows FaceFusion style: (width, height) construction
         box_mask = np.ones((crop_h, crop_w), dtype=np.float32)
 
         top, right, bottom, left = [int(v) for v in face_mask_padding]
@@ -344,6 +383,11 @@ class SimSwapWorker:
         mask = cv2.GaussianBlur(mask.clip(0.0, 1.0), (0, 0), sigma).clip(0.5, 1.0)
         mask = (mask - 0.5) * 2.0
         return np.ascontiguousarray(np.clip(mask, 0.0, 1.0))
+
+    @staticmethod
+    def _transform_points(pts_xy: np.ndarray, M_2x3: np.ndarray) -> np.ndarray:
+        pts = np.asarray(pts_xy, dtype=np.float32).reshape(-1, 1, 2)
+        return cv2.transform(pts, M_2x3).reshape(-1, 2)
 
     @staticmethod
     def _calculate_paste_area(
@@ -425,16 +469,23 @@ class SimSwapWorker:
         if roi_bgr_u8 is None:
             return None
 
-        kps5 = self._extract_target_kps5(target_face_meta)
-        aligned_bgr_u8, affine_matrix = self._align_face(roi_bgr_u8, kps5)
+        aligned_size = int(self._target_size)
 
-        img_in = self._prepare_simswap_image(aligned_bgr_u8)
-        emb_in = self._src_embedding
-        raw = self._run_simswap_once(img_in, emb_in)
-        swapped_crop_bgr_u8 = self._decode_simswap_output(raw)
+        kps5 = self._extract_target_kps5(target_face_meta)
+        crop_bgr_u8, affine_matrix = self._warp_face_by_landmark_5(
+            roi_bgr_u8=roi_bgr_u8,
+            kps5=kps5,
+            aligned_size=aligned_size,
+            template_norm=self.ARC_TEMPLATE_128,
+        )
+
+        target_tensor = self._prepare_target_tensor(crop_bgr_u8)
+        raw_img = self._run_model_image_only(target_tensor)
+        swapped_crop_bgr_u8 = self._decode_output_bgr_u8(raw_img, aligned_size)
 
         crop_masks: List[np.ndarray] = []
 
+        # FaceFusion-style box mask is always the base mask.
         crop_masks.append(
             self._create_box_mask(
                 swapped_crop_bgr_u8,
@@ -443,19 +494,23 @@ class SimSwapWorker:
             )
         )
 
+        # Optional area mask when 68 landmarks are available from the refiner.
         if self.USE_AREA_MASK_IF_68:
             kps68 = self._extract_target_kps68(target_face_meta)
             if kps68 is not None:
                 kps68_aligned = self._transform_points(kps68, affine_matrix)
                 crop_masks.append(
                     self._create_area_mask_from_landmarks68(
-                        crop_size=int(swapped_crop_bgr_u8.shape[0]),
+                        crop_size=aligned_size,
                         landmarks68_aligned=kps68_aligned,
                         sigma=self.AREA_MASK_SIGMA,
                     )
                 )
 
-        crop_mask = np.minimum.reduce(crop_masks).clip(0.0, 1.0)
+        if crop_masks:
+            crop_mask = np.minimum.reduce(crop_masks).clip(0.0, 1.0)
+        else:
+            crop_mask = np.ones((aligned_size, aligned_size), dtype=np.float32)
 
         pasted_roi = self._paste_back(
             roi_bgr_u8=roi_bgr_u8,
@@ -466,4 +521,4 @@ class SimSwapWorker:
         return pasted_roi
 
 
-__all__ = ["SimSwapWorker"]
+__all__ = ["HyperSwapWorker"]

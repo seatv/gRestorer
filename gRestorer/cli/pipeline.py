@@ -20,8 +20,10 @@ from gRestorer.detector.face_detector import FaceDetector
 from gRestorer.restorer.basicvsrpp_clip_restorer import BasicVSRPPClipRestorer
 from gRestorer.restorer.compositor import _composite_clip_into_store, _composite_clip_into_store_laplacian
 from gRestorer.restorer.pseudo_clip_restorer import PseudoClipRestorer
+
 from gRestorer.restorer.inswapper_clip_restorer import InSwapperClipRestorer
 from gRestorer.restorer.simswap_clip_restorer import SimSwapClipRestorer
+from gRestorer.restorer.hyperswap_clip_restorer import HyperSwapClipRestorer
 
 from gRestorer.core.lada_clip import LadaClip
 from gRestorer.restorer.lada_basicvsrpp_clip_restorer import LadaBasicVSRPPClipRestorer
@@ -151,16 +153,18 @@ class PipelineMetrics:
         return self.t_decode + self.t_det + self.t_track + self.t_restore + self.t_encode
 
 
-
-
 def _detect_face_swap_backend(model_path: str, configured_backend: str = "auto") -> str:
     b = str(configured_backend or "auto").strip().lower()
-    if b in ("inswapper", "simswap"):
+    if b in ("inswapper", "simswap", "hyperswap"):
         return b
+
     name = Path(str(model_path or "")).name.lower()
+    if "hyperswap" in name:
+        return "hyperswap"
     if "simswap" in name:
         return "simswap"
     return "inswapper"
+
 
 
 def _pick_device(gpu_id: int) -> torch.device:
@@ -730,7 +734,13 @@ class Pipeline:
             swap_backend = _detect_face_swap_backend(self.swap_model_path, self.swap_backend)
             print(f"[FaceSwap] backend={swap_backend}")
 
-            restorer_cls = SimSwapClipRestorer if swap_backend == "simswap" else InSwapperClipRestorer
+            if swap_backend == "simswap":
+                restorer_cls = SimSwapClipRestorer
+            elif swap_backend == "hyperswap":
+                restorer_cls = HyperSwapClipRestorer
+            else:
+                restorer_cls = InSwapperClipRestorer
+
             return restorer_cls(
                 device=self.device,
                 source_face_path=self.source_face_path,

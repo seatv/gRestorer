@@ -116,7 +116,7 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--swap-model", default=None, help="ONNX face swap model path")
     p.add_argument("--swap-input-size", type=int, default=None)
     p.add_argument("--swap-provider", choices=["auto", "cuda", "cpu"], default=None)
-    p.add_argument("--swap-backend", choices=["auto", "inswapper", "simswap"], default=None, help="Face swap backend override (default: auto by model path)")
+    p.add_argument("--swap-backend", choices=["auto", "inswapper", "simswap", "hyperswap"], default=None, help="Face swap backend override (default: auto by model path)")
     p.add_argument("--face-enhancer-model", default=None, help="Optional ONNX face enhancer model path (GFPGAN-like single-input model)")
     p.add_argument("--face-enhancer-blend", type=int, default=None, help="Optional face enhancer blend 0..100")
     p.add_argument("--rest-compositor-quantize-before-resize", action=argparse.BooleanOptionalAction, default=None)

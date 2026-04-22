@@ -38,6 +38,8 @@ class FaceSwapRestoreStats:
     frames_worker_called: int = 0
     frames_worker_returned: int = 0
     frames_worker_returned_none: int = 0
+    worker_exceptions: int = 0
+    last_worker_exception: str = ""
     frames_materially_changed: int = 0
     mean_abs_diff_accum: float = 0.0
     frames_enhancer_called: int = 0
@@ -151,6 +153,7 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
 
         self.material_change_mad_threshold = float(material_change_mad_threshold)
         self.stats = FaceSwapRestoreStats()
+        self._swap_exception_print_budget = 5
 
         self.worker = self._build_worker()
 
@@ -548,6 +551,7 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
             f"[FaceSwapStats] selector_called={self.stats.frames_selector_called} candidates_found={self.stats.frames_selector_candidates_found} replaced={self.stats.frames_selector_replaced}",
             f"[FaceSwapStats] selector_kept={self.stats.frames_selector_kept} selector_no_viable={self.stats.frames_selector_no_viable}",
             f"[FaceSwapStats] worker_called={self.stats.frames_worker_called} returned={self.stats.frames_worker_returned} returned_none={self.stats.frames_worker_returned_none}",
+            f"[FaceSwapStats] worker_exceptions={self.stats.worker_exceptions} last_worker_exception={self.stats.last_worker_exception or '-'}",
             f"[FaceSwapStats] materially_changed={self.stats.frames_materially_changed} mad_threshold={self.material_change_mad_threshold:.3f} avg_mad={self.stats.avg_mean_abs_diff():.4f}",
             f"[FaceSwapStats] enhancer_called={self.stats.frames_enhancer_called} returned={self.stats.frames_enhancer_returned} failed={self.stats.frames_enhancer_failed}",
             f"[FaceSwapStats] enhancer_materially_changed={self.stats.frames_enhancer_materially_changed} avg_enhancer_mad={self.stats.avg_enhancer_mean_abs_diff():.4f}",
@@ -723,7 +727,12 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
                     try:
                         backend_result = self.worker.swap_result(crop_np, active_face_meta)
                     except Exception as e:
+                        self.stats.worker_exceptions += 1
+                        self.stats.last_worker_exception = repr(e)
                         self._save_debug_text(frame_num, f"swap_result_exception={e!r}")
+                        if self._swap_exception_print_budget > 0:
+                            print(f"[FaceSwap][swap_result_exception] frame={frame_num} {e!r}")
+                            self._swap_exception_print_budget -= 1
                         backend_result = None
 
                     if backend_result is not None:
@@ -756,7 +765,12 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
                     try:
                         out = self.worker.swap(crop_np, active_face_meta)
                     except Exception as e:
+                        self.stats.worker_exceptions += 1
+                        self.stats.last_worker_exception = repr(e)
                         self._save_debug_text(frame_num, f"swap_exception={e!r}")
+                        if self._swap_exception_print_budget > 0:
+                            print(f"[FaceSwap][swap_exception] frame={frame_num} {e!r}")
+                            self._swap_exception_print_budget -= 1
                         out = None
 
                 if out is None:

@@ -1,13 +1,13 @@
-from __future__ import annotations
+# gRestorer/restorer/simswap_clip_restorer.py
 
-import torch
+from __future__ import annotations
 
 from gRestorer.restorer.base_face_swap_clip_restorer import BaseFaceSwapClipRestorer
 from gRestorer.restorer.simswap_worker import SimSwapWorker
 
 
 class SimSwapClipRestorer(BaseFaceSwapClipRestorer):
-    """Face-swap clip restorer using SimSwap ONNX as the concrete worker."""
+    """Face-swap clip restorer using native SimSwap paste-back."""
 
     def _build_worker(self):
         return SimSwapWorker(

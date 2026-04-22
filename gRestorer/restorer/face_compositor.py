@@ -11,8 +11,47 @@ from gRestorer.restorer.face_types import FaceSwapBackendResult, FaceCompositorC
 
 
 class FaceCompositor:
+
     def __init__(self, cfg: FaceCompositorConfig) -> None:
         self.cfg = cfg
+
+
+    @staticmethod
+    def _scale_aligned_bgr_u8(img: np.ndarray, face_scale: float) -> np.ndarray:
+        delta = float(face_scale or 0.0)
+        if abs(delta) < 1e-6:
+            return np.ascontiguousarray(img)
+
+        scale = 1.0 + delta
+        h, w = img.shape[:2]
+        M = cv2.getRotationMatrix2D((w * 0.5, h * 0.5), 0.0, scale)
+        out = cv2.warpAffine(
+            img,
+            M,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+        return np.ascontiguousarray(out)
+
+    @staticmethod
+    def _scale_aligned_mask_f32(mask: np.ndarray, face_scale: float) -> np.ndarray:
+        delta = float(face_scale or 0.0)
+        if abs(delta) < 1e-6:
+            return np.ascontiguousarray(np.clip(mask.astype(np.float32), 0.0, 1.0))
+
+        scale = 1.0 + delta
+        h, w = mask.shape[:2]
+        M = cv2.getRotationMatrix2D((w * 0.5, h * 0.5), 0.0, scale)
+        out = cv2.warpAffine(
+            mask.astype(np.float32, copy=False),
+            M,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+        return np.ascontiguousarray(np.clip(out, 0.0, 1.0))
 
     @staticmethod
     def _arcface_template(size: int) -> np.ndarray:
@@ -227,7 +266,7 @@ class FaceCompositor:
         if mode in ("pred_both", "pred_src_dst", "predicted_both"):
             return p if p is not None else (g if g is not None else s if s is not None else d)
 
-        if mode in ("geom_pred_intersection", "intersection"):
+        if mode in ("geom_pred_intersection", "geom_backend_intersection", "intersection"):
             if g is None:
                 return p if p is not None else s if s is not None else d
             q = p if p is not None else s if s is not None else d
@@ -235,7 +274,7 @@ class FaceCompositor:
                 return g
             return np.minimum(g, q)
 
-        if mode in ("geom_pred_union", "union"):
+        if mode in ("geom_pred_union", "geom_backend_union", "union"):
             if g is None:
                 return p if p is not None else s if s is not None else d
             q = p if p is not None else s if s is not None else d
@@ -353,12 +392,45 @@ class FaceCompositor:
         aligned_target_u8 = None
         if backend_result.aligned_target_f32 is not None:
             aligned_target_u8 = self._f32_to_u8(self._ensure_hwc_f32(backend_result.aligned_target_f32))
+        else:
+            aligned_target_u8 = cv2.warpAffine(
+                roi_u8,
+                np.asarray(backend_result.roi_to_aligned, dtype=np.float32),
+                (aligned_size, aligned_size),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REFLECT_101,
+            )
+
+        if aligned_target_u8.shape[0] != aligned_size or aligned_target_u8.shape[1] != aligned_size:
+            aligned_target_u8 = cv2.resize(
+                aligned_target_u8,
+                (aligned_size, aligned_size),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        aligned_target_u8 = np.ascontiguousarray(aligned_target_u8)
 
         swapped_u8 = self._f32_to_u8(swapped_f32)
-        swapped_u8 = self._maybe_color_transfer(aligned_target_u8, swapped_u8, combined_mask)
+
+        # Stage 1: preblend in aligned space using source-trust mask.
+        preblend_src_mask = pred_src if pred_src is not None else combined_mask
+        preblend_src_mask = self._postprocess_mask(preblend_src_mask)
+
+        swapped_u8 = self._maybe_color_transfer(aligned_target_u8, swapped_u8, preblend_src_mask)
+        aligned_preblend_u8 = self._blend_alpha(
+            aligned_target_u8,
+            swapped_u8,
+            preblend_src_mask,
+        )
+
+        # Stage 2: paste the already-preblended aligned face back to ROI
+        # using the destination/combined coverage mask.
+        warp_input_u8 = aligned_preblend_u8
+        if abs(float(self.cfg.face_scale or 0.0)) > 1e-6:
+            warp_input_u8 = self._scale_aligned_bgr_u8(warp_input_u8, float(self.cfg.face_scale))
+            combined_mask = self._scale_aligned_mask_f32(combined_mask, float(self.cfg.face_scale))
 
         warped_face = self._warp_aligned_face_to_roi(
-            swapped_u8,
+            warp_input_u8,
             np.asarray(backend_result.aligned_to_roi, dtype=np.float32),
             roi_w,
             roi_h,
@@ -385,6 +457,8 @@ class FaceCompositor:
             "aligned_combined_mask_f32": combined_mask,
             "roi_warped_alpha_f32": warped_alpha,
             "roi_warped_face_bgr_u8": warped_face,
+            "aligned_preblend_src_mask_f32": preblend_src_mask,
+            "aligned_preblended_face_bgr_u8": aligned_preblend_u8,
         }
         if keep_mask is not None:
             debug["roi_keep_mask_f32"] = keep_mask

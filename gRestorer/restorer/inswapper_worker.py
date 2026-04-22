@@ -13,11 +13,12 @@ from gRestorer.detector.core import FaceMetadata
 class InSwapperWorker:
     """Pure face-swap worker.
 
-    Contract:
-      - Knows nothing about whole-frame policy, scene tracking, adjacent frames,
-        clip-level anchor selection, or whether a frame should be swapped.
-      - Given one ROI crop + one target-face metadata object + one enrolled
-        source face, returns its best swap result for that ROI.
+    This intentionally stays on the known-good legacy path:
+      - no swap_result()
+      - no shared aligned compositor path
+      - let insightface InSwapper do paste_back=True itself
+
+    This matches the known-good behavior from the attached gRestorer-main.zip.
     """
 
     def __init__(
@@ -59,6 +60,8 @@ class InSwapperWorker:
             src_faces,
             key=lambda f: float((f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])),
         )
+
+        print(f"[InSwapperWorker] provider={self.provider} mode=legacy_paste_back_true")
 
     @staticmethod
     def _providers_for(provider: str, device: torch.device) -> List[str]:
