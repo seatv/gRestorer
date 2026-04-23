@@ -1,7 +1,7 @@
-# gRestorer/restorer/simswap_worker.py
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -14,13 +14,13 @@ from gRestorer.detector.core import FaceMetadata
 
 class SimSwapWorker:
     """
-    Native SimSwap worker.
+    Native SimSwap worker, cleaned up for the stable SimSwap 256 path.
 
-    Design goal:
-    - follow FaceFusion-style native SimSwap flow
-    - do NOT return FaceSwapBackendResult
-    - do native warp -> infer -> mask -> paste-back in swap()
-    - bypass the shared compositor entirely
+    Design goals:
+    - keep the FaceFusion-style native SimSwap flow
+    - keep the debug dump path
+    - explicitly reject unsupported SimSwap 512 unofficial models
+    - keep the worker simple and reliable for SimSwap 256
     """
 
     ARC_DST_5_V1 = np.array(
@@ -36,7 +36,7 @@ class SimSwapWorker:
 
     BOX_MASK_BLUR = 0.30
     BOX_MASK_PADDING = (0, 0, 0, 0)  # top, right, bottom, left in percent
-    USE_AREA_MASK_IF_68 = True
+    USE_AREA_MASK_IF_68 = False
     AREA_MASK_SIGMA = 5.0
 
     def __init__(
@@ -104,11 +104,25 @@ class SimSwapWorker:
 
         self._src_embedding = self._prepare_simswap_embedding()
 
+        self._debug_dir = str(os.environ.get("GR_SIMSWAP_DEBUG_DIR", "") or "").strip()
+        self._debug_swap_index = int(str(os.environ.get("GR_SIMSWAP_DEBUG_SWAP_INDEX", "0") or "0"))
+        self._debug_dump_all = str(os.environ.get("GR_SIMSWAP_DEBUG_DUMP_ALL", "0") or "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._swap_counter = 0
+
         print(
             f"[SimSwapWorker] provider={self.provider} image_size={self._image_size} "
             f"layout={self._image_input_layout} image_input={self._image_input_name} "
             f"embedding_input={self._embedding_input_name} "
-            f"converter={'yes' if self._embedding_converter is not None else 'no'}"
+            f"converter={'yes' if self._embedding_converter is not None else 'no'} "
+            f"mask_mode={'box_only' if not self.USE_AREA_MASK_IF_68 else 'box_plus_area68'} "
+            f"debug_dir={self._debug_dir if self._debug_dir else '-'} "
+            f"debug_swap_index={self._debug_swap_index if self._debug_swap_index > 0 else '-'} "
+            f"debug_dump_all={self._debug_dump_all}"
         )
 
     @staticmethod
@@ -192,12 +206,14 @@ class SimSwapWorker:
             self._image_size = dims[-1] if dims else 256
 
         name = Path(self.swap_model_path).name.lower()
-        if "unofficial_512" in name or "512_unofficial" in name:
-            self._model_mean = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-            self._model_std = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-        else:
-            self._model_mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-            self._model_std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        if "unofficial_512" in name or "512_unofficial" in name or self._image_size >= 512:
+            raise SystemExit(
+                "❌ Unsupported configuration: SimSwap 512 unofficial is not supported in gRestorer. "
+                "Please select the stable SimSwap 256 model instead."
+            )
+
+        self._model_mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        self._model_std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
     def _prepare_simswap_embedding(self) -> np.ndarray:
         emb = getattr(self._src_face, "embedding", None)
@@ -317,15 +333,28 @@ class SimSwapWorker:
     ) -> np.ndarray:
         crop_w, crop_h = crop_bgr_u8.shape[:2][::-1]
         blur_amount = int(crop_w * 0.5 * float(face_mask_blur))
-        blur_area = max(blur_amount // 2, 1)
 
         box_mask = np.ones((crop_h, crop_w), dtype=np.float32)
-
         top, right, bottom, left = [int(v) for v in face_mask_padding]
-        box_mask[:max(blur_area, int(crop_h * top / 100.0)), :] = 0.0
-        box_mask[-max(blur_area, int(crop_h * bottom / 100.0)) :, :] = 0.0
-        box_mask[:, :max(blur_area, int(crop_w * left / 100.0))] = 0.0
-        box_mask[:, -max(blur_area, int(crop_w * right / 100.0)) :] = 0.0
+
+        if top == 0 and right == 0 and bottom == 0 and left == 0:
+            edge_x = max(1, int(round(crop_w * 0.02)))
+            edge_y = max(1, int(round(crop_h * 0.02)))
+            top_px, right_px, bottom_px, left_px = edge_y, edge_x, edge_y, edge_x
+        else:
+            top_px = int(round(crop_h * top / 100.0))
+            right_px = int(round(crop_w * right / 100.0))
+            bottom_px = int(round(crop_h * bottom / 100.0))
+            left_px = int(round(crop_w * left / 100.0))
+
+        if top_px > 0:
+            box_mask[:top_px, :] = 0.0
+        if bottom_px > 0:
+            box_mask[-bottom_px:, :] = 0.0
+        if left_px > 0:
+            box_mask[:, :left_px] = 0.0
+        if right_px > 0:
+            box_mask[:, -right_px:] = 0.0
 
         if blur_amount > 0:
             box_mask = cv2.GaussianBlur(box_mask, (0, 0), blur_amount * 0.25)
@@ -417,6 +446,70 @@ class SimSwapWorker:
         out[y1:y2, x1:x2] = np.clip(blended, 0.0, 255.0).astype(np.uint8)
         return np.ascontiguousarray(out)
 
+    def _get_aligned_target_kps5(self, original_target_kps5: np.ndarray, affine_matrix: np.ndarray) -> np.ndarray:
+        return self._transform_points(original_target_kps5, affine_matrix).astype(np.float32, copy=False)
+
+    def _maybe_correct_swapped_geometry(
+        self,
+        swapped_crop_bgr_u8: np.ndarray,
+        crop_mask_f32: np.ndarray,
+        target_kps5_aligned: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, dict]:
+        # 256-only cleaned worker: keep a no-op here so the debug contract
+        # remains consistent, but do not attempt any 512-oriented geometry fix.
+        return swapped_crop_bgr_u8, crop_mask_f32, {
+            "attempted": False,
+            "applied": False,
+            "reason": "disabled_256_only_worker",
+        }
+
+    def _should_dump_debug(self, swap_index: int) -> bool:
+        if not self._debug_dir:
+            return False
+        if self._debug_dump_all:
+            return True
+        return self._debug_swap_index > 0 and swap_index == self._debug_swap_index
+
+    @staticmethod
+    def _mask_to_u8(mask_f32: np.ndarray) -> np.ndarray:
+        arr = np.asarray(mask_f32, dtype=np.float32)
+        return np.ascontiguousarray(np.clip(arr * 255.0, 0.0, 255.0).round().astype(np.uint8))
+
+    def _dump_debug_artifacts(
+        self,
+        swap_index: int,
+        aligned_target_bgr_u8: np.ndarray,
+        swapped_crop_raw_bgr_u8: np.ndarray,
+        swapped_crop_final_bgr_u8: np.ndarray,
+        crop_mask_f32: np.ndarray,
+        pasted_roi_bgr_u8: np.ndarray,
+        correction_info: dict,
+    ) -> None:
+        if not self._should_dump_debug(swap_index):
+            return
+
+        out_dir = Path(self._debug_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        prefix = f"simswap_s{swap_index:06d}"
+
+        cv2.imwrite(str(out_dir / f"{prefix}_01_aligned_target.png"), aligned_target_bgr_u8)
+        cv2.imwrite(str(out_dir / f"{prefix}_02_swapped_aligned_raw.png"), swapped_crop_raw_bgr_u8)
+        if correction_info.get("applied"):
+            cv2.imwrite(str(out_dir / f"{prefix}_02b_swapped_aligned_corrected.png"), swapped_crop_final_bgr_u8)
+        else:
+            cv2.imwrite(str(out_dir / f"{prefix}_02b_swapped_aligned_corrected.png"), swapped_crop_final_bgr_u8)
+        cv2.imwrite(str(out_dir / f"{prefix}_03_crop_mask.png"), self._mask_to_u8(crop_mask_f32))
+        cv2.imwrite(str(out_dir / f"{prefix}_04_pasted_roi.png"), pasted_roi_bgr_u8)
+
+        meta_path = out_dir / f"{prefix}_05_debug_meta.txt"
+        lines = [
+            "worker_mode=256_only",
+            f"correction_attempted={bool(correction_info.get('attempted', False))}",
+            f"correction_applied={bool(correction_info.get('applied', False))}",
+            f"correction_reason={correction_info.get('reason', '-')}",
+        ]
+        meta_path.write_text("\n".join(str(x) for x in lines), encoding="utf-8")
+
     def swap(
         self,
         roi_bgr_u8: np.ndarray,
@@ -425,19 +518,21 @@ class SimSwapWorker:
         if roi_bgr_u8 is None:
             return None
 
+        self._swap_counter += 1
+        swap_index = self._swap_counter
+
         kps5 = self._extract_target_kps5(target_face_meta)
         aligned_bgr_u8, affine_matrix = self._align_face(roi_bgr_u8, kps5)
 
         img_in = self._prepare_simswap_image(aligned_bgr_u8)
         emb_in = self._src_embedding
         raw = self._run_simswap_once(img_in, emb_in)
-        swapped_crop_bgr_u8 = self._decode_simswap_output(raw)
+        swapped_crop_raw_bgr_u8 = self._decode_simswap_output(raw)
 
         crop_masks: List[np.ndarray] = []
-
         crop_masks.append(
             self._create_box_mask(
-                swapped_crop_bgr_u8,
+                swapped_crop_raw_bgr_u8,
                 face_mask_blur=self.BOX_MASK_BLUR,
                 face_mask_padding=self.BOX_MASK_PADDING,
             )
@@ -449,7 +544,7 @@ class SimSwapWorker:
                 kps68_aligned = self._transform_points(kps68, affine_matrix)
                 crop_masks.append(
                     self._create_area_mask_from_landmarks68(
-                        crop_size=int(swapped_crop_bgr_u8.shape[0]),
+                        crop_size=int(swapped_crop_raw_bgr_u8.shape[0]),
                         landmarks68_aligned=kps68_aligned,
                         sigma=self.AREA_MASK_SIGMA,
                     )
@@ -457,11 +552,27 @@ class SimSwapWorker:
 
         crop_mask = np.minimum.reduce(crop_masks).clip(0.0, 1.0)
 
+        swapped_crop_final_bgr_u8, crop_mask_final, correction_info = self._maybe_correct_swapped_geometry(
+            swapped_crop_bgr_u8=swapped_crop_raw_bgr_u8,
+            crop_mask_f32=crop_mask,
+            target_kps5_aligned=kps5,
+        )
+
         pasted_roi = self._paste_back(
             roi_bgr_u8=roi_bgr_u8,
-            crop_bgr_u8=swapped_crop_bgr_u8,
-            crop_mask_f32=crop_mask,
+            crop_bgr_u8=swapped_crop_final_bgr_u8,
+            crop_mask_f32=crop_mask_final,
             affine_matrix=affine_matrix,
+        )
+
+        self._dump_debug_artifacts(
+            swap_index=swap_index,
+            aligned_target_bgr_u8=aligned_bgr_u8,
+            swapped_crop_raw_bgr_u8=swapped_crop_raw_bgr_u8,
+            swapped_crop_final_bgr_u8=swapped_crop_final_bgr_u8,
+            crop_mask_f32=crop_mask_final,
+            pasted_roi_bgr_u8=pasted_roi,
+            correction_info=correction_info,
         )
         return pasted_roi
 

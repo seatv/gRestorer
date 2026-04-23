@@ -20,7 +20,6 @@ from gRestorer.detector.face_detector import FaceDetector
 from gRestorer.restorer.basicvsrpp_clip_restorer import BasicVSRPPClipRestorer
 from gRestorer.restorer.compositor import _composite_clip_into_store, _composite_clip_into_store_laplacian
 from gRestorer.restorer.pseudo_clip_restorer import PseudoClipRestorer
-
 from gRestorer.restorer.inswapper_clip_restorer import InSwapperClipRestorer
 from gRestorer.restorer.simswap_clip_restorer import SimSwapClipRestorer
 from gRestorer.restorer.hyperswap_clip_restorer import HyperSwapClipRestorer
@@ -153,6 +152,8 @@ class PipelineMetrics:
         return self.t_decode + self.t_det + self.t_track + self.t_restore + self.t_encode
 
 
+
+
 def _detect_face_swap_backend(model_path: str, configured_backend: str = "auto") -> str:
     b = str(configured_backend or "auto").strip().lower()
     if b in ("inswapper", "simswap", "hyperswap"):
@@ -164,8 +165,6 @@ def _detect_face_swap_backend(model_path: str, configured_backend: str = "auto")
     if "simswap" in name:
         return "simswap"
     return "inswapper"
-
-
 
 def _pick_device(gpu_id: int) -> torch.device:
     if torch.cuda.is_available():
@@ -443,6 +442,18 @@ class Pipeline:
         self.swap_input_size: int = int(cfg_first(self.cfg, [("face_restoration", "swap_input_size"), ("restoration", "swap_input_size")], default=128))
         self.swap_provider: str = str(cfg_first(self.cfg, [("face_restoration", "provider"), ("restoration", "swap_provider")], default="auto") or "auto").lower()
         self.swap_backend: str = str(cfg_first(self.cfg, [("face_restoration", "swap_backend"), ("restoration", "swap_backend")], default="auto") or "auto").lower()
+        self.swap_pixel_boost: str = str(
+            cfg_first(
+                self.cfg,
+                [
+                    ("face_restoration", "pixel_boost"),
+                    ("face_restoration", "swap_pixel_boost"),
+                    ("restoration", "swap_pixel_boost"),
+                ],
+                default="",
+            )
+            or ""
+        ).strip()
 
         self.face_comp_mask_mode: str = str(
             cfg_first(
@@ -734,12 +745,16 @@ class Pipeline:
             swap_backend = _detect_face_swap_backend(self.swap_model_path, self.swap_backend)
             print(f"[FaceSwap] backend={swap_backend}")
 
-            if swap_backend == "simswap":
-                restorer_cls = SimSwapClipRestorer
-            elif swap_backend == "hyperswap":
+            if swap_backend == "hyperswap":
                 restorer_cls = HyperSwapClipRestorer
+            elif swap_backend == "simswap":
+                restorer_cls = SimSwapClipRestorer
             else:
                 restorer_cls = InSwapperClipRestorer
+
+            extra_kwargs = {}
+            if swap_backend == "hyperswap" and self.swap_pixel_boost:
+                extra_kwargs["swap_pixel_boost"] = self.swap_pixel_boost
 
             return restorer_cls(
                 device=self.device,
@@ -777,6 +792,7 @@ class Pipeline:
                 debug_start=self.fs_debug_start,
                 debug_end=self.fs_debug_end,
                 material_change_mad_threshold=self.fs_material_mad,
+                **extra_kwargs,
             )
 
         if not self.rest_model:

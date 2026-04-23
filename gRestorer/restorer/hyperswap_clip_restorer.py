@@ -9,6 +9,10 @@ from gRestorer.restorer.hyperswap_worker import HyperSwapWorker
 class HyperSwapClipRestorer(BaseFaceSwapClipRestorer):
     """Face-swap clip restorer using native HyperSwap paste-back."""
 
+    def __init__(self, *args, swap_pixel_boost: str = "", **kwargs):
+        self.swap_pixel_boost = str(swap_pixel_boost or "").strip()
+        super().__init__(*args, **kwargs)
+
     def _build_worker(self):
         return HyperSwapWorker(
             device=self.device,
@@ -16,6 +20,7 @@ class HyperSwapClipRestorer(BaseFaceSwapClipRestorer):
             swap_model_path=self.swap_model_path,
             swap_input_size=self.swap_input_size,
             provider=self.provider,
+            pixel_boost=(self.swap_pixel_boost or None),
         )
 
 
