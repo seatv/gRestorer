@@ -18,7 +18,7 @@ from gRestorer.core.scene_tracker import SceneTracker, TrackerConfig
 from gRestorer.detector.core import Detection, Detector as YoloDetector, FaceMetadata
 from gRestorer.detector.face_detector import FaceDetector
 from gRestorer.restorer.basicvsrpp_clip_restorer import BasicVSRPPClipRestorer
-from gRestorer.restorer.compositor import _composite_clip_into_store, _composite_clip_into_store_laplacian
+from gRestorer.restorer.compositor import _composite_clip_into_store
 from gRestorer.restorer.pseudo_clip_restorer import PseudoClipRestorer
 from gRestorer.restorer.inswapper_clip_restorer import InSwapperClipRestorer
 from gRestorer.restorer.simswap_clip_restorer import SimSwapClipRestorer
@@ -27,6 +27,7 @@ from gRestorer.restorer.hyperswap_clip_restorer import HyperSwapClipRestorer
 from gRestorer.core.lada_clip import LadaClip
 from gRestorer.restorer.lada_basicvsrpp_clip_restorer import LadaBasicVSRPPClipRestorer
 from gRestorer.restorer.lada_compositor import composite_lada_clip_into_store
+from gRestorer.restorer.mosaic_paste_debug import MosaicPasteDebug
 
 from gRestorer.utils.config_util import Config
 from gRestorer.video.decoder import Decoder
@@ -599,9 +600,15 @@ class Pipeline:
         self.rest_pad_mode: str = str(cfg_first(self.cfg, pad_paths, default="reflect"))
 
         self.feather_radius: int = int(cfg_first(self.cfg, [("mosaic_restoration", "feather_radius"), ("restoration", "feather_radius")], default=0))
-        self.rest_blendmask: str = str(cfg_first(self.cfg, [("mosaic_restoration", "blendmask"), ("restoration", "blendmask")], default="none") or "none").lower()
-        if self.rest_blendmask not in ("none", "facefusion", "laplacian"):
+
+        self.rest_blendmask: str = str(cfg_first(self.cfg, [("mosaic_restoration", "blendmask"), ("restoration", "blendmask")], default="legacy") or "legacy").lower()
+        _blend_aliases = {"facefusion": "support", "laplacian": "legacy", "conditioned": "legacy_conditioned"}
+        self.rest_blendmask = _blend_aliases.get(self.rest_blendmask, self.rest_blendmask)
+        if self.rest_blendmask not in ("none", "legacy", "legacy_conditioned", "support"):
             raise ValueError(f"Invalid restoration.blendmask: {self.rest_blendmask!r}")
+
+        self.rest_sharpen: bool = bool(cfg_first(self.cfg, [("mosaic_restoration", "sharpen"), ("restoration", "sharpen")], default=False,))
+        print(f"[Sharpen] init: rest_blendmask={self.rest_blendmask} rest_sharpen={self.rest_sharpen}")
 
         self.rest_compositor_quantize_before_resize: bool = bool(
             cfg_first(self.cfg, [("mosaic_restoration", "compositor_quantize_before_resize"), ("restoration", "compositor_quantize_before_resize")], default=False)
@@ -617,6 +624,50 @@ class Pipeline:
                 default=False,
             )
         )
+        self.mosaic_paste_debug_enabled: bool = _cfg_bool(
+            self.cfg,
+            [("debug", "mosaic_paste", "enabled")],
+            env_name="GR_MOSAIC_PASTE_DEBUG",
+            default=False,
+        )
+        self.mosaic_paste_debug_dir: Path = Path(
+            _cfg_str(
+                self.cfg,
+                [("debug", "mosaic_paste", "dir")],
+                env_name="GR_MOSAIC_PASTE_DEBUG_DIR",
+                default="mosaic_paste_debug",
+            )
+        )
+        self.mosaic_paste_debug_start: int = _cfg_int(
+            self.cfg,
+            [("debug", "mosaic_paste", "start")],
+            env_name="GR_MOSAIC_PASTE_DEBUG_START",
+            default=-1,
+        )
+        self.mosaic_paste_debug_end: int = _cfg_int(
+            self.cfg,
+            [("debug", "mosaic_paste", "end")],
+            env_name="GR_MOSAIC_PASTE_DEBUG_END",
+            default=-1,
+        )
+        _raw_mosaic_paste_frames = cfg_first(self.cfg, [("debug", "mosaic_paste", "frames")], default=[]) or []
+        if not isinstance(_raw_mosaic_paste_frames, (list, tuple)):
+            _raw_mosaic_paste_frames = [_raw_mosaic_paste_frames]
+        self.mosaic_paste_debug_frames: List[int] = []
+        for _v in _raw_mosaic_paste_frames:
+            try:
+                self.mosaic_paste_debug_frames.append(int(_v))
+            except Exception:
+                continue
+        self.mosaic_paste_debug: MosaicPasteDebug | None = None
+        if self.mosaic_paste_debug_enabled:
+            self.mosaic_paste_debug = MosaicPasteDebug(
+                enabled=True,
+                out_dir=self.mosaic_paste_debug_dir,
+                frames=set(self.mosaic_paste_debug_frames),
+                start=int(self.mosaic_paste_debug_start),
+                end=int(self.mosaic_paste_debug_end),
+            )
         _raw_synth_rois = self.cfg.get("synth_mosaic", "rois", default=[]) or []
         self.analysis_synth_rois: List[Tuple[int, int, int, int]] = []
         try:
@@ -971,28 +1022,23 @@ class Pipeline:
                     restored_frames_u8=restored,
                     store_bgr_u8=store.frames_bgr_u8,
                     model_dtype=restorer.model_dtype,
+                    blendmask_mode=self.rest_blendmask,
+                    feather_radius=int(self.feather_radius),
+                    debug_ctx=self.mosaic_paste_debug,
                 )
                 return
 
-            if self.rest_blendmask == "laplacian":
-                _composite_clip_into_store_laplacian(
-                    clip=clip,
-                    restored_frames=restored,
-                    store_bgr_u8=store.frames_bgr_u8,
-                    feather_radius=int(self.feather_radius),
-                    quantize_before_resize=bool(self.rest_compositor_quantize_before_resize),
-                    resize_backend=str(self.rest_compositor_resize_backend),
-                )
-            else:
-                _composite_clip_into_store(
-                    clip=clip,
-                    restored_frames=restored,
-                    store_bgr_u8=store.frames_bgr_u8,
-                    feather_radius=int(self.feather_radius),
-                    quantize_before_resize=bool(self.rest_compositor_quantize_before_resize),
-                    resize_backend=str(self.rest_compositor_resize_backend),
-                    blendmask_mode=self.rest_blendmask,
-                )
+            _composite_clip_into_store(
+                clip=clip,
+                restored_frames=restored,
+                store_bgr_u8=store.frames_bgr_u8,
+                feather_radius=int(self.feather_radius),
+                quantize_before_resize=bool(self.rest_compositor_quantize_before_resize),
+                resize_backend=str(self.rest_compositor_resize_backend),
+                blendmask_mode=self.rest_blendmask,
+                sharpen=bool(self.rest_sharpen),
+                debug_ctx=self.mosaic_paste_debug,
+            )
 
 
         pts_log: List[Tuple[int, Optional[int]]] = []

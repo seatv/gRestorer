@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-import cv2
 import torch
 import torch.nn.functional as F
 
 from gRestorer.core.scene import Clip
-from gRestorer.utils.mask_utils import create_blend_mask, laplacian_pyramid_blend
+from gRestorer.utils.mask_utils import (
+    create_blend_mask,
+    create_support_blend_mask,
+)
+from gRestorer.restorer.mosaic_paste_debug import MosaicPasteDebug
 
 
 def _unpad_hwc(x: torch.Tensor, pad: Tuple[int, int, int, int]) -> torch.Tensor:
@@ -49,8 +52,76 @@ def _feather_alpha(alpha_hw: torch.Tensor, radius: int = 3) -> torch.Tensor:
     a = F.avg_pool2d(a, kernel_size=k, stride=1, padding=r)
     return a.squeeze(0).squeeze(0).clamp(0.0, 1.0)
 
+def _blur_hwc_float(x: torch.Tensor, radius: int = 1) -> torch.Tensor:
+    """Cheap box blur for float32 HWC image in [0,1]."""
+    r = int(radius)
+    if r <= 0:
+        return x
+    k = 2 * r + 1
+    y = x.permute(2, 0, 1).unsqueeze(0)
+    y = F.avg_pool2d(y, kernel_size=k, stride=1, padding=r)
+    return y.squeeze(0).permute(1, 2, 0)
 
 
+def _apply_support_inner_sharpen(
+    roi_f: torch.Tensor,
+    alpha_hw: torch.Tensor,
+    *,
+    amount: float = 0.18,
+    blur_radius: int = 1,
+    start_alpha: float = 0.35,
+    full_alpha: float = 0.85,
+) -> torch.Tensor:
+    """
+    Mild detail compensation inside support-mode paste.
+
+    - no effect in the low-alpha outer ring
+    - ramps up as alpha increases inward
+    - keeps the support alpha unchanged
+    """
+    amt = float(amount)
+    if amt <= 0.0:
+        return roi_f
+
+    alpha_hw = alpha_hw.clamp(0.0, 1.0)
+    denom = max(1e-6, float(full_alpha) - float(start_alpha))
+    zone = ((alpha_hw - float(start_alpha)) / denom).clamp(0.0, 1.0)
+
+    if not bool((zone > 0).any()):
+        return roi_f
+
+    zone3 = zone.unsqueeze(-1)
+    blurred = _blur_hwc_float(roi_f, radius=blur_radius)
+    sharpened = (roi_f + amt * (roi_f - blurred)).clamp(0.0, 1.0)
+
+    return (roi_f * (1.0 - zone3) + sharpened * zone3).clamp(0.0, 1.0)
+
+def _normalize_blendmask_mode(blendmask_mode: str) -> str:
+    mode = str(blendmask_mode or "legacy").strip().lower()
+    aliases = {
+        "facefusion": "support",
+        "laplacian": "legacy",
+        "conditioned": "legacy_conditioned",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"none", "legacy", "legacy_conditioned", "support"}:
+        raise ValueError(f"Unsupported blendmask mode: {blendmask_mode!r}")
+    return mode
+
+def _build_alpha(mask_rs: torch.Tensor, *, blendmask_mode: str, feather_radius: int) -> torch.Tensor:
+    mode = _normalize_blendmask_mode(blendmask_mode)
+    mask_f = mask_rs.to(dtype=torch.float32) / 255.0
+
+    if mode == "none":
+        return (mask_rs > 0).to(dtype=torch.float32)
+
+    if mode == "support":
+        adaptive_feather = int(feather_radius) if int(feather_radius) > 0 else None
+        return create_support_blend_mask(mask_f, feather_px=adaptive_feather).clamp(0.0, 1.0)
+
+    # For now, keep legacy_conditioned on the legacy path until that experiment is reintroduced.
+    alpha = create_blend_mask(mask_f).clamp(0.0, 1.0)
+    return _feather_alpha(alpha, radius=feather_radius)
 
 def _composite_clip_into_store(
     *,
@@ -60,210 +131,83 @@ def _composite_clip_into_store(
     feather_radius: int = 0,
     quantize_before_resize: bool = False,
     resize_backend: str = "torch",
-    blendmask_mode: str = "none"
-) -> None:
+    blendmask_mode: str = "legacy",
+    sharpen: bool = False,
+    debug_ctx: MosaicPasteDebug | None = None,
+    ) -> None:
     """Paste restored clip results back into buffered full frames (in-place)."""
     if len(restored_frames) != len(clip):
         raise ValueError(f"restored_frames length ({len(restored_frames)}) != clip length ({len(clip)})")
 
     clip_size = int(clip.clip_size)
 
+    mode = _normalize_blendmask_mode(blendmask_mode)
+
+
     for i, frame_num in enumerate(clip.frame_nums):
         full = store_bgr_u8.get(int(frame_num))
         if full is None:
-            # Shouldn't happen in the streaming design, but don't crash.
             continue
 
         crop_box = clip.crop_boxes[i]
         crop_h, crop_w = clip.crop_shapes[i]
         pad = clip.pad_after_resizes[i]
 
-        # Restored frame is float HWC in [0,1] with clip_size.
         frm = restored_frames[i]
         if frm.shape[0] != clip_size or frm.shape[1] != clip_size:
             raise ValueError(f"Restored frame must be {clip_size}x{clip_size}, got {tuple(frm.shape)}")
 
-        # Unpad back to the resized crop.
         frm_u = _unpad_hwc(frm, pad)
         m_u = clip.masks[i]
         m_u = _unpad_hwc(m_u.unsqueeze(-1), pad).squeeze(-1)
 
-        # Optional experiment knobs kept for pipeline compatibility.
-        # For this debug drop-in we preserve the current generic numeric path,
-        # but accept the extra arguments so pipeline.py does not explode.
         if quantize_before_resize:
             frm_u = frm_u.mul(255.0).round().clamp(0.0, 255.0).div(255.0)
 
-        # Resize to original crop size.
-        # image_utils backend is accepted for compatibility, but this debug drop-in
-        # still uses the generic float bilinear path for the restored patch.
         patch = _resize_hwc_float(frm_u, (crop_h, crop_w))
         mask_rs = _resize_hw_mask_u8(m_u, (crop_h, crop_w))
-
-        # LADA-style blend mask to reduce visible paste-back boundaries.
-        # It creates a soft transition band near the crop edge while keeping the ROI interior strong.
-        alpha = create_blend_mask(mask_rs.to(dtype=torch.float32) / 255.0).clamp(0.0, 1.0)
-        # Optional extra feathering knob (usually keep 0 once blend mask is enabled).
-        alpha = _feather_alpha(alpha, radius=feather_radius)
-        a3 = alpha.unsqueeze(-1)
+        alpha = _build_alpha(mask_rs, blendmask_mode=blendmask_mode, feather_radius=feather_radius)
 
         t, l, b, r = crop_box
-        region_u8 = full[t : b + 1, l : r + 1, :]
+        debug_enabled = bool(debug_ctx is not None and debug_ctx.should_dump(frame_num))
+        orig_roi = full[t : b + 1, l : r + 1, :].clone() if debug_enabled else None
+        legacy_alpha = create_blend_mask(mask_rs.to(dtype=torch.float32) / 255.0).clamp(0.0, 1.0) if debug_enabled else None
 
-        # Blend in float on the (cropped) ROI, then write back to the uint8 buffer.
-        region_f = region_u8.to(dtype=torch.float32) / 255.0
-        out_f = region_f * (1.0 - a3) + patch * a3
-        region_u8.copy_(out_f.mul(255.0).round().clamp(0.0, 255.0).to(dtype=torch.uint8))
-
-        #region_u8.copy_(out_f.mul(255.0).clamp(0.0, 255.0).to(dtype=torch.uint8))
-
-
-
-import torch.nn.functional as F
-
-def laplacian_pyramid_blend(original: torch.Tensor, swapped: torch.Tensor, mask: torch.Tensor, levels: int = 3) -> torch.Tensor:
-    """
-    C++ Equivalent logic: Multi-resolution blending. 
-    Prevents 'teeth-ghosting' by blending lighting at low frequencies 
-    and texture at high frequencies.
-    """
-    # Convert HWC to BCHW for PyTorch ops
-    o = original.permute(2, 0, 1).unsqueeze(0)
-    s = swapped.permute(2, 0, 1).unsqueeze(0)
-    m = mask.permute(2, 0, 1).unsqueeze(0)
-
-    # 1. Build Gaussian Pyramids (Downsample stack)
-    gauss_o, gauss_s, gauss_m = [o], [s], [m]
-    for i in range(levels):
-        o = F.interpolate(o, scale_factor=0.5, mode='bilinear', align_corners=False)
-        s = F.interpolate(s, scale_factor=0.5, mode='bilinear', align_corners=False)
-        m = F.interpolate(m, scale_factor=0.5, mode='bilinear', align_corners=False)
-        gauss_o.append(o); gauss_s.append(s); gauss_m.append(m)
-
-    # 2. Build Laplacian Pyramids (Detail maps)
-    lap_o, lap_s = [], []
-    for i in range(levels):
-        size = (gauss_o[i].shape[2], gauss_o[i].shape[3])
-        upsampled_o = F.interpolate(gauss_o[i+1], size=size, mode='bilinear', align_corners=False)
-        upsampled_s = F.interpolate(gauss_s[i+1], size=size, mode='bilinear', align_corners=False)
-        lap_o.append(gauss_o[i] - upsampled_o)
-        lap_s.append(gauss_s[i] - upsampled_s)
-    lap_o.append(gauss_o[levels])
-    lap_s.append(gauss_s[levels])
-
-    # 3. Blend & 4. Reconstruct (Collapse the pyramid)
-    res = lap_s[levels] * gauss_m[levels] + lap_o[levels] * (1.0 - gauss_m[levels])
-    for i in range(levels - 1, -1, -1):
-        size = (lap_o[i].shape[2], lap_o[i].shape[3])
-        res = F.interpolate(res, size=size, mode='bilinear', align_corners=False)
-        res += lap_s[i] * gauss_m[i] + lap_o[i] * (1.0 - gauss_m[i])
-
-    return res.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0)
-
-def _composite_clip_into_store_laplacian(
-    *,
-    clip: Clip,
-    restored_frames: List[torch.Tensor],
-    store_bgr_u8: Dict[int, torch.Tensor],
-    feather_radius: int = 0,
-    quantize_before_resize: bool = False,
-    resize_backend: str = "torch",
-    use_laplacian: bool = True  # New default for your tongue/tile issues
-) -> None:
-    for i, frame_num in enumerate(clip.frame_nums):
-        full = store_bgr_u8[frame_num]
-        frm_u = restored_frames[i]
-        
-        # Metadata recovery
-        m_u = frm_u.get_metadata("mask")
-        crop_box = frm_u.get_metadata("crop_box")
-        pad = frm_u.get_metadata("pad")
-        crop_h, crop_w = (crop_box[2] - crop_box[0] + 1), (crop_box[3] - crop_box[1] + 1)
-
-        # Pre-processing
-        frm_u = _unpad_hwc(frm_u, pad)
-        patch = _resize_hwc_float(frm_u, (crop_h, crop_w))
-        mask_rs = _resize_hw_mask_u8(m_u, (crop_h, crop_w))
-        
-        # ROI Pointers
-        t, l, b, r = crop_box
-        region_u8 = full[t : b + 1, l : r + 1, :]
-        region_f = region_u8.to(dtype=torch.float32) / 255.0
-
-        # MASK GENERATION
-        # Convert u8 mask to float [0,1]
-        alpha_mask = mask_rs.to(dtype=torch.float32).unsqueeze(-1) / 255.0
-        
-        # APPLY BLEND
-        if use_laplacian:
-            # Solve tongue/lighting issues by frequency-blending
-            out_f = laplacian_pyramid_blend(region_f, patch, alpha_mask, levels=3)
+        nz = alpha > 0
+        if bool(nz.any()):
+            rows = torch.where(nz.any(dim=1))[0]
+            cols = torch.where(nz.any(dim=0))[0]
+            at, al, ab, ar = int(rows[0]), int(cols[0]), int(rows[-1]), int(cols[-1])
         else:
-            # Fallback to your original linear feathering
-            alpha = create_blend_mask(alpha_mask.squeeze()).clamp(0.0, 1.0)
-            alpha = _feather_alpha(alpha, radius=feather_radius).unsqueeze(-1)
-            out_f = region_f * (1.0 - alpha) + patch * alpha
+            at, al, ab, ar = 0, 0, crop_h - 1, crop_w - 1
 
-        # Write back to shared memory / buffer
-        region_u8.copy_(out_f.mul(255.0).round().clamp(0.0, 255.0).to(dtype=torch.uint8))
+        a_hw = alpha[at: ab + 1, al: ar + 1]
+        a3 = a_hw.unsqueeze(-1)
+        patch_roi = patch[at: ab + 1, al: ar + 1, :]
 
-def _composite_clip_into_store_laplacian(
-    *,
-    clip: Clip,
-    restored_frames: List[torch.Tensor],
-    store_bgr_u8: Dict[int, torch.Tensor],
-    feather_radius: int = 0,
-    quantize_before_resize: bool = False,
-    resize_backend: str = "torch",
-    blendmask_mode: str = "laplacian",
-) -> None:
-    """Alternate compositor that preserves the original path and only changes blending.
-
-    This function intentionally mirrors _composite_clip_into_store() preprocessing:
-      - same unpad path
-      - same optional quantize-before-resize path
-      - same resize path
-      - same create_blend_mask() + feathering path
-
-    The only semantic difference is the final blend operator:
-      - original compositor: linear alpha blend
-      - this compositor:    Laplacian pyramid blend
-    """
-    if len(restored_frames) != len(clip):
-        raise ValueError(f"restored_frames length ({len(restored_frames)}) != clip length ({len(clip)})")
-
-    clip_size = int(clip.clip_size)
-
-    for i, frame_num in enumerate(clip.frame_nums):
-        full = store_bgr_u8.get(int(frame_num))
-        if full is None:
-            continue
-
-        crop_box = clip.crop_boxes[i]
-        crop_h, crop_w = clip.crop_shapes[i]
-        pad = clip.pad_after_resizes[i]
-
-        frm = restored_frames[i]
-        if frm.shape[0] != clip_size or frm.shape[1] != clip_size:
-            raise ValueError(f"Restored frame must be {clip_size}x{clip_size}, got {tuple(frm.shape)}")
-
-        frm_u = _unpad_hwc(frm, pad)
-        m_u = clip.masks[i]
-        m_u = _unpad_hwc(m_u.unsqueeze(-1), pad).squeeze(-1)
-
-        if quantize_before_resize:
-            frm_u = frm_u.mul(255.0).round().clamp(0.0, 255.0).div(255.0)
-
-        patch = _resize_hwc_float(frm_u, (crop_h, crop_w))
-        mask_rs = _resize_hw_mask_u8(m_u, (crop_h, crop_w))
-
-        alpha = create_blend_mask(mask_rs.to(dtype=torch.float32) / 255.0).clamp(0.0, 1.0)
-        alpha = _feather_alpha(alpha, radius=feather_radius)
-        a3 = alpha.unsqueeze(-1)
-
-        t, l, b, r = crop_box
-        region_u8 = full[t : b + 1, l : r + 1, :]
+        region_u8 = full[t + at: t + ab + 1, l + al: l + ar + 1, :]
         region_f = region_u8.to(dtype=torch.float32) / 255.0
+        out_f = region_f * (1.0 - a3) + patch_roi * a3
 
-        out_f = laplacian_pyramid_blend(region_f, patch, a3, levels=4)
+        if sharpen and mode == "support":
+            out_f = _apply_support_inner_sharpen(out_f, a_hw, amount=0.18, blur_radius=1)
+        elif sharpen and mode == "legacy":
+            out_f = _apply_support_inner_sharpen(out_f, a_hw, amount=0.12, blur_radius=1)
+
         region_u8.copy_(out_f.mul(255.0).round().clamp(0.0, 255.0).to(dtype=torch.uint8))
+
+        if debug_enabled and debug_ctx is not None and orig_roi is not None and legacy_alpha is not None:
+            debug_ctx.dump(
+                frame_num=int(frame_num),
+                clip_id=int(getattr(clip, "id", -1)),
+                crop_box=(int(t), int(l), int(b), int(r)),
+                original_roi=orig_roi,
+                restored_roi=patch,
+                resized_mask=mask_rs,
+                legacy_alpha=legacy_alpha,
+                actual_alpha=alpha,
+                final_roi=full[t : b + 1, l : r + 1, :].clone(),
+            )
+
+
+__all__ = ["_composite_clip_into_store"]

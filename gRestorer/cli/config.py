@@ -110,8 +110,9 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--rest-border-ratio", type=float, default=None)
     p.add_argument("--rest-pad-mode", default=None)
     p.add_argument("--rest-feather-radius", type=int, default=None)
-    p.add_argument("--rest-blendmask", choices=["none", "facefusion", "laplacian"], default=None)
-    p.add_argument("--laplacian", action="store_true", help="Use laplacian pyramid compositor (sets --rest-blendmask laplacian)")
+    p.add_argument("--rest-blendmask", choices=["none", "legacy", "legacy_conditioned", "conditioned", "support", "facefusion", "laplacian"], default=None)
+    p.add_argument("--sharpen", action=argparse.BooleanOptionalAction, default=None, help="Enable mild interior sharpening for support blend mode",  )
+    p.add_argument("--laplacian", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--source-face", default=None, help="Source/reference face image for face_swap restorer")
     p.add_argument("--swap-model", default=None, help="ONNX face swap model path")
     p.add_argument("--swap-input-size", type=int, default=None)
@@ -144,6 +145,11 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--debug-save-detection-frames", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--debug-save-detection-json", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--debug-output-dir", default=None)
+    p.add_argument("--debug-mosaic-paste", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--debug-mosaic-paste-dir", default=None)
+    p.add_argument("--debug-mosaic-paste-start", type=int, default=None)
+    p.add_argument("--debug-mosaic-paste-end", type=int, default=None)
+    p.add_argument("--debug-mosaic-paste-frame", action="append", type=int, default=None)
     p.add_argument("--sbs", action="store_true")
     p.add_argument("--no-sbs", action="store_true")
     p.add_argument("--sbs-layout", choices=["lr", "rl"], default=None)
@@ -165,6 +171,7 @@ def _set_many_if_not_none(cfg: Config, keys_list: Sequence[Sequence[str]], value
         return
     for keys in keys_list:
         cfg.set(*keys, value=value)
+
 
 
 def _load_config_json(path: Path) -> dict[str, Any]:
@@ -206,7 +213,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     if cfg.get("debug_enabled", default=None) is None:
         cfg.set("debug_enabled", value=False)
     if cfg.get("restoration", "blendmask", default=None) is None:
-        cfg.set("restoration", "blendmask", value="none")
+        cfg.set("restoration", "blendmask", value="legacy")
 
     # High-level overrides
     _set_if_not_none(cfg, ("mode",), args.mode)
@@ -289,10 +296,16 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_many_if_not_none(cfg, [("restoration", "border_ratio"), ("mosaic_restoration", "border_ratio"), ("face_restoration", "border_ratio")], args.rest_border_ratio)
     _set_many_if_not_none(cfg, [("restoration", "pad_mode"), ("mosaic_restoration", "pad_mode"), ("face_restoration", "pad_mode")], args.rest_pad_mode)
     _set_many_if_not_none(cfg, [("restoration", "feather_radius"), ("mosaic_restoration", "feather_radius")], args.rest_feather_radius)
-    _set_many_if_not_none(cfg, [("restoration", "blendmask"), ("mosaic_restoration", "blendmask")], args.rest_blendmask)
+    normalized_blendmask = args.rest_blendmask
+    if normalized_blendmask is not None:
+        normalized_blendmask = {"facefusion": "support", "laplacian": "legacy", "conditioned": "legacy_conditioned"}.get(normalized_blendmask, normalized_blendmask)
+    _set_many_if_not_none(cfg, [("restoration", "blendmask"), ("mosaic_restoration", "blendmask")], normalized_blendmask)
     if args.laplacian:
-        cfg.set("restoration", "blendmask", value="laplacian")
-        cfg.set("mosaic_restoration", "blendmask", value="laplacian")
+        cfg.set("restoration", "blendmask", value="legacy")
+        cfg.set("mosaic_restoration", "blendmask", value="legacy")
+
+    _set_many_if_not_none(cfg,[("restoration", "sharpen"), ("mosaic_restoration", "sharpen")], args.sharpen, )
+
     _set_many_if_not_none(cfg, [("restoration", "source_face_path"), ("face_restoration", "source_face_path")], args.source_face)
     _set_many_if_not_none(cfg, [("restoration", "swap_model_path"), ("face_restoration", "swap_model_path")], args.swap_model)
     _set_many_if_not_none(cfg, [("restoration", "swap_input_size"), ("face_restoration", "swap_input_size")], args.swap_input_size)
@@ -332,6 +345,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("debug", "save_detection_frames"), args.debug_save_detection_frames)
     _set_if_not_none(cfg, ("debug", "save_detection_json"), args.debug_save_detection_json)
     _set_if_not_none(cfg, ("debug", "output_dir"), args.debug_output_dir)
+    _set_if_not_none(cfg, ("debug", "mosaic_paste", "enabled"), args.debug_mosaic_paste)
+    _set_if_not_none(cfg, ("debug", "mosaic_paste", "dir"), args.debug_mosaic_paste_dir)
+    _set_if_not_none(cfg, ("debug", "mosaic_paste", "start"), args.debug_mosaic_paste_start)
+    _set_if_not_none(cfg, ("debug", "mosaic_paste", "end"), args.debug_mosaic_paste_end)
+    _set_if_not_none(cfg, ("debug", "mosaic_paste", "frames"), args.debug_mosaic_paste_frame)
 
     # SBS
     if args.sbs:

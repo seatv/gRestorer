@@ -60,7 +60,7 @@
 		"border_ratio": 0.06,
 		"pad_mode": "reflect",
 		"feather_radius": 0,
-		"blendmask": "none"
+		"blendmask": "legacy"
 	},
 	"face_detection": {
 		"det_type": "face",
