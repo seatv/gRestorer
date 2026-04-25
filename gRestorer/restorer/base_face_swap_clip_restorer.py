@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import List, Optional
 import os
 from pathlib import Path
@@ -12,11 +12,9 @@ import torch
 from gRestorer.core.scene import Clip, face_meta_clip_to_crop
 from gRestorer.detector.core import FaceMetadata
 from gRestorer.restorer.clip_restorer import BaseClipRestorer
-from gRestorer.restorer.face_compositor import FaceCompositor
 from gRestorer.restorer.face_enhancer import FaceEnhancer
 from gRestorer.restorer.face_occluder import FaceOccluder
 from gRestorer.restorer.face_landmarker import FaceLandmarker
-from gRestorer.restorer.face_types import FaceCompositorConfig, FaceSwapBackendResult
 
 
 
@@ -64,20 +62,22 @@ class FaceSwapRestoreStats:
         return self.occluder_mean_abs_diff_accum / max(1, self.frames_occluder_returned)
 
 class BaseFaceSwapClipRestorer(BaseClipRestorer):
-    """ROI-authoritative face-swap wrapper with enhancer and optional occluder.
+    """ROI-authoritative face-swap wrapper with global post-processing.
 
     Policy lives here:
       - choose/stabilize the target face track within a clip
       - optional landmark refinement for the already chosen target face
-      - shared face compositor for backends that can return aligned swap results
+      - run the selected swapper's native paste-back path
+      - apply global ROI-space enhancer and occluder preserve stages
       - repad/resize behavior for the clip interface
 
-    Worker contracts:
-      legacy:
-          swap(one_original_crop_image, one_target_face_metadata_in_that_crop_space)
-      new-style:
-          swap_result(one_original_crop_image, one_target_face_metadata_in_that_crop_space)
-          -> FaceSwapBackendResult
+    Worker contract:
+      swap(one_original_crop_image, one_target_face_metadata_in_that_crop_space)
+          -> swapped crop image in the same ROI/crop space
+
+    Important design choice:
+      Each swapper owns its own align/infer/native paste-back semantics.
+      This class does not use the experimental aligned-space FaceCompositor path.
     """
 
     def __init__(
@@ -164,19 +164,8 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
 
         self.worker = self._build_worker()
 
-        self.face_compositor = FaceCompositor(
-            FaceCompositorConfig(
-                mask_mode=str(face_comp_mask_mode or "geom_backend_intersection").lower(),
-                geom_expand=float(face_comp_geom_expand),
-                mask_erode=int(face_comp_mask_erode),
-                mask_dilate=int(face_comp_mask_dilate),
-                mask_blur=int(face_comp_mask_blur),
-                blend_mode=str(face_comp_blend_mode or "alpha").lower(),
-                color_transfer=str(face_comp_color_transfer or "none").lower(),
-                face_scale=float(face_comp_face_scale),
-                debug=bool(face_comp_debug),
-            )
-        )
+        # Keep face_comp_* constructor arguments for CLI/config compatibility,
+        # but do not use the experimental shared face compositor in the active path.
         self.landmarker = None
         if self.landmark_refiner_enabled:
             if not self.landmark_model_path:
@@ -212,9 +201,6 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
 
     def _build_worker(self):
         raise NotImplementedError("Subclasses must create the concrete face-swap worker.")
-
-    def _worker_supports_backend_result(self) -> bool:
-        return hasattr(self.worker, "swap_result") and callable(getattr(self.worker, "swap_result"))
 
     @staticmethod
     def _tensor_hwc_float_to_numpy_bgr_u8(x: torch.Tensor) -> np.ndarray:
@@ -296,26 +282,6 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
             y = arr
         out = self.debug_dir / f"f{frame_num:06d}_{name}.png"
         cv2.imwrite(str(out), y)
-
-    def _save_backend_result_debug(self, frame_num: int, result: FaceSwapBackendResult) -> None:
-        if not self._debug_this_frame(frame_num):
-            return
-        try:
-            if result.aligned_target_bgr_u8 is not None:
-                self._save_debug_image(frame_num, "03a_aligned_target", result.aligned_target_bgr_u8)
-            self._save_debug_image(frame_num, "03b_aligned_swapped", result.aligned_swapped_bgr_u8)
-            if result.aligned_backend_mask_f32 is not None:
-                self._save_debug_mask(frame_num, "03c_backend_mask", result.aligned_backend_mask_f32)
-            self._save_debug_text(
-                frame_num,
-                f"backend_result aligned_size={int(result.aligned_size)} "
-                f"has_target={result.aligned_target_bgr_u8 is not None} "
-                f"has_backend_mask={result.aligned_backend_mask_f32 is not None}",
-            )
-            if result.debug:
-                self._save_debug_text(frame_num, f"backend_debug={result.debug}")
-        except Exception as e:
-            self._save_debug_text(frame_num, f"backend_result_debug_exception={e!r}")
 
     @staticmethod
     def _diff_image(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -574,67 +540,63 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
             f"[FaceSwapStats] occluder_materially_changed={self.stats.frames_occluder_materially_changed} avg_occluder_mad={self.stats.avg_occluder_mean_abs_diff():.4f}",
         ]
 
-    def _save_compositor_debug(self, frame_num: int, debug: dict[str, np.ndarray]) -> None:
-        if not (self.face_compositor.cfg.debug or self.debug_enabled):
-            return
-        if self.debug_start >= 0 and frame_num < self.debug_start:
-            return
-        if self.debug_end >= 0 and frame_num > self.debug_end:
-            return
+    def _apply_global_face_postprocess(
+        self,
+        *,
+        frame_num: int,
+        original_roi: np.ndarray,
+        swapped_roi: np.ndarray,
+        active_face_meta: FaceMetadata,
+    ) -> np.ndarray:
+        """Apply global ROI-space post-swap stages shared by all swappers.
 
-        self.debug_dir.mkdir(parents=True, exist_ok=True)
+        Swappers are intentionally responsible for their own align/infer/native
+        paste-back semantics. This method is the common control point for
+        enhancer and occluder policy after a worker has returned a same-size ROI.
+        """
+        stage_img = swapped_roi
 
-        def _save_mask(name: str, mask: np.ndarray) -> None:
-            arr = np.asarray(mask)
-            if arr.ndim == 3 and arr.shape[2] == 1:
-                arr = arr[..., 0]
-            if arr.ndim != 2:
-                return
-            if arr.dtype != np.uint8:
-                y = arr.astype(np.float32, copy=False)
-                if y.max() <= 1.0:
-                    y = y * 255.0
-                y = np.clip(y, 0.0, 255.0).round().astype(np.uint8)
-            else:
-                y = arr
-            out = self.debug_dir / f"f{frame_num:06d}_{name}.png"
-            cv2.imwrite(str(out), y)
+        if self.enhancer is not None:
+            self.stats.frames_enhancer_called += 1
+            try:
+                enhanced = self.enhancer.enhance(stage_img, active_face_meta)
+            except Exception as e:
+                self.stats.frames_enhancer_failed += 1
+                self._save_debug_text(frame_num, f"enhancer_exception={e!r}")
+                enhanced = None
+            if enhanced is not None:
+                enhanced = self._maybe_copy_guard(enhanced)
+                self.stats.frames_enhancer_returned += 1
+                emad = float(np.mean(np.abs(enhanced.astype(np.int16) - stage_img.astype(np.int16))))
+                self.stats.enhancer_mean_abs_diff_accum += emad
+                if emad >= self.material_change_mad_threshold:
+                    self.stats.frames_enhancer_materially_changed += 1
+                self._save_debug_text(frame_num, f"enhancer_mean_abs_diff={emad:.4f}")
+                self._save_debug_image(frame_num, "03b_enhanced", enhanced)
+                self._save_debug_image(frame_num, "04b_enhancer_diff", self._diff_image(stage_img, enhanced))
+                stage_img = enhanced
 
-        def _save_img(name: str, img: np.ndarray) -> None:
-            arr = np.asarray(img)
-            if arr.ndim != 3 or arr.shape[2] != 3:
-                return
-            if arr.dtype != np.uint8:
-                arr = np.clip(arr, 0.0, 255.0).round().astype(np.uint8)
-            out = self.debug_dir / f"f{frame_num:06d}_{name}.png"
-            cv2.imwrite(str(out), np.ascontiguousarray(arr))
+        if self.occluder is not None:
+            self.stats.frames_occluder_called += 1
+            try:
+                occluded = self.occluder.preserve(original_roi, stage_img, active_face_meta)
+            except Exception as e:
+                self.stats.frames_occluder_failed += 1
+                self._save_debug_text(frame_num, f"occluder_exception={e!r}")
+                occluded = None
+            if occluded is not None:
+                occluded = self._maybe_copy_guard(occluded)
+                self.stats.frames_occluder_returned += 1
+                omad = float(np.mean(np.abs(occluded.astype(np.int16) - stage_img.astype(np.int16))))
+                self.stats.occluder_mean_abs_diff_accum += omad
+                if omad >= self.material_change_mad_threshold:
+                    self.stats.frames_occluder_materially_changed += 1
+                self._save_debug_text(frame_num, f"occluder_mean_abs_diff={omad:.4f}")
+                self._save_debug_image(frame_num, "03c_occluded", occluded)
+                self._save_debug_image(frame_num, "04c_occluder_diff", self._diff_image(stage_img, occluded))
+                stage_img = occluded
 
-        try:
-
-            if "aligned_geom_mask_f32" in debug:
-                _save_mask("03d_geom_mask", debug["aligned_geom_mask_f32"])
-            if "aligned_pred_src_mask_f32" in debug:
-                _save_mask("03e_pred_src_mask", debug["aligned_pred_src_mask_f32"])
-            if "aligned_pred_dst_mask_f32" in debug:
-                _save_mask("03f_pred_dst_mask", debug["aligned_pred_dst_mask_f32"])
-            if "aligned_combined_mask_f32" in debug:
-                _save_mask("03g_combined_mask", debug["aligned_combined_mask_f32"])
-            if "roi_warped_alpha_f32" in debug:
-                _save_mask("03h_warped_alpha", debug["roi_warped_alpha_f32"])
-            if "roi_warped_face_bgr_u8" in debug:
-                _save_img("03i_warped_face", debug["roi_warped_face_bgr_u8"])
-            if "roi_keep_mask_f32" in debug:
-                _save_mask("03j_keep_mask", debug["roi_keep_mask_f32"])
-
-            txt_path = self.debug_dir / f"f{frame_num:06d}.txt"
-            with open(txt_path, "a", encoding="utf-8") as f:
-                f.write(f"compositor_debug_keys={sorted(debug.keys())}\n")
-
-        except Exception as e:
-            txt_path = self.debug_dir / f"f{frame_num:06d}.txt"
-            with open(txt_path, "a", encoding="utf-8") as f:
-                f.write(f"compositor_debug_exception={e!r}\n")
-
+        return self._maybe_copy_guard(stage_img)
 
     @torch.inference_mode()
     def restore_clip(self, clip: Clip) -> List[torch.Tensor]:
@@ -726,138 +688,27 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
 
                 self.stats.frames_worker_called += 1
                 out = None
-                backend_result: Optional[FaceSwapBackendResult] = None
-                used_authoritative_backend_path = False
 
                 self._save_debug_text(
                     frame_num,
                     "worker_runtime="
                     f"{type(self.worker).__module__}.{type(self.worker).__name__} "
-                    f"has_swap={hasattr(self.worker, 'swap')} "
-                    f"has_swap_result={hasattr(self.worker, 'swap_result')}"
+                    f"has_swap={hasattr(self.worker, 'swap')}"
                 )
+                self._save_debug_text(frame_num, "worker_branch=native_swap")
 
-                if self._worker_supports_backend_result():
-                    self._save_debug_text(frame_num, "worker_branch=backend_result")
-
-                    try:
-                        backend_result = self.worker.swap_result(crop_np, active_face_meta)
-                    except Exception as e:
-                        self.stats.worker_exceptions += 1
-                        self.stats.last_worker_exception = repr(e)
-                        self._save_debug_text(frame_num, f"swap_result_exception={e!r}")
-                        if self._swap_exception_print_budget > 0:
-                            print(f"[FaceSwap][swap_result_exception] frame={frame_num} {e!r}")
-                            self._swap_exception_print_budget -= 1
-                        backend_result = None
-
-                    if backend_result is not None:
-                        self._save_backend_result_debug(frame_num, backend_result)
-
-                        occlusion_keep_mask_f32 = None
-
-                        # 1) Optional enhancer in aligned space, BEFORE final compositor.
-                        if self.enhancer is not None:
-                            self.stats.frames_enhancer_called += 1
-                            try:
-                                enhanced_f32 = self.enhancer.enhance_aligned_f32(backend_result.swapped_face_f32)
-                            except Exception as e:
-                                self.stats.frames_enhancer_failed += 1
-                                self._save_debug_text(frame_num, f"enhancer_aligned_exception={e!r}")
-                                enhanced_f32 = None
-
-                            if enhanced_f32 is not None:
-                                self.stats.frames_enhancer_returned += 1
-
-                                before_enh_u8 = backend_result.aligned_swapped_bgr_u8
-                                after_enh_u8 = FaceSwapBackendResult._f32_to_u8(enhanced_f32)
-
-                                emad = float(
-                                    np.mean(np.abs(after_enh_u8.astype(np.int16) - before_enh_u8.astype(np.int16))))
-                                self.stats.enhancer_mean_abs_diff_accum += emad
-                                if emad >= self.material_change_mad_threshold:
-                                    self.stats.frames_enhancer_materially_changed += 1
-
-                                self._save_debug_text(frame_num, f"enhancer_aligned_mean_abs_diff={emad:.4f}")
-                                self._save_debug_image(frame_num, "03ba_aligned_enhanced", after_enh_u8)
-                                self._save_debug_image(frame_num, "03bb_aligned_enhancer_diff",
-                                                       self._diff_image(before_enh_u8, after_enh_u8))
-
-                                backend_result = replace(backend_result, swapped_face_f32=enhanced_f32)
-
-                        # 2) Optional occluder keep mask, BEFORE final compositor.
-                        if self.occluder is not None:
-                            self.stats.frames_occluder_called += 1
-                            try:
-                                occ = self.occluder.build_keep_mask(crop_np, active_face_meta)
-                            except Exception as e:
-                                self.stats.frames_occluder_failed += 1
-                                self._save_debug_text(frame_num, f"occluder_keep_mask_exception={e!r}")
-                                occ = None
-
-                            if occ is not None:
-                                self.stats.frames_occluder_returned += 1
-                                occlusion_keep_mask_f32 = occ.keep_mask_f32
-
-                                if occ.aligned_input_bgr_u8 is not None:
-                                    self._save_debug_image(frame_num, "03ca_occluder_aligned_input",
-                                                           occ.aligned_input_bgr_u8)
-                                if occ.aligned_raw_mask_f32 is not None:
-                                    self._save_debug_mask(frame_num, "03cb_occluder_raw_mask", occ.aligned_raw_mask_f32)
-                                if occ.aligned_keep_mask_f32 is not None:
-                                    self._save_debug_mask(frame_num, "03cc_occluder_keep_mask_aligned",
-                                                          occ.aligned_keep_mask_f32)
-                                if occlusion_keep_mask_f32 is not None:
-                                    self._save_debug_mask(frame_num, "03cd_occluder_keep_mask_roi",
-                                                          occlusion_keep_mask_f32)
-
-                                    keep_mean = float(np.mean(occlusion_keep_mask_f32))
-                                    self._save_debug_text(frame_num, f"occluder_keep_mask_mean={keep_mean:.6f}")
-                                    if keep_mean > 1e-4:
-                                        self.stats.frames_occluder_materially_changed += 1
-
-                        # 3) One authoritative final compose.
-                        try:
-                            if self.face_compositor.cfg.debug or self.debug_enabled:
-                                out, comp_debug = self.face_compositor.compose_debug(
-                                    original_roi_bgr_u8=crop_np,
-                                    target_face_meta=active_face_meta,
-                                    backend_result=backend_result,
-                                    occlusion_keep_mask_f32=occlusion_keep_mask_f32,
-                                )
-                                self._save_compositor_debug(frame_num, comp_debug)
-                                self._save_debug_text(frame_num, f"compositor_debug_keys={sorted(comp_debug.keys())}")
-                            else:
-                                out = self.face_compositor.compose(
-                                    original_roi_bgr_u8=crop_np,
-                                    target_face_meta=active_face_meta,
-                                    backend_result=backend_result,
-                                    occlusion_keep_mask_f32=occlusion_keep_mask_f32,
-                                )
-
-                            if out is not None:
-                                used_authoritative_backend_path = True
-                                self._save_debug_text(frame_num, "authoritative_backend_path=True")
-
-                        except Exception as e:
-                            self._save_debug_text(frame_num, f"face_compositor_exception={e!r}")
-                            out = None
-                    else:
-                        self._save_debug_text(frame_num, "swap_result_returned=None")
-                else:
-                    self._save_debug_text(frame_num, "worker_branch=legacy_swap")
-                    try:
-                        out = self.worker.swap(crop_np, active_face_meta)
-                        if out is not None:
-                            out = self._maybe_copy_guard(out)
-                    except Exception as e:
-                        self.stats.worker_exceptions += 1
-                        self.stats.last_worker_exception = repr(e)
-                        self._save_debug_text(frame_num, f"swap_exception={e!r}")
-                        if self._swap_exception_print_budget > 0:
-                            print(f"[FaceSwap][swap_exception] frame={frame_num} {e!r}")
-                            self._swap_exception_print_budget -= 1
-                        out = None
+                try:
+                    out = self.worker.swap(crop_np, active_face_meta)
+                    if out is not None:
+                        out = self._maybe_copy_guard(out)
+                except Exception as e:
+                    self.stats.worker_exceptions += 1
+                    self.stats.last_worker_exception = repr(e)
+                    self._save_debug_text(frame_num, f"swap_exception={e!r}")
+                    if self._swap_exception_print_budget > 0:
+                        print(f"[FaceSwap][swap_exception] frame={frame_num} {e!r}")
+                        self._swap_exception_print_budget -= 1
+                    out = None
 
                 if out is None:
                     self.stats.frames_worker_returned_none += 1
@@ -873,49 +724,12 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
                     self._save_debug_image(frame_num, "02_swapped", out)
                     self._save_debug_image(frame_num, "04_swap_diff", self._diff_image(before, out))
 
-                    stage_img = out
-
-                    if (not used_authoritative_backend_path) and self.enhancer is not None:
-                        self.stats.frames_enhancer_called += 1
-                        try:
-                            enhanced = self.enhancer.enhance(stage_img, active_face_meta)
-                        except Exception as e:
-                            self.stats.frames_enhancer_failed += 1
-                            self._save_debug_text(frame_num, f"enhancer_exception={e!r}")
-                            enhanced = None
-                        if enhanced is not None:
-                            enhanced = self._maybe_copy_guard(enhanced)
-                            self.stats.frames_enhancer_returned += 1
-                            emad = float(np.mean(np.abs(enhanced.astype(np.int16) - stage_img.astype(np.int16))))
-                            self.stats.enhancer_mean_abs_diff_accum += emad
-                            if emad >= self.material_change_mad_threshold:
-                                self.stats.frames_enhancer_materially_changed += 1
-                            self._save_debug_text(frame_num, f"enhancer_mean_abs_diff={emad:.4f}")
-                            self._save_debug_image(frame_num, "03b_enhanced", enhanced)
-                            self._save_debug_image(frame_num, "04b_enhancer_diff", self._diff_image(stage_img, enhanced))
-                            stage_img = enhanced
-
-                    if (not used_authoritative_backend_path) and self.occluder is not None:
-                        self.stats.frames_occluder_called += 1
-                        try:
-                            occluded = self.occluder.preserve(original_roi, stage_img, active_face_meta)
-                        except Exception as e:
-                            self.stats.frames_occluder_failed += 1
-                            self._save_debug_text(frame_num, f"occluder_exception={e!r}")
-                            occluded = None
-                        if occluded is not None:
-                            occluded = self._maybe_copy_guard(occluded)
-                            self.stats.frames_occluder_returned += 1
-                            omad = float(np.mean(np.abs(occluded.astype(np.int16) - stage_img.astype(np.int16))))
-                            self.stats.occluder_mean_abs_diff_accum += omad
-                            if omad >= self.material_change_mad_threshold:
-                                self.stats.frames_occluder_materially_changed += 1
-                            self._save_debug_text(frame_num, f"occluder_mean_abs_diff={omad:.4f}")
-                            self._save_debug_image(frame_num, "03c_occluded", occluded)
-                            self._save_debug_image(frame_num, "04c_occluder_diff", self._diff_image(stage_img, occluded))
-                            stage_img = occluded
-
-                    swapped_np = self._maybe_copy_guard(stage_img)
+                    swapped_np = self._apply_global_face_postprocess(
+                        frame_num=frame_num,
+                        original_roi=original_roi,
+                        swapped_roi=out,
+                        active_face_meta=active_face_meta,
+                    )
 
             target_h, target_w = crop_resized_shapes[i]
             if int(swapped_np.shape[0]) != target_h or int(swapped_np.shape[1]) != target_w:
