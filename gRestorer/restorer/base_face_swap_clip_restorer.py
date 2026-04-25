@@ -77,7 +77,7 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
 
     Important design choice:
       Each swapper owns its own align/infer/native paste-back semantics.
-      This class does not use the experimental aligned-space FaceCompositor path.
+      This class uses native swapper paste-back, not the inactive aligned-space compositor path.
     """
 
     def __init__(

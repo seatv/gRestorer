@@ -15,9 +15,9 @@ class HyperSwapWorker:
 
     Design goal:
     - follow the FaceFusion-style native flow for HyperSwap
-    - do NOT return FaceSwapBackendResult
+    - return a fully pasted ROI from swap()
     - do native warp -> infer -> mask -> paste-back in swap()
-    - bypass the shared compositor entirely
+    - keep backend-specific paste-back inside HyperSwap
     - optionally apply FaceFusion-style pixel boost using interleaved
       implode/explode helpers around the native model size
     """

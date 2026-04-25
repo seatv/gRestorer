@@ -14,7 +14,6 @@ class InSwapperWorker:
     """Pure face-swap worker.
 
     This intentionally stays on the known-good legacy path:
-      - no swap_result()
       - no shared aligned compositor path
       - let insightface InSwapper do paste_back=True itself
 
