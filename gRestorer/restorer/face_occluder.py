@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from gRestorer.detector.core import FaceMetadata
-
+from .face_types import FaceOcclusionMaskResult
 
 class FaceOccluder:
     """Optional post-swap occluder-preserve stage.
@@ -189,11 +189,40 @@ class FaceOccluder:
             mask = cv2.GaussianBlur(mask, (k, k), 0)
         return np.clip(mask, 0.0, 1.0)
 
-    def preserve(self, original_roi_bgr_u8: np.ndarray, modified_roi_bgr_u8: np.ndarray, face_meta: FaceMetadata) -> Optional[np.ndarray]:
+    def preserve(
+            self,
+            original_roi_bgr_u8: np.ndarray,
+            modified_roi_bgr_u8: np.ndarray,
+            face_meta: FaceMetadata,
+    ) -> Optional[np.ndarray]:
         if original_roi_bgr_u8 is None or modified_roi_bgr_u8 is None or face_meta is None:
             return None
-        if self.blend <= 0:
+
+        result = self.build_keep_mask(original_roi_bgr_u8, face_meta)
+        if result is None:
             return modified_roi_bgr_u8
+
+        keep = result.keep_mask_f32[..., None]
+        orig = original_roi_bgr_u8.astype(np.float32)
+        mod = modified_roi_bgr_u8.astype(np.float32)
+        out = mod * (1.0 - keep) + orig * keep
+        return np.clip(out, 0.0, 255.0).round().astype(np.uint8)
+
+    def build_keep_mask(
+            self,
+            original_roi_bgr_u8: np.ndarray,
+            face_meta: FaceMetadata,
+    ) -> Optional[FaceOcclusionMaskResult]:
+        if original_roi_bgr_u8 is None or face_meta is None:
+            return None
+        if self.blend <= 0:
+            h, w = original_roi_bgr_u8.shape[:2]
+            return FaceOcclusionMaskResult(
+                keep_mask_f32=np.zeros((h, w), dtype=np.float32),
+                aligned_input_bgr_u8=None,
+                aligned_raw_mask_f32=None,
+                aligned_keep_mask_f32=None,
+            )
 
         h, w = original_roi_bgr_u8.shape[:2]
         src_pts = self._five_points(face_meta)
@@ -206,25 +235,27 @@ class FaceOccluder:
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_REFLECT_101,
         )
-        mask = self._run_model(aligned)
-        mask = self._postprocess_mask(mask)
+
+        raw_mask = self._run_model(aligned)
+        keep_mask_aligned = self._postprocess_mask(raw_mask)
 
         M_inv = cv2.invertAffineTransform(M)
-        warped_mask = cv2.warpAffine(
-            mask,
+        keep_mask_roi = cv2.warpAffine(
+            keep_mask_aligned,
             M_inv,
             (w, h),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0.0,
+        ).astype(np.float32)
+
+        keep_mask_roi = np.clip(keep_mask_roi, 0.0, 1.0)
+        keep_mask_roi *= float(self.blend) / 100.0
+
+        return FaceOcclusionMaskResult(
+            keep_mask_f32=keep_mask_roi,
+            aligned_input_bgr_u8=aligned,
+            aligned_raw_mask_f32=np.clip(raw_mask.astype(np.float32), 0.0, 1.0),
+            aligned_keep_mask_f32=np.clip(keep_mask_aligned.astype(np.float32), 0.0, 1.0),
         )
-        warped_mask = np.clip(warped_mask, 0.0, 1.0)[..., None]
-        warped_mask *= float(self.blend) / 100.0
-
-        orig = original_roi_bgr_u8.astype(np.float32)
-        mod = modified_roi_bgr_u8.astype(np.float32)
-        out = mod * (1.0 - warped_mask) + orig * warped_mask
-        return np.clip(out, 0.0, 255.0).round().astype(np.uint8)
-
-
 __all__ = ["FaceOccluder"]

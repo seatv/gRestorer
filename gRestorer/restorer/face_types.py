@@ -58,5 +58,11 @@ class FaceCompositorConfig:
     face_scale: float = 0.0
     debug: bool = False
 
+@dataclass
+class FaceOcclusionMaskResult:
+    keep_mask_f32: np.ndarray
+    aligned_input_bgr_u8: Optional[np.ndarray] = None
+    aligned_raw_mask_f32: Optional[np.ndarray] = None
+    aligned_keep_mask_f32: Optional[np.ndarray] = None
 
-__all__ = ["FaceSwapBackendResult", "FaceCompositorConfig"]
+__all__ = ["FaceSwapBackendResult", "FaceCompositorConfig", "FaceOcclusionMaskResult"]

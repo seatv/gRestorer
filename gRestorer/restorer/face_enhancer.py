@@ -46,6 +46,13 @@ class FaceEnhancer:
         self._output_name = self._session.get_outputs()[0].name
         self.input_size = self._infer_input_size(self._session)
 
+        print(
+            f"[FaceEnhancer] provider={self.provider} "
+            f"input_size={self.input_size} "
+            f"input={self._input_name} output={self._output_name} "
+            f"blend={self.blend}"
+        )
+
     @staticmethod
     def _providers_for(provider: str, device: torch.device) -> List[str]:
         p = str(provider or 'auto').lower()
@@ -188,5 +195,42 @@ class FaceEnhancer:
         out = base * (1.0 - warped_mask) + over * warped_mask
         return np.clip(out, 0.0, 255.0).round().astype(np.uint8)
 
+    def enhance_aligned_f32(self, aligned_face_f32: np.ndarray) -> Optional[np.ndarray]:
+        if aligned_face_f32 is None:
+            return None
+        if self.blend <= 0:
+            return aligned_face_f32
+
+        src = np.asarray(aligned_face_f32, dtype=np.float32)
+        if src.ndim != 3 or src.shape[2] != 3:
+            raise ValueError(f"Expected HWC float image, got shape={tuple(src.shape)}")
+
+        src = np.clip(src, 0.0, 1.0)
+        h, w = src.shape[:2]
+
+        src_u8 = np.clip(src * 255.0, 0.0, 255.0).round().astype(np.uint8)
+
+        if h != self.input_size or w != self.input_size:
+            model_in = cv2.resize(src_u8, (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR)
+        else:
+            model_in = src_u8
+
+        enhanced_u8 = self._run_model(model_in)
+
+        if enhanced_u8.shape[:2] != (h, w):
+            enhanced_u8 = cv2.resize(enhanced_u8, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        mask = self._soft_mask(max(h, w))
+        if mask.shape[:2] != (h, w):
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
+        mask = np.clip(mask.astype(np.float32), 0.0, 1.0)[..., None]
+        mask *= float(self.blend) / 100.0
+
+        base = src_u8.astype(np.float32)
+        over = enhanced_u8.astype(np.float32)
+        out = base * (1.0 - mask) + over * mask
+        out = np.clip(out, 0.0, 255.0).round().astype(np.uint8)
+
+        return out.astype(np.float32) / 255.0
 
 __all__ = ['FaceEnhancer']

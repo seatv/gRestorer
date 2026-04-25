@@ -686,7 +686,9 @@ class Pipeline:
         self.enc_qp: int = int(self.cfg.get("encoder", "qp", default=20))
         self.enc_sync_before_encode: bool = bool(self.cfg.get("encoder", "sync_before_encode", default=True))
 
-        self.enc_mode: str = str(self.cfg.get("encoder", "mode", default="hq") or "hq").lower()
+        _raw_enc_mode = self.cfg.get("encoder", "mode", default=None)
+        self.enc_mode: str | None = str(_raw_enc_mode).lower() if _raw_enc_mode not in (None, "") else None
+
         self.enc_options_str: str = str(self.cfg.get("encoder", "options", default="") or "")
         self.enc_opt_dict = self.cfg.get("encoder", "opt", default={}) or {}
         if not isinstance(self.enc_opt_dict, dict):

@@ -199,14 +199,151 @@ def _parse_kv_style_tokens(tokens: List[str]) -> Dict[str, Any]:
     return out
 
 
-# FFmpeg-style option names -> PyNvVideoCodec-ish names we try.
-# (We keep pass-through too; this mapping is additive.)
+# FFmpeg-style / CLI-ish option names -> canonical NVENC-ish names we try.
+# Keys that are not true CreateEncoder kwargs (for example pix_fmt) are handled
+# separately and usually dropped with a warning before reaching the API.
 _FFMPEG_TO_NVC = {
+    "preset:v": "preset",
+    "profile:v": "profile",
+    "tune": "tuning_info",
     "rc-lookahead": "lookahead",
     "spatial_aq": "aq",
     "temporal_aq": "temporalaq",
-    "tune": "tuning_info",
+    "b:v": "bitrate",
+    "maxrate": "maxbitrate",
+    "bufsize": "vbvbufsize",
+    "aq-strength": "aq_strength",
 }
+
+_DROP_BEFORE_CREATE = {
+    "pix_fmt",
+}
+
+_RATECONTROL_BITRATE_KEYS = {
+    "bitrate",
+    "maxbitrate",
+    "vbvbufsize",
+    "vbvinit",
+}
+
+def _normalize_tuning_info(v: Any) -> Any:
+    s = _as_str(v)
+    if s is None:
+        return v
+    s_l = s.lower()
+    if s_l in ("hq", "high_quality", "highquality"):
+        return "high_quality"
+    if s_l in ("ll", "low_latency", "lowlatency"):
+        return "low_latency"
+    if s_l in ("ull", "ultra_low_latency", "ultralowlatency"):
+        return "ultra_low_latency"
+    if s_l in ("lossless",):
+        return "lossless"
+    return s
+
+def _canonicalize_user_options(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Convert FFmpeg/CLI-ish keys into the smaller canonical key space we want to
+    hand to CreateEncoder. Last write wins after canonicalization.
+    """
+    out: Dict[str, Any] = {}
+    notes: List[str] = []
+    for k, v in raw.items():
+        kk = str(k).strip()
+        if not kk:
+            continue
+
+        canonical = _FFMPEG_TO_NVC.get(kk, kk)
+
+        if canonical in _DROP_BEFORE_CREATE:
+            notes.append(f"dropped non-NVENC option '{kk}={v}'")
+            continue
+
+        if canonical in ("cq", "cq:v"):
+            canonical = "cq"
+
+        prev = out.get(canonical)
+        if prev is not None and str(prev) != str(v):
+            notes.append(f"override '{canonical}': '{prev}' -> '{v}'")
+
+        out[canonical] = v
+
+    if "tuning_info" in out:
+        out["tuning_info"] = _normalize_tuning_info(out["tuning_info"])
+
+    return out, notes
+
+def _sanitize_nvenc_options(
+    opts: Dict[str, Any],
+    *,
+    mode: str,
+    qp_default: int,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Clean conflicting/duplicated options before they reach CreateEncoder.
+
+    Policy:
+    - custom mode starts from a minimal baseline; no silent HQ knobs
+    - canonicalize CLI aliases into one option vocabulary
+    - resolve constqp-vs-bitrate conflicts predictably
+    - drop keys known not to belong to CreateEncoder
+    """
+    out = dict(opts)
+    notes: List[str] = []
+
+    for k in list(out.keys()):
+        if k in _DROP_BEFORE_CREATE:
+            notes.append(f"dropped non-NVENC option '{k}={out[k]}'")
+            out.pop(k, None)
+
+    rc = (_as_str(out.get("rc")) or "").lower()
+
+    if "cq" in out:
+        cq_val = out.pop("cq")
+        if rc == "constqp":
+            if "constqp" in out:
+                if str(out["constqp"]) != str(cq_val):
+                    notes.append(
+                        f"dropped 'cq={cq_val}' because constqp={out['constqp']} already selected"
+                    )
+            else:
+                out["constqp"] = cq_val
+                notes.append(f"mapped 'cq={cq_val}' -> 'constqp={cq_val}' for rc=constqp")
+        else:
+            notes.append(f"dropped 'cq={cq_val}' because rc is not constqp")
+
+    if rc == "constqp" and "constqp" not in out and "qp" in out:
+        out["constqp"] = out["qp"]
+        notes.append(f"mapped 'qp={out['qp']}' -> 'constqp={out['qp']}' for rc=constqp")
+    if "qp" in out and rc == "constqp":
+        out.pop("qp", None)
+
+    if rc == "constqp":
+        for k in list(_RATECONTROL_BITRATE_KEYS):
+            if k in out:
+                notes.append(f"dropped '{k}={out[k]}' because rc=constqp")
+                out.pop(k, None)
+
+    if "preset" in out:
+        out["preset"] = _normalize_preset(str(out["preset"]))
+    if "tuning_info" in out:
+        out["tuning_info"] = _normalize_tuning_info(out["tuning_info"])
+
+    if mode == "custom":
+        for k in ("aq", "aq_strength", "temporalaq", "lookahead", "multipass", "tuning_info", "bf", "bframes", "b_ref_mode"):
+            if k in out and k not in opts:
+                notes.append(f"dropped implicit custom-mode default '{k}={out[k]}'")
+                out.pop(k, None)
+
+    if "bf" in out and "bframes" in out:
+        notes.append(f"dropped 'bframes={out['bframes']}' because bf={out['bf']} wins")
+        out.pop("bframes", None)
+
+    if rc == "constqp" and "constqp" not in out:
+        out["constqp"] = str(qp_default)
+        notes.append(f"filled missing constqp from default qp={qp_default}")
+
+    return out, notes
 
 
 # A broad "known" key set used for a safer retry when allow_unknown=False.
@@ -381,7 +518,7 @@ class Encoder:
         container: str | None = None,
         ffmpeg_path: str = "ffmpeg",
         # new knobs
-        mode: str = "hq",
+        mode: str = "default",
         nvenc_options_str: str = "",
         nvenc_options: Optional[Dict[str, Any]] = None,
         nvenc_allow_unknown: bool = False,
@@ -406,7 +543,7 @@ class Encoder:
         self.ffmpeg_path = str(ffmpeg_path)
         self.ffprobe_path = _resolve_ffprobe_path(self.ffmpeg_path)
 
-        self.mode = str(mode or "hq").lower()
+        self.mode = str(mode or "default").lower()
         self.analysis_mode = self.mode in ("analysis", "metric", "metrics")
         self.default_mode = self.mode in ("default",)
         self.deterministic_mode = self.analysis_mode or self.default_mode
@@ -440,6 +577,7 @@ class Encoder:
         self._file = open(self._raw_path, "wb")
         self._frames_encoded = 0
         self._closed = False
+        self._nvenc_option_notes: List[str] = []
 
         # Create encoder
         fmt = "ARGB"  # expects BGRA bytes on little-endian
@@ -459,6 +597,8 @@ class Encoder:
         if self.nvenc_options:
             print(f"[Encoder] nvenc_options(dict): {self.nvenc_options}")
         print(f"[Encoder] Final NVENC opts: {enc_opts}")
+        for note in self._nvenc_option_notes:
+            print(f"[Encoder] NVENC note: {note}")
         print(f"[Encoder] Format: ARGB (expects BGRA memory layout)")
         if self._needs_remux:
             print(f"[Encoder] Container: {self.container} (ffmpeg remux at close)")
@@ -481,7 +621,11 @@ class Encoder:
     def _mode_defaults(self) -> Dict[str, Any]:
         """
         Mode defaults are intentionally conservative; unsupported keys will be dropped.
-        You can push to LADA parity by passing nvenc_options_str with -bf/-b_ref_mode/etc.
+
+        Policy:
+        - default / analysis => deterministic no-B-frame profile (sanitized later)
+        - hq / archive        => explicit higher quality toolset
+        - custom             => minimal baseline only; no silent HQ knobs
         """
         gop_frames = max(1, int(round(self.fps * 2.0)))
 
@@ -499,6 +643,27 @@ class Encoder:
                 "bf": "0",
             }
 
+        if self.mode in ("default", "analysis", "metric", "metrics"):
+            return {
+                "preset": _normalize_preset(self.preset or "P7"),
+                "profile": self.profile,
+                "fps": self.fps_rate_str,
+                "gop": str(gop_frames),
+                "idrperiod": str(gop_frames),
+                "rc": "constqp",
+                "constqp": str(self.qp),
+                "bf": "0",
+            }
+
+        if self.mode in ("custom",):
+            return {
+                "preset": _normalize_preset(self.preset or "P7"),
+                "profile": self.profile,
+                "fps": self.fps_rate_str,
+                "gop": str(gop_frames),
+                "idrperiod": str(gop_frames),
+            }
+
         if self.mode in ("archive", "max", "maxquality"):
             return {
                 "preset": _normalize_preset(self.preset or "P7"),
@@ -511,10 +676,9 @@ class Encoder:
                 "tuning_info": "high_quality",
                 "aq": "1",
                 "lookahead": "32",
-                # bf/b_ref_mode intentionally not forced; user can opt-in.
             }
 
-        # hq / custom default
+        # hq fallback
         return {
             "preset": _normalize_preset(self.preset or "P7"),
             "profile": self.profile,
@@ -526,7 +690,6 @@ class Encoder:
             "tuning_info": "high_quality",
             "aq": "1",
             "lookahead": "32",
-            # bf/b_ref_mode are opt-in via nvenc_options_str/dict
         }
 
     def _merge_options(self, base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
@@ -575,46 +738,39 @@ class Encoder:
             "fps": self.fps_rate_str,
         }
 
-        # Merge mode defaults
+        # Merge mode defaults first.
         opts = self._merge_options(opts, self._mode_defaults())
 
-        # Merge dict overrides
-        if self.nvenc_options:
-            opts = self._merge_options(opts, self.nvenc_options)
+        # Merge user overrides in two stages:
+        #   1) dict overrides
+        #   2) string overrides (highest precedence)
+        user_notes: List[str] = []
 
-        # Merge string overrides (ffmpeg-ish)
+        if self.nvenc_options:
+            canonical_dict, notes = _canonicalize_user_options(self.nvenc_options)
+            user_notes.extend(notes)
+            opts = self._merge_options(opts, canonical_dict)
+
         if self.nvenc_options_str.strip():
             toks = shlex.split(self.nvenc_options_str)
             parsed = _parse_kv_style_tokens(toks)
+            canonical_str, notes = _canonicalize_user_options(parsed)
+            user_notes.extend(notes)
+            opts = self._merge_options(opts, canonical_str)
 
-            # Map ffmpeg-style keys into nvc keys too
-            mapped: Dict[str, Any] = {}
-            for k, v in parsed.items():
-                kk = str(k)
-                vv = v
-                if kk in _FFMPEG_TO_NVC:
-                    mapped[_FFMPEG_TO_NVC[kk]] = vv
-                mapped[kk] = vv
-
-            opts = self._merge_options(opts, mapped)
-
-        # If user specified -qp but we're in constqp, map qp -> constqp when constqp not explicitly set.
-        rc = _as_str(opts.get("rc")) or ""
-        if rc.lower() == "constqp":
-            if "constqp" not in opts and "qp" in opts:
-                opts["constqp"] = opts["qp"]
-
-        # Normalize common fields
-        if "preset" in opts:
-            opts["preset"] = _normalize_preset(str(opts["preset"]))
-        if "bf" in opts and "bframes" not in opts:
-            # keep bf as primary; some builds accept bframes instead
-            pass
+        # Normalize and sanitize merged options before CreateEncoder sees them.
+        opts, sanitize_notes = _sanitize_nvenc_options(
+            opts,
+            mode=self.mode,
+            qp_default=self.qp,
+        )
+        user_notes.extend(sanitize_notes)
 
         if self.deterministic_mode:
             opts = self._analysis_sanitize_options(opts)
 
         # Encode expects strings commonly; keep as-is.
+        self._nvenc_option_notes = user_notes
         return opts
 
     def _create_encoder_with_fallback(
