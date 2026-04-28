@@ -121,6 +121,15 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--swap-pixel-boost", default=None, help="HyperSwap pixel boost size, e.g. 512x512")
     p.add_argument("--face-enhancer-model", default=None, help="Optional ONNX face enhancer model path (GFPGAN-like single-input model)")
     p.add_argument("--face-enhancer-blend", type=int, default=None, help="Optional face enhancer blend 0..100")
+    p.add_argument("--expression-restorer-enabled", action=argparse.BooleanOptionalAction, default=None, help="Enable FaceFusion-style LivePortrait expression restoration after face swap")
+    p.add_argument("--expression-restorer-model", choices=["live_portrait"], default=None)
+    p.add_argument("--expression-restorer-feature-extractor", default=None, help="LivePortrait feature extractor ONNX path")
+    p.add_argument("--expression-restorer-motion-extractor", default=None, help="LivePortrait motion extractor ONNX path")
+    p.add_argument("--expression-restorer-generator", default=None, help="LivePortrait generator ONNX path")
+    p.add_argument("--expression-restorer-provider", choices=["auto", "cuda", "cpu"], default=None)
+    p.add_argument("--expression-restorer-factor", type=int, default=None, help="Expression restoration factor 0..100; FaceFusion maps 80 to 0.96")
+    p.add_argument("--expression-restorer-areas", nargs="+", choices=["upper-face", "lower-face"], default=None)
+    p.add_argument("--expression-restorer-mask-blur", type=float, default=None)
     p.add_argument("--rest-compositor-quantize-before-resize", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--rest-compositor-resize-backend", choices=["torch", "image_utils"], default=None)
     p.add_argument("--analysis-use-synth-rois", action=argparse.BooleanOptionalAction, default=None)
@@ -316,6 +325,15 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_many_if_not_none(cfg, [("restoration", "face_enhancer_blend"), ("enhancement", "blend")], args.face_enhancer_blend)
     if args.face_enhancer_model is not None:
         cfg.set("enhancement", "enabled", value=bool(str(args.face_enhancer_model).strip()))
+    _set_if_not_none(cfg, ("expression_restoration", "enabled"), args.expression_restorer_enabled)
+    _set_if_not_none(cfg, ("expression_restoration", "model"), args.expression_restorer_model)
+    _set_if_not_none(cfg, ("expression_restoration", "feature_extractor_path"), args.expression_restorer_feature_extractor)
+    _set_if_not_none(cfg, ("expression_restoration", "motion_extractor_path"), args.expression_restorer_motion_extractor)
+    _set_if_not_none(cfg, ("expression_restoration", "generator_path"), args.expression_restorer_generator)
+    _set_if_not_none(cfg, ("expression_restoration", "provider"), args.expression_restorer_provider)
+    _set_if_not_none(cfg, ("expression_restoration", "factor"), args.expression_restorer_factor)
+    _set_if_not_none(cfg, ("expression_restoration", "areas"), args.expression_restorer_areas)
+    _set_if_not_none(cfg, ("expression_restoration", "mask_blur"), args.expression_restorer_mask_blur)
     _set_if_not_none(cfg, ("restoration", "compositor_quantize_before_resize"), args.rest_compositor_quantize_before_resize)
     _set_if_not_none(cfg, ("restoration", "compositor_resize_backend"), args.rest_compositor_resize_backend)
     _set_if_not_none(cfg, ("restoration", "analysis_use_synth_rois"), args.analysis_use_synth_rois)
@@ -417,6 +435,31 @@ def parse_args(argv: list[str] | None = None) -> Config:
         swap_model_path = Path(swap_model_s)
         if not swap_model_path.exists():
             raise FileNotFoundError(f"Swap model not found: {swap_model_path}")
+
+        expression_enabled = bool(_cfg_first(cfg, [("expression_restoration", "enabled")], default=False))
+        if expression_enabled:
+            expression_model = str(_cfg_first(cfg, [("expression_restoration", "model")], default="live_portrait") or "live_portrait").lower()
+            if expression_model != "live_portrait":
+                raise ValueError("expression_restoration.model currently supports only 'live_portrait'")
+            for key in ("feature_extractor_path", "motion_extractor_path", "generator_path"):
+                model_s = str(_cfg_first(cfg, [("expression_restoration", key)], default="") or "").strip()
+                if not model_s:
+                    raise FileNotFoundError(f"expression_restoration.{key} is empty")
+                model_path = Path(model_s)
+                if not model_path.exists():
+                    raise FileNotFoundError(f"Expression restorer model not found: {model_path}")
+            factor = int(_cfg_first(cfg, [("expression_restoration", "factor")], default=80))
+            if factor < 0 or factor > 100:
+                raise ValueError("expression_restoration.factor must be in 0..100")
+            areas = _cfg_first(cfg, [("expression_restoration", "areas")], default=["upper-face", "lower-face"])
+            if isinstance(areas, str):
+                areas = [p.strip() for p in areas.replace(",", " ").split() if p.strip()]
+            for area in areas or []:
+                if str(area).lower() not in ("upper-face", "lower-face"):
+                    raise ValueError("expression_restoration.areas must contain only 'upper-face' and/or 'lower-face'")
+            mask_blur = float(_cfg_first(cfg, [("expression_restoration", "mask_blur")], default=0.3))
+            if mask_blur < 0.0:
+                raise ValueError("expression_restoration.mask_blur must be >= 0")
 
         face_enhancer_enabled = bool(_cfg_first(cfg, [("enhancement", "enabled")], default=False))
         face_enhancer_s = str(_cfg_first(cfg, [("enhancement", "model_path"), ("restoration", "face_enhancer_model_path")], default="") or "").strip()

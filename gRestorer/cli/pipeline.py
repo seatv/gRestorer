@@ -94,6 +94,16 @@ def _cfg_str(cfg: Config, key_paths: List[Tuple[str, ...]], *, env_name: Optiona
         return str(os.getenv(env_name, default))
     return str(default)
 
+def _cfg_str_list(cfg: Config, key_paths: List[Tuple[str, ...]], *, default: Optional[List[str]] = None) -> List[str]:
+    value = cfg_first(cfg, key_paths, default=None)
+    if value is None:
+        return list(default or [])
+    if isinstance(value, str):
+        return [p.strip() for p in value.replace(",", " ").split() if p.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(p).strip() for p in value if str(p).strip()]
+    return list(default or [])
+
 
 @dataclass
 class DetStats:
@@ -455,6 +465,16 @@ class Pipeline:
             )
             or ""
         ).strip()
+
+        self.expression_restorer_enabled: bool = _cfg_bool(self.cfg, [("expression_restoration", "enabled")], default=False)
+        self.expression_restorer_model: str = str(cfg_first(self.cfg, [("expression_restoration", "model")], default="live_portrait") or "live_portrait").lower()
+        self.expression_restorer_feature_extractor_path: str = str(cfg_first(self.cfg, [("expression_restoration", "feature_extractor_path")], default="") or "")
+        self.expression_restorer_motion_extractor_path: str = str(cfg_first(self.cfg, [("expression_restoration", "motion_extractor_path")], default="") or "")
+        self.expression_restorer_generator_path: str = str(cfg_first(self.cfg, [("expression_restoration", "generator_path")], default="") or "")
+        self.expression_restorer_provider: str = str(cfg_first(self.cfg, [("expression_restoration", "provider"), ("face_restoration", "provider"), ("restoration", "swap_provider")], default=self.swap_provider) or self.swap_provider).lower()
+        self.expression_restorer_factor: int = int(cfg_first(self.cfg, [("expression_restoration", "factor")], default=80))
+        self.expression_restorer_areas: List[str] = _cfg_str_list(self.cfg, [("expression_restoration", "areas")], default=["upper-face", "lower-face"])
+        self.expression_restorer_mask_blur: float = float(cfg_first(self.cfg, [("expression_restoration", "mask_blur")], default=0.3))
 
         self.face_comp_mask_mode: str = str(
             cfg_first(
@@ -824,6 +844,15 @@ class Pipeline:
                 face_comp_color_transfer=self.face_comp_color_transfer,
                 face_comp_face_scale=self.face_comp_face_scale,
                 face_comp_debug=self.face_comp_debug,
+                expression_restorer_enabled=self.expression_restorer_enabled,
+                expression_restorer_model=self.expression_restorer_model,
+                expression_restorer_feature_extractor_path=self.expression_restorer_feature_extractor_path,
+                expression_restorer_motion_extractor_path=self.expression_restorer_motion_extractor_path,
+                expression_restorer_generator_path=self.expression_restorer_generator_path,
+                expression_restorer_provider=self.expression_restorer_provider,
+                expression_restorer_factor=self.expression_restorer_factor,
+                expression_restorer_areas=self.expression_restorer_areas,
+                expression_restorer_mask_blur=self.expression_restorer_mask_blur,
                 face_enhancer_enabled=self.face_enhancer_enabled,
                 face_enhancer_model_path=self.face_enhancer_model_path,
                 face_enhancer_provider=self.face_enhancer_provider,

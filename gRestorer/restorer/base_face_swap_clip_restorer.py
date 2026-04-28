@@ -15,6 +15,7 @@ from gRestorer.restorer.clip_restorer import BaseClipRestorer
 from gRestorer.restorer.face_enhancer import FaceEnhancer
 from gRestorer.restorer.face_occluder import FaceOccluder
 from gRestorer.restorer.face_landmarker import FaceLandmarker
+from gRestorer.restorer.face_expression_restorer import FaceExpressionRestorer
 
 
 
@@ -41,6 +42,11 @@ class FaceSwapRestoreStats:
     last_worker_exception: str = ""
     frames_materially_changed: int = 0
     mean_abs_diff_accum: float = 0.0
+    frames_expression_called: int = 0
+    frames_expression_returned: int = 0
+    frames_expression_failed: int = 0
+    frames_expression_materially_changed: int = 0
+    expression_mean_abs_diff_accum: float = 0.0
     frames_enhancer_called: int = 0
     frames_enhancer_returned: int = 0
     frames_enhancer_failed: int = 0
@@ -54,6 +60,9 @@ class FaceSwapRestoreStats:
 
     def avg_mean_abs_diff(self) -> float:
         return self.mean_abs_diff_accum / max(1, self.frames_worker_returned)
+
+    def avg_expression_mean_abs_diff(self) -> float:
+        return self.expression_mean_abs_diff_accum / max(1, self.frames_expression_returned)
 
     def avg_enhancer_mean_abs_diff(self) -> float:
         return self.enhancer_mean_abs_diff_accum / max(1, self.frames_enhancer_returned)
@@ -97,6 +106,15 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
         face_comp_color_transfer: str = "none",
         face_comp_face_scale: float = 0.0,
         face_comp_debug: bool = False,
+        expression_restorer_enabled: bool = False,
+        expression_restorer_model: str = "live_portrait",
+        expression_restorer_feature_extractor_path: str = "",
+        expression_restorer_motion_extractor_path: str = "",
+        expression_restorer_generator_path: str = "",
+        expression_restorer_provider: str = "auto",
+        expression_restorer_factor: int = 80,
+        expression_restorer_areas: Optional[List[str]] = None,
+        expression_restorer_mask_blur: float = 0.3,
         face_enhancer_enabled: bool = False,
         face_enhancer_model_path: str = "",
         face_enhancer_provider: str = "auto",
@@ -125,6 +143,16 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
         self.swap_model_path = str(swap_model_path)
         self.swap_input_size = int(swap_input_size)
         self.provider = str(provider or "auto").lower()
+
+        self.expression_restorer_enabled = bool(expression_restorer_enabled)
+        self.expression_restorer_model = str(expression_restorer_model or "live_portrait").lower()
+        self.expression_restorer_feature_extractor_path = str(expression_restorer_feature_extractor_path or "")
+        self.expression_restorer_motion_extractor_path = str(expression_restorer_motion_extractor_path or "")
+        self.expression_restorer_generator_path = str(expression_restorer_generator_path or "")
+        self.expression_restorer_provider = str(expression_restorer_provider or self.provider or "auto").lower()
+        self.expression_restorer_factor = int(max(0, min(100, int(expression_restorer_factor))))
+        self.expression_restorer_areas = list(expression_restorer_areas or ["upper-face", "lower-face"])
+        self.expression_restorer_mask_blur = float(expression_restorer_mask_blur)
 
         self.face_enhancer_enabled = bool(face_enhancer_enabled)
         self.face_enhancer_model_path = str(face_enhancer_model_path or "")
@@ -176,6 +204,26 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
                 model_path=self.landmark_model_path,
                 provider=self.landmark_provider,
                 score=self.landmark_score,
+            )
+
+        self.expression_restorer = None
+        if self.expression_restorer_enabled:
+            if not self.expression_restorer_feature_extractor_path:
+                raise FileNotFoundError("Expression restorer is enabled but feature_extractor_path is empty")
+            if not self.expression_restorer_motion_extractor_path:
+                raise FileNotFoundError("Expression restorer is enabled but motion_extractor_path is empty")
+            if not self.expression_restorer_generator_path:
+                raise FileNotFoundError("Expression restorer is enabled but generator_path is empty")
+            self.expression_restorer = FaceExpressionRestorer(
+                device=self.device,
+                model=self.expression_restorer_model,
+                feature_extractor_path=self.expression_restorer_feature_extractor_path,
+                motion_extractor_path=self.expression_restorer_motion_extractor_path,
+                generator_path=self.expression_restorer_generator_path,
+                provider=self.expression_restorer_provider,
+                factor=self.expression_restorer_factor,
+                areas=self.expression_restorer_areas,
+                mask_blur=self.expression_restorer_mask_blur,
             )
 
         self.enhancer = None
@@ -534,6 +582,8 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
             f"[FaceSwapStats] worker_called={self.stats.frames_worker_called} returned={self.stats.frames_worker_returned} returned_none={self.stats.frames_worker_returned_none}",
             f"[FaceSwapStats] worker_exceptions={self.stats.worker_exceptions} last_worker_exception={self.stats.last_worker_exception or '-'}",
             f"[FaceSwapStats] materially_changed={self.stats.frames_materially_changed} mad_threshold={self.material_change_mad_threshold:.3f} avg_mad={self.stats.avg_mean_abs_diff():.4f}",
+            f"[FaceSwapStats] expression_called={self.stats.frames_expression_called} returned={self.stats.frames_expression_returned} failed={self.stats.frames_expression_failed}",
+            f"[FaceSwapStats] expression_materially_changed={self.stats.frames_expression_materially_changed} avg_expression_mad={self.stats.avg_expression_mean_abs_diff():.4f}",
             f"[FaceSwapStats] enhancer_called={self.stats.frames_enhancer_called} returned={self.stats.frames_enhancer_returned} failed={self.stats.frames_enhancer_failed}",
             f"[FaceSwapStats] enhancer_materially_changed={self.stats.frames_enhancer_materially_changed} avg_enhancer_mad={self.stats.avg_enhancer_mean_abs_diff():.4f}",
             f"[FaceSwapStats] occluder_called={self.stats.frames_occluder_called} returned={self.stats.frames_occluder_returned} failed={self.stats.frames_occluder_failed}",
@@ -555,6 +605,26 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
         enhancer and occluder policy after a worker has returned a same-size ROI.
         """
         stage_img = swapped_roi
+
+        if self.expression_restorer is not None:
+            self.stats.frames_expression_called += 1
+            try:
+                expression_restored = self.expression_restorer.restore(original_roi, stage_img, active_face_meta)
+            except Exception as e:
+                self.stats.frames_expression_failed += 1
+                self._save_debug_text(frame_num, f"expression_restorer_exception={e!r}")
+                expression_restored = None
+            if expression_restored is not None:
+                expression_restored = self._maybe_copy_guard(expression_restored)
+                self.stats.frames_expression_returned += 1
+                xmad = float(np.mean(np.abs(expression_restored.astype(np.int16) - stage_img.astype(np.int16))))
+                self.stats.expression_mean_abs_diff_accum += xmad
+                if xmad >= self.material_change_mad_threshold:
+                    self.stats.frames_expression_materially_changed += 1
+                self._save_debug_text(frame_num, f"expression_restorer_mean_abs_diff={xmad:.4f}")
+                self._save_debug_image(frame_num, "03a_expression_restored", expression_restored)
+                self._save_debug_image(frame_num, "04a_expression_diff", self._diff_image(stage_img, expression_restored))
+                stage_img = expression_restored
 
         if self.enhancer is not None:
             self.stats.frames_enhancer_called += 1

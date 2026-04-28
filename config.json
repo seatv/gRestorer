@@ -98,14 +98,25 @@
 			"debug": false
 		}
 	},
+	"expression_restoration": {
+	"enabled": true,
+	"model": "live_portrait",
+	"feature_extractor_path": "D:\\Models\\face\\live_portrait_feature_extractor.onnx",
+	"motion_extractor_path": "D:\\Models\\face\\live_portrait_motion_extractor.onnx",
+	"generator_path": "D:\\Models\\face\\live_portrait_generator.onnx",
+	"provider": "cuda",
+	"factor": 100,
+	"areas": ["upper-face", "lower-face"],
+	"mask_blur": 0.3
+	},
 	"enhancement": {
-		"enabled": true,
+		"enabled": false,
 		"model_path": "D:\\Models\\face\\gfpgan_1.4.onnx",
 		"provider": "cuda",
 		"blend": 80
 	},
 	"occlusion": {
-		"enabled": true,
+		"enabled": false,
 		"model_path": "D:\\Models\\face\\xseg_2.onnx",
 		"threshold": 0.5,
 		"blur": 5,
