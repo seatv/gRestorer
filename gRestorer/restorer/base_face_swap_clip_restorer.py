@@ -88,6 +88,8 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
         *,
         swap_input_size: int = 128,
         provider: str = "auto",
+        swap_mask_box_blur: float | None = None,
+        swap_mask_box_padding=None,
         face_comp_mask_mode: str = "geom_backend_intersection",
         face_comp_geom_expand: float = 1.05,
         face_comp_mask_erode: int = 0,
@@ -125,6 +127,8 @@ class BaseFaceSwapClipRestorer(BaseClipRestorer):
         self.swap_model_path = str(swap_model_path)
         self.swap_input_size = int(swap_input_size)
         self.provider = str(provider or "auto").lower()
+        self.swap_mask_box_blur = swap_mask_box_blur
+        self.swap_mask_box_padding = swap_mask_box_padding
 
         self.face_enhancer_enabled = bool(face_enhancer_enabled)
         self.face_enhancer_model_path = str(face_enhancer_model_path or "")

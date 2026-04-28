@@ -95,6 +95,40 @@ def _cfg_str(cfg: Config, key_paths: List[Tuple[str, ...]], *, env_name: Optiona
     return str(default)
 
 
+def _cfg_int_quad(
+    cfg: Config,
+    key_paths: List[Tuple[str, ...]],
+    *,
+    env_name: Optional[str] = None,
+    default: Optional[Tuple[int, int, int, int]] = None,
+) -> Optional[Tuple[int, int, int, int]]:
+    value = cfg_first(cfg, key_paths, default=None)
+    if value is None and env_name:
+        value = os.getenv(env_name)
+    if value is None:
+        return default
+
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.replace(";", ",").split(",") if p.strip()]
+        if len(parts) == 1:
+            v = int(float(parts[0]))
+            return (v, v, v, v)
+        if len(parts) == 4:
+            return tuple(int(float(p)) for p in parts)  # type: ignore[return-value]
+        raise ValueError(f"Expected scalar or top,right,bottom,left integer padding, got {value!r}")
+
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            v = int(float(value[0]))
+            return (v, v, v, v)
+        if len(value) == 4:
+            return tuple(int(float(v)) for v in value)  # type: ignore[return-value]
+        raise ValueError(f"Expected scalar or top,right,bottom,left integer padding, got {value!r}")
+
+    v = int(float(value))
+    return (v, v, v, v)
+
+
 @dataclass
 class DetStats:
     frames_total: int = 0
@@ -455,6 +489,48 @@ class Pipeline:
             )
             or ""
         ).strip()
+        _swap_mask_box_blur = cfg_first(
+            self.cfg,
+            [
+                ("face_restoration", "mask_box_blur"),
+                ("face_restoration", "swap_mask_box_blur"),
+                ("restoration", "swap_mask_box_blur"),
+            ],
+            default=None,
+        )
+        self.swap_mask_box_blur: Optional[float] = None if _swap_mask_box_blur is None else float(_swap_mask_box_blur)
+        self.swap_mask_box_padding: Optional[Tuple[int, int, int, int]] = _cfg_int_quad(
+            self.cfg,
+            [
+                ("face_restoration", "mask_box_padding"),
+                ("face_restoration", "swap_mask_box_padding"),
+                ("restoration", "swap_mask_box_padding"),
+            ],
+            default=None,
+        )
+        self.hyperswap_output_shift_x: float = float(
+            cfg_first(
+                self.cfg,
+                [("face_restoration", "hyperswap_output_shift_x"), ("restoration", "hyperswap_output_shift_x")],
+                default=0.0,
+            )
+        )
+        self.hyperswap_output_shift_y: float = float(
+            cfg_first(
+                self.cfg,
+                [("face_restoration", "hyperswap_output_shift_y"), ("restoration", "hyperswap_output_shift_y")],
+                default=0.0,
+            )
+        )
+        self.hyperswap_output_scale: float = float(
+            cfg_first(
+                self.cfg,
+                [("face_restoration", "hyperswap_output_scale"), ("restoration", "hyperswap_output_scale")],
+                default=1.0,
+            )
+        )
+        if self.hyperswap_output_scale <= 0.0:
+            raise ValueError("face_restoration.hyperswap_output_scale must be > 0")
 
         self.face_comp_mask_mode: str = str(
             cfg_first(
@@ -806,8 +882,12 @@ class Pipeline:
                 restorer_cls = InSwapperClipRestorer
 
             extra_kwargs = {}
-            if swap_backend == "hyperswap" and self.swap_pixel_boost:
-                extra_kwargs["swap_pixel_boost"] = self.swap_pixel_boost
+            if swap_backend == "hyperswap":
+                if self.swap_pixel_boost:
+                    extra_kwargs["swap_pixel_boost"] = self.swap_pixel_boost
+                extra_kwargs["hyperswap_output_shift_x"] = self.hyperswap_output_shift_x
+                extra_kwargs["hyperswap_output_shift_y"] = self.hyperswap_output_shift_y
+                extra_kwargs["hyperswap_output_scale"] = self.hyperswap_output_scale
 
             return restorer_cls(
                 device=self.device,
@@ -815,6 +895,8 @@ class Pipeline:
                 swap_model_path=self.swap_model_path,
                 swap_input_size=self.swap_input_size,
                 provider=self.swap_provider,
+                swap_mask_box_blur=self.swap_mask_box_blur,
+                swap_mask_box_padding=self.swap_mask_box_padding,
                 face_comp_mask_mode=self.face_comp_mask_mode,
                 face_comp_geom_expand=self.face_comp_geom_expand,
                 face_comp_mask_erode=self.face_comp_mask_erode,

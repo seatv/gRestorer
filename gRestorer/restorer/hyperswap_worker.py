@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import List, Optional, Tuple
 
 import cv2
@@ -47,6 +48,11 @@ class HyperSwapWorker:
         swap_input_size: int = 256,
         provider: str = "auto",
         pixel_boost: str | int | tuple[int, int] | None = None,
+        mask_box_blur: float | None = None,
+        mask_box_padding: Tuple[int, int, int, int] | List[int] | str | int | None = None,
+        output_shift_x: float = 0.0,
+        output_shift_y: float = 0.0,
+        output_scale: float = 1.0,
     ) -> None:
         self.device = device
         self.source_face_path = str(source_face_path)
@@ -103,6 +109,62 @@ class HyperSwapWorker:
         self._pixel_boost_size = self._resolve_pixel_boost_size(pixel_boost)
         self._pixel_boost_total = max(1, self._pixel_boost_size // self._target_size)
 
+        self._use_area_mask_if_68 = self._env_flag(
+            "GR_HYPERSWAP_USE_AREA_MASK",
+            default=bool(self.USE_AREA_MASK_IF_68),
+        )
+        self._area_mask_sigma = self._env_float(
+            "GR_HYPERSWAP_AREA_MASK_SIGMA",
+            default=float(self.AREA_MASK_SIGMA),
+        )
+        self._area_mask_dilate = max(
+            0,
+            self._env_int("GR_HYPERSWAP_AREA_MASK_DILATE", default=0),
+        )
+
+        # HyperSwap native paste-back mask tuning.
+        #
+        # Config values are passed by the face-restoration pipeline. The env vars
+        # remain as temporary override knobs for fast A/B testing.
+        box_blur_default = self.BOX_MASK_BLUR if mask_box_blur is None else float(mask_box_blur)
+        self._box_mask_blur = max(
+            0.0,
+            self._env_float("GR_HYPERSWAP_BOX_MASK_BLUR", default=float(box_blur_default)),
+        )
+        padding_default = self._parse_mask_box_padding(
+            mask_box_padding,
+            default=self.BOX_MASK_PADDING,
+        )
+        self._box_mask_padding = self._parse_mask_box_padding(
+            os.getenv("GR_HYPERSWAP_BOX_MASK_PADDING"),
+            default=padding_default,
+        )
+
+        # Aligned-output geometry correction. Positive Y moves the swapped
+        # aligned crop downward before native paste-back.
+        self._output_shift_x = self._env_float(
+            "GR_HYPERSWAP_OUTPUT_SHIFT_X",
+            default=float(output_shift_x),
+        )
+        self._output_shift_y = self._env_float(
+            "GR_HYPERSWAP_OUTPUT_SHIFT_Y",
+            default=float(output_shift_y),
+        )
+        self._output_scale = max(
+            0.01,
+            self._env_float("GR_HYPERSWAP_OUTPUT_SCALE", default=float(output_scale)),
+        )
+
+        print(
+            f"[HyperSwapMask] use_area_mask={self._use_area_mask_if_68} "
+            f"area_sigma={self._area_mask_sigma} "
+            f"area_dilate={self._area_mask_dilate} "
+            f"box_blur={self._box_mask_blur} "
+            f"box_padding={self._box_mask_padding} "
+            f"out_shift=({self._output_shift_x},{self._output_shift_y}) "
+            f"out_scale={self._output_scale}"
+        )
+
         print(
             f"[HyperSwapWorker] provider={self.provider} "
             f"size={self._target_size} layout={self._target_input_layout} "
@@ -110,6 +172,69 @@ class HyperSwapWorker:
             f"image_output={self._image_output_name or '-'} pixel_boost={self._pixel_boost_size} "
             f"scale={self._pixel_boost_total}"
         )
+
+    @staticmethod
+    def _env_flag(name: str, *, default: bool = False) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return bool(default)
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _env_float(name: str, *, default: float) -> float:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return float(default)
+        try:
+            return float(str(raw).strip())
+        except ValueError:
+            print(f"[HyperSwapMask] invalid {name}={raw!r}; using {default}")
+            return float(default)
+
+    @staticmethod
+    def _env_int(name: str, *, default: int) -> int:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return int(default)
+        try:
+            return int(str(raw).strip())
+        except ValueError:
+            print(f"[HyperSwapMask] invalid {name}={raw!r}; using {default}")
+            return int(default)
+
+    @staticmethod
+    def _parse_mask_box_padding(value, *, default: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+        """Parse mask padding as top,right,bottom,left percentages.
+
+        Accepts a 4-item list/tuple, a comma-separated string, or a scalar.
+        A scalar applies to all four sides.
+        """
+        if value is None or value == "":
+            return tuple(int(v) for v in default)  # type: ignore[return-value]
+
+        if isinstance(value, str):
+            parts = [p.strip() for p in value.replace(";", ",").split(",") if p.strip()]
+            if len(parts) == 1:
+                v = int(float(parts[0]))
+                return (v, v, v, v)
+            if len(parts) != 4:
+                raise ValueError(
+                    f"mask_box_padding must be a scalar or top,right,bottom,left; got {value!r}"
+                )
+            return tuple(int(float(p)) for p in parts)  # type: ignore[return-value]
+
+        if isinstance(value, (list, tuple)):
+            if len(value) == 1:
+                v = int(float(value[0]))
+                return (v, v, v, v)
+            if len(value) != 4:
+                raise ValueError(
+                    f"mask_box_padding must have 4 values top,right,bottom,left; got {value!r}"
+                )
+            return tuple(int(float(v)) for v in value)  # type: ignore[return-value]
+
+        v = int(float(value))
+        return (v, v, v, v)
 
     @staticmethod
     def _providers_for(provider: str, device: torch.device) -> List[str]:
@@ -398,13 +523,69 @@ class HyperSwapWorker:
         return np.ascontiguousarray(np.clip(box_mask, 0.0, 1.0))
 
     @staticmethod
-    def _create_area_mask_from_landmarks68(crop_size: int, landmarks68_aligned: np.ndarray, sigma: float = 5.0) -> np.ndarray:
+    def _create_area_mask_from_landmarks68(
+        crop_size: int,
+        landmarks68_aligned: np.ndarray,
+        sigma: float = 5.0,
+        dilate: int = 0,
+    ) -> np.ndarray:
         mask = np.zeros((crop_size, crop_size), dtype=np.float32)
         hull = cv2.convexHull(landmarks68_aligned.astype(np.int32))
         cv2.fillConvexPoly(mask, hull, 1.0)
-        mask = cv2.GaussianBlur(mask.clip(0.0, 1.0), (0, 0), sigma).clip(0.5, 1.0)
+
+        dilate = int(max(0, dilate))
+        if dilate > 0:
+            kernel_size = dilate * 2 + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+            mask = cv2.dilate(mask, kernel, iterations=1)
+
+        mask = cv2.GaussianBlur(mask.clip(0.0, 1.0), (0, 0), float(sigma)).clip(0.5, 1.0)
         mask = (mask - 0.5) * 2.0
         return np.ascontiguousarray(np.clip(mask, 0.0, 1.0))
+
+    @staticmethod
+    def _adjust_swapped_crop_geometry(
+        swapped_crop_bgr_u8: np.ndarray,
+        *,
+        shift_x: float = 0.0,
+        shift_y: float = 0.0,
+        scale: float = 1.0,
+    ) -> np.ndarray:
+        """Apply a small diagnostic geometry correction in aligned-crop space.
+
+        This intentionally moves/scales only the swapped output crop before the
+        existing native inverse-affine paste-back. It does not change target
+        landmarks or the paste transform, so it is a narrow HyperSwap-only test
+        for apparent vertical registration errors.
+        """
+        sx = float(shift_x)
+        sy = float(shift_y)
+        sc = float(scale)
+        if abs(sx) < 1e-6 and abs(sy) < 1e-6 and abs(sc - 1.0) < 1e-6:
+            return swapped_crop_bgr_u8
+
+        h, w = swapped_crop_bgr_u8.shape[:2]
+        cx = (float(w) - 1.0) * 0.5
+        cy = (float(h) - 1.0) * 0.5
+
+        # cv2.warpAffine maps source pixels into destination coordinates here:
+        #   dest = center + scale * (src - center) + shift
+        matrix = np.array(
+            [
+                [sc, 0.0, (1.0 - sc) * cx + sx],
+                [0.0, sc, (1.0 - sc) * cy + sy],
+            ],
+            dtype=np.float32,
+        )
+
+        adjusted = cv2.warpAffine(
+            swapped_crop_bgr_u8,
+            matrix,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        return np.ascontiguousarray(adjusted)
 
     @staticmethod
     def _transform_points(pts_xy: np.ndarray, M_2x3: np.ndarray) -> np.ndarray:
@@ -471,13 +652,26 @@ class HyperSwapWorker:
             template_norm=self.ARC_TEMPLATE_128,
         )
         swapped_crop_bgr_u8 = self._run_pixel_boost(crop_bgr_u8)
+        swapped_crop_bgr_u8 = self._adjust_swapped_crop_geometry(
+            swapped_crop_bgr_u8,
+            shift_x=self._output_shift_x,
+            shift_y=self._output_shift_y,
+            scale=self._output_scale,
+        )
         crop_masks: List[np.ndarray] = []
-        crop_masks.append(self._create_box_mask(swapped_crop_bgr_u8, self.BOX_MASK_BLUR, self.BOX_MASK_PADDING))
-        if self.USE_AREA_MASK_IF_68:
+        crop_masks.append(self._create_box_mask(swapped_crop_bgr_u8, self._box_mask_blur, self._box_mask_padding))
+        if self._use_area_mask_if_68:
             kps68 = self._extract_target_kps68(target_face_meta)
             if kps68 is not None:
                 kps68_aligned = self._transform_points(kps68, affine_matrix)
-                crop_masks.append(self._create_area_mask_from_landmarks68(aligned_size, kps68_aligned, self.AREA_MASK_SIGMA))
+                crop_masks.append(
+                    self._create_area_mask_from_landmarks68(
+                        aligned_size,
+                        kps68_aligned,
+                        self._area_mask_sigma,
+                        self._area_mask_dilate,
+                    )
+                )
         crop_mask = np.minimum.reduce(crop_masks).clip(0.0, 1.0) if crop_masks else np.ones((aligned_size, aligned_size), dtype=np.float32)
         return self._paste_back(roi_bgr_u8, swapped_crop_bgr_u8, crop_mask, affine_matrix)
 

@@ -22,6 +22,20 @@ def _parse_rgb_triplet(s: str) -> Tuple[int, int, int]:
     return r, g, b
 
 
+
+def _parse_int_quad(s: str) -> Tuple[int, int, int, int]:
+    parts = [p.strip() for p in str(s).replace(";", ",").split(",") if p.strip()]
+    try:
+        if len(parts) == 1:
+            v = int(float(parts[0]))
+            return v, v, v, v
+        if len(parts) == 4:
+            return tuple(int(float(p)) for p in parts)  # type: ignore[return-value]
+    except Exception as e:
+        raise argparse.ArgumentTypeError(f"Invalid integer padding values: {s!r}") from e
+    raise argparse.ArgumentTypeError("Expected scalar or top,right,bottom,left integer percentages")
+
+
 def _parse_ext_list(s: str) -> list[str]:
     out: list[str] = []
     for p in s.split(","):
@@ -119,6 +133,11 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--swap-provider", choices=["auto", "cuda", "cpu"], default=None)
     p.add_argument("--swap-backend", choices=["auto", "inswapper", "simswap", "hyperswap"], default=None, help="Face swap backend override (default: auto by model path)")
     p.add_argument("--swap-pixel-boost", default=None, help="HyperSwap pixel boost size, e.g. 512x512")
+    p.add_argument("--swap-mask-box-blur", type=float, default=None, help="Backend-native swap mask box blur. HyperSwap default is 0.30; try 0.05 or 0.0 for wider lower-face paste.")
+    p.add_argument("--swap-mask-box-padding", type=_parse_int_quad, default=None, help="Backend-native swap mask box padding as top,right,bottom,left percentages; scalar applies to all sides.")
+    p.add_argument("--hyperswap-output-shift-x", type=float, default=None, help="HyperSwap aligned-output X shift in aligned-crop pixels before paste-back.")
+    p.add_argument("--hyperswap-output-shift-y", type=float, default=None, help="HyperSwap aligned-output Y shift in aligned-crop pixels before paste-back; positive moves swapped output downward.")
+    p.add_argument("--hyperswap-output-scale", type=float, default=None, help="HyperSwap aligned-output scale before paste-back; 1.0 leaves output unchanged.")
     p.add_argument("--face-enhancer-model", default=None, help="Optional ONNX face enhancer model path (GFPGAN-like single-input model)")
     p.add_argument("--face-enhancer-blend", type=int, default=None, help="Optional face enhancer blend 0..100")
     p.add_argument("--rest-compositor-quantize-before-resize", action=argparse.BooleanOptionalAction, default=None)
@@ -312,6 +331,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_many_if_not_none(cfg, [("restoration", "swap_provider"), ("face_restoration", "provider")], args.swap_provider)
     _set_many_if_not_none(cfg, [("restoration", "swap_backend"), ("face_restoration", "swap_backend")], args.swap_backend)
     _set_many_if_not_none(cfg, [("restoration", "swap_pixel_boost"), ("face_restoration", "swap_pixel_boost"), ("face_restoration", "pixel_boost")], args.swap_pixel_boost)
+    _set_many_if_not_none(cfg, [("restoration", "swap_mask_box_blur"), ("face_restoration", "mask_box_blur"), ("face_restoration", "swap_mask_box_blur")], args.swap_mask_box_blur)
+    _set_many_if_not_none(cfg, [("restoration", "swap_mask_box_padding"), ("face_restoration", "mask_box_padding"), ("face_restoration", "swap_mask_box_padding")], list(args.swap_mask_box_padding) if args.swap_mask_box_padding is not None else None)
+    _set_many_if_not_none(cfg, [("face_restoration", "hyperswap_output_shift_x"), ("restoration", "hyperswap_output_shift_x")], args.hyperswap_output_shift_x)
+    _set_many_if_not_none(cfg, [("face_restoration", "hyperswap_output_shift_y"), ("restoration", "hyperswap_output_shift_y")], args.hyperswap_output_shift_y)
+    _set_many_if_not_none(cfg, [("face_restoration", "hyperswap_output_scale"), ("restoration", "hyperswap_output_scale")], args.hyperswap_output_scale)
     _set_many_if_not_none(cfg, [("restoration", "face_enhancer_model_path"), ("enhancement", "model_path")], args.face_enhancer_model)
     _set_many_if_not_none(cfg, [("restoration", "face_enhancer_blend"), ("enhancement", "blend")], args.face_enhancer_blend)
     if args.face_enhancer_model is not None:
@@ -417,6 +441,36 @@ def parse_args(argv: list[str] | None = None) -> Config:
         swap_model_path = Path(swap_model_s)
         if not swap_model_path.exists():
             raise FileNotFoundError(f"Swap model not found: {swap_model_path}")
+
+        mask_box_blur = _cfg_first(
+            cfg,
+            [("face_restoration", "mask_box_blur"), ("face_restoration", "swap_mask_box_blur"), ("restoration", "swap_mask_box_blur")],
+            default=None,
+        )
+        if mask_box_blur is not None and float(mask_box_blur) < 0.0:
+            raise ValueError("face_restoration.mask_box_blur must be >= 0")
+
+        mask_box_padding = _cfg_first(
+            cfg,
+            [("face_restoration", "mask_box_padding"), ("face_restoration", "swap_mask_box_padding"), ("restoration", "swap_mask_box_padding")],
+            default=None,
+        )
+        if mask_box_padding is not None:
+            if isinstance(mask_box_padding, str):
+                mask_box_padding = _parse_int_quad(mask_box_padding)
+            elif isinstance(mask_box_padding, (list, tuple)):
+                if len(mask_box_padding) not in (1, 4):
+                    raise ValueError("face_restoration.mask_box_padding must be scalar or top,right,bottom,left")
+            else:
+                int(mask_box_padding)
+
+        hyperswap_output_scale = _cfg_first(
+            cfg,
+            [("face_restoration", "hyperswap_output_scale"), ("restoration", "hyperswap_output_scale")],
+            default=None,
+        )
+        if hyperswap_output_scale is not None and float(hyperswap_output_scale) <= 0.0:
+            raise ValueError("face_restoration.hyperswap_output_scale must be > 0")
 
         face_enhancer_enabled = bool(_cfg_first(cfg, [("enhancement", "enabled")], default=False))
         face_enhancer_s = str(_cfg_first(cfg, [("enhancement", "model_path"), ("restoration", "face_enhancer_model_path")], default="") or "").strip()
