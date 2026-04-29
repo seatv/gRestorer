@@ -15,6 +15,7 @@ class SimSwapClipRestorer(BaseFaceSwapClipRestorer):
             source_face_path=self.source_face_path,
             swap_model_path=self.swap_model_path,
             provider=self.provider,
+            face_swapper_weight=self.face_swapper_weight,
         )
 
 

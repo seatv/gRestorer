@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import cv2
@@ -15,9 +16,9 @@ class HyperSwapWorker:
 
     Design goal:
     - follow the FaceFusion-style native flow for HyperSwap
-    - return a fully pasted ROI from swap()
+    - do NOT return FaceSwapBackendResult
     - do native warp -> infer -> mask -> paste-back in swap()
-    - keep backend-specific paste-back inside HyperSwap
+    - bypass the shared compositor entirely
     - optionally apply FaceFusion-style pixel boost using interleaved
       implode/explode helpers around the native model size
     """
@@ -47,11 +48,14 @@ class HyperSwapWorker:
         swap_input_size: int = 256,
         provider: str = "auto",
         pixel_boost: str | int | tuple[int, int] | None = None,
+        face_swapper_weight: float = 1.0,
     ) -> None:
         self.device = device
         self.source_face_path = str(source_face_path)
         self.swap_model_path = str(swap_model_path)
         self.provider = str(provider or "auto").lower()
+        self.face_swapper_weight = float(max(0.0, min(1.0, float(face_swapper_weight))))
+        self.last_swap_metrics: dict = {}
         self.requested_swap_input_size = int(swap_input_size)
 
         try:
@@ -108,7 +112,7 @@ class HyperSwapWorker:
             f"size={self._target_size} layout={self._target_input_layout} "
             f"source_input={self._source_input_name} target_input={self._target_input_name} "
             f"image_output={self._image_output_name or '-'} pixel_boost={self._pixel_boost_size} "
-            f"scale={self._pixel_boost_total}"
+            f"scale={self._pixel_boost_total} face_swapper_weight={self.face_swapper_weight:.3f}"
         )
 
     @staticmethod
@@ -217,22 +221,166 @@ class HyperSwapWorker:
         self._image_output_name = out_img.name
         self._mask_output_name = out_mask.name if out_mask is not None else None
 
+
+    @staticmethod
+    def _normalize_embedding(emb: np.ndarray) -> np.ndarray:
+        arr = np.asarray(emb, dtype=np.float32).reshape(1, -1)
+        norm = float(np.linalg.norm(arr))
+        if norm > 0.0:
+            arr = arr / norm
+        return np.ascontiguousarray(arr.astype(np.float32, copy=False))
+
+    @staticmethod
+    def _face_embedding(face) -> Optional[np.ndarray]:
+        for attr in ("normed_embedding", "embedding_norm", "embedding"):
+            emb = getattr(face, attr, None)
+            if emb is not None:
+                return HyperSwapWorker._normalize_embedding(np.asarray(emb, dtype=np.float32))
+        return None
+
+    @staticmethod
+    def _bbox_iou(a: np.ndarray, b: np.ndarray) -> float:
+        ax1, ay1, ax2, ay2 = [float(v) for v in a[:4]]
+        bx1, by1, bx2, by2 = [float(v) for v in b[:4]]
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        iw = max(0.0, ix2 - ix1)
+        ih = max(0.0, iy2 - iy1)
+        inter = iw * ih
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union = area_a + area_b - inter
+        return float(inter / union) if union > 0.0 else 0.0
+
+    def _select_target_face_candidate(self, roi_bgr_u8: np.ndarray, target_face_meta: FaceMetadata):
+        try:
+            candidates = self._app.get(roi_bgr_u8)
+        except Exception:
+            return None
+        if not candidates:
+            return None
+        target_bbox = np.asarray(target_face_meta.bbox_xyxy, dtype=np.float32)
+        return max(
+            candidates,
+            key=lambda f: (
+                self._bbox_iou(np.asarray(getattr(f, "bbox", target_bbox), dtype=np.float32), target_bbox),
+                float((f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])) if hasattr(f, "bbox") else 0.0,
+            ),
+        )
+
+    def _target_face_from_meta(self, face_meta: FaceMetadata):
+        return SimpleNamespace(
+            bbox=np.asarray(face_meta.bbox_xyxy, dtype=np.float32),
+            kps=self._extract_target_kps5(face_meta),
+            det_score=float(face_meta.det_score) if face_meta.det_score is not None else 1.0,
+        )
+
+    def _recognize_target_face_from_meta(self, roi_bgr_u8: np.ndarray, target_face_meta: FaceMetadata):
+        """Run ArcFace recognition using pipeline-selected face metadata instead of re-detecting the face."""
+        face = self._target_face_from_meta(target_face_meta)
+        models = getattr(self._app, "models", {}) or {}
+        model_values = list(models.values()) if isinstance(models, dict) else list(models)
+        recognizers = [
+            m for m in model_values
+            if str(getattr(m, "taskname", "")).lower() == "recognition"
+        ]
+        recognizers.extend([m for m in model_values if m not in recognizers and hasattr(m, "get")])
+
+        for model in recognizers:
+            try:
+                model.get(roi_bgr_u8, face)
+                if self._face_embedding(face) is not None:
+                    return face
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _embedding_cosine(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
+        if a is None or b is None:
+            return None
+        aa = np.asarray(a, dtype=np.float32).reshape(-1)
+        bb = np.asarray(b, dtype=np.float32).reshape(-1)
+        denom = float(np.linalg.norm(aa) * np.linalg.norm(bb))
+        if denom <= 0.0:
+            return None
+        return float(np.dot(aa, bb) / denom)
+
+    def _set_last_embedding_metrics(
+        self,
+        *,
+        source_embedding: Optional[np.ndarray],
+        target_embedding: Optional[np.ndarray],
+        mixed_embedding: Optional[np.ndarray],
+        target_candidate_found: bool,
+        mode: str,
+        target_embedding_source: str = "none",
+    ) -> None:
+        target_used = target_embedding is not None
+        self.last_swap_metrics = {
+            "embedding_mode": mode,
+            "face_swapper_weight": float(self.face_swapper_weight),
+            "target_candidate_found": bool(target_candidate_found),
+            "target_embedding_source": str(target_embedding_source),
+            "target_embedding_used": bool(target_used),
+            "target_embedding_missing": bool(not target_used and self.face_swapper_weight < 0.999),
+            "mixed_embedding_used": bool(str(mode).startswith("mixed") and target_used and self.face_swapper_weight < 0.999),
+            "source_to_target_cos": self._embedding_cosine(source_embedding, target_embedding),
+            "source_to_mixed_cos": self._embedding_cosine(source_embedding, mixed_embedding),
+            "target_to_mixed_cos": self._embedding_cosine(target_embedding, mixed_embedding),
+        }
+
+    @staticmethod
+    def _mix_embeddings(source_embedding: np.ndarray, target_embedding: Optional[np.ndarray], weight: float) -> np.ndarray:
+        if target_embedding is None:
+            return source_embedding
+        w = float(max(0.0, min(1.0, weight)))
+        mixed = source_embedding.astype(np.float32) * w + target_embedding.astype(np.float32) * (1.0 - w)
+        return HyperSwapWorker._normalize_embedding(mixed)
+
     def _prepare_source_embedding(self) -> np.ndarray:
-        emb = getattr(self._src_face, "normed_embedding", None)
-        if emb is None:
-            emb = getattr(self._src_face, "embedding_norm", None)
-        if emb is None:
-            emb = getattr(self._src_face, "embedding", None)
+        emb = self._face_embedding(self._src_face)
         if emb is None:
             raise RuntimeError("Source face embedding missing from insightface result.")
-
-        emb = np.asarray(emb, dtype=np.float32).reshape(1, -1)
         if emb.shape[1] != 512:
             raise RuntimeError(f"Unexpected HyperSwap source embedding shape: {tuple(emb.shape)}")
-        norm = float(np.linalg.norm(emb))
-        if norm > 0.0:
-            emb = emb / norm
-        return np.ascontiguousarray(emb.astype(np.float32, copy=False))
+        return emb
+
+    def _runtime_source_embedding(self, roi_bgr_u8: np.ndarray, target_face_meta: FaceMetadata) -> np.ndarray:
+        if self.face_swapper_weight >= 0.999:
+            self._set_last_embedding_metrics(
+                source_embedding=self._src_embedding,
+                target_embedding=None,
+                mixed_embedding=self._src_embedding,
+                target_candidate_found=False,
+                mode="source_only",
+                target_embedding_source="none",
+            )
+            return self._src_embedding
+        target_embedding_source = "detector_candidate"
+        target_candidate = self._select_target_face_candidate(roi_bgr_u8, target_face_meta)
+        target_embedding = self._face_embedding(target_candidate) if target_candidate is not None else None
+
+        if target_embedding is None:
+            target_embedding_source = "metadata_recognition"
+            target_candidate = self._recognize_target_face_from_meta(roi_bgr_u8, target_face_meta)
+            target_embedding = self._face_embedding(target_candidate) if target_candidate is not None else None
+
+        if target_embedding is None:
+            target_embedding_source = "failed"
+
+        mixed = self._mix_embeddings(self._src_embedding, target_embedding, self.face_swapper_weight)
+        self._set_last_embedding_metrics(
+            source_embedding=self._src_embedding,
+            target_embedding=target_embedding,
+            mixed_embedding=mixed,
+            target_candidate_found=target_candidate is not None,
+            mode="mixed" if target_embedding is not None else "target_lookup_failed",
+            target_embedding_source=target_embedding_source,
+        )
+        return mixed
 
     @staticmethod
     def _extract_target_kps5(face_meta: FaceMetadata) -> np.ndarray:
@@ -345,9 +493,9 @@ class HyperSwapWorker:
         bgr_u8 = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
         return np.ascontiguousarray(bgr_u8)
 
-    def _run_model_image_only(self, target_tensor: np.ndarray) -> np.ndarray:
+    def _run_model_image_only(self, target_tensor: np.ndarray, source_embedding: np.ndarray) -> np.ndarray:
         feeds = {
-            self._source_input_name: self._src_embedding,
+            self._source_input_name: source_embedding,
             self._target_input_name: target_tensor,
         }
         outs = self._session.run(None, feeds)
@@ -355,9 +503,9 @@ class HyperSwapWorker:
             raise RuntimeError("HyperSwap ONNX session returned no outputs.")
         return outs[0]
 
-    def _run_single_tile(self, tile_bgr_u8: np.ndarray) -> np.ndarray:
+    def _run_single_tile(self, tile_bgr_u8: np.ndarray, source_embedding: np.ndarray) -> np.ndarray:
         target_tensor = self._prepare_target_tensor(tile_bgr_u8)
-        raw_img = self._run_model_image_only(target_tensor)
+        raw_img = self._run_model_image_only(target_tensor, source_embedding)
         return self._decode_output_bgr_u8(raw_img, self._target_size)
 
     def _implode_pixel_boost(self, crop_bgr_u8: np.ndarray) -> List[np.ndarray]:
@@ -375,11 +523,11 @@ class HyperSwapWorker:
         crop = crop.transpose(2, 0, 3, 1, 4).reshape(boost, boost, 3)
         return np.ascontiguousarray(crop)
 
-    def _run_pixel_boost(self, boosted_crop_bgr_u8: np.ndarray) -> np.ndarray:
+    def _run_pixel_boost(self, boosted_crop_bgr_u8: np.ndarray, source_embedding: np.ndarray) -> np.ndarray:
         if self._pixel_boost_total <= 1:
-            return self._run_single_tile(boosted_crop_bgr_u8)
+            return self._run_single_tile(boosted_crop_bgr_u8, source_embedding)
         tiles_in = self._implode_pixel_boost(boosted_crop_bgr_u8)
-        tiles_out = [self._run_single_tile(tile) for tile in tiles_in]
+        tiles_out = [self._run_single_tile(tile, source_embedding) for tile in tiles_in]
         return self._explode_pixel_boost(tiles_out)
 
     @staticmethod
@@ -470,7 +618,8 @@ class HyperSwapWorker:
             aligned_size=aligned_size,
             template_norm=self.ARC_TEMPLATE_128,
         )
-        swapped_crop_bgr_u8 = self._run_pixel_boost(crop_bgr_u8)
+        source_embedding = self._runtime_source_embedding(roi_bgr_u8, target_face_meta)
+        swapped_crop_bgr_u8 = self._run_pixel_boost(crop_bgr_u8, source_embedding)
         crop_masks: List[np.ndarray] = []
         crop_masks.append(self._create_box_mask(swapped_crop_bgr_u8, self.BOX_MASK_BLUR, self.BOX_MASK_PADDING))
         if self.USE_AREA_MASK_IF_68:

@@ -20,6 +20,7 @@ class HyperSwapClipRestorer(BaseFaceSwapClipRestorer):
             swap_model_path=self.swap_model_path,
             swap_input_size=self.swap_input_size,
             provider=self.provider,
+            face_swapper_weight=self.face_swapper_weight,
             pixel_boost=(self.swap_pixel_boost or None),
         )
 

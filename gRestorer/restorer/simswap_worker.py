@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 import os
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -47,11 +48,14 @@ class SimSwapWorker:
         *,
         provider: str = "auto",
         embedding_converter_path: str | None = None,
+        face_swapper_weight: float = 1.0,
     ) -> None:
         self.device = device
         self.source_face_path = str(source_face_path)
         self.swap_model_path = str(swap_model_path)
         self.provider = str(provider or "auto").lower()
+        self.face_swapper_weight = float(max(0.0, min(1.0, float(face_swapper_weight))))
+        self.last_swap_metrics: dict = {}
 
         try:
             from insightface.app import FaceAnalysis
@@ -102,7 +106,8 @@ class SimSwapWorker:
         if self._embedding_converter_path:
             self._embedding_converter = ort.InferenceSession(self._embedding_converter_path, providers=providers)
 
-        self._src_embedding = self._prepare_simswap_embedding()
+        self._src_embedding_raw = self._prepare_source_embedding_raw()
+        self._src_embedding = self._convert_simswap_embedding(self._src_embedding_raw)
 
         self._debug_dir = str(os.environ.get("GR_SIMSWAP_DEBUG_DIR", "") or "").strip()
         self._debug_swap_index = int(str(os.environ.get("GR_SIMSWAP_DEBUG_SWAP_INDEX", "0") or "0"))
@@ -119,6 +124,7 @@ class SimSwapWorker:
             f"layout={self._image_input_layout} image_input={self._image_input_name} "
             f"embedding_input={self._embedding_input_name} "
             f"converter={'yes' if self._embedding_converter is not None else 'no'} "
+            f"face_swapper_weight={self.face_swapper_weight:.3f} "
             f"mask_mode={'box_only' if not self.USE_AREA_MASK_IF_68 else 'box_plus_area68'} "
             f"debug_dir={self._debug_dir if self._debug_dir else '-'} "
             f"debug_swap_index={self._debug_swap_index if self._debug_swap_index > 0 else '-'} "
@@ -215,26 +221,172 @@ class SimSwapWorker:
         self._model_mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         self._model_std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-    def _prepare_simswap_embedding(self) -> np.ndarray:
-        emb = getattr(self._src_face, "embedding", None)
-        if emb is None:
-            emb = getattr(self._src_face, "normed_embedding", None)
+
+    @staticmethod
+    def _normalize_embedding(emb: np.ndarray) -> np.ndarray:
+        arr = np.asarray(emb, dtype=np.float32).reshape(1, -1)
+        norm = float(np.linalg.norm(arr))
+        if norm > 0.0:
+            arr = arr / norm
+        return np.ascontiguousarray(arr.astype(np.float32, copy=False))
+
+    @staticmethod
+    def _face_embedding(face) -> Optional[np.ndarray]:
+        for attr in ("normed_embedding", "embedding_norm", "embedding"):
+            emb = getattr(face, attr, None)
+            if emb is not None:
+                return SimSwapWorker._normalize_embedding(np.asarray(emb, dtype=np.float32))
+        return None
+
+    @staticmethod
+    def _bbox_iou(a: np.ndarray, b: np.ndarray) -> float:
+        ax1, ay1, ax2, ay2 = [float(v) for v in a[:4]]
+        bx1, by1, bx2, by2 = [float(v) for v in b[:4]]
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        iw = max(0.0, ix2 - ix1)
+        ih = max(0.0, iy2 - iy1)
+        inter = iw * ih
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union = area_a + area_b - inter
+        return float(inter / union) if union > 0.0 else 0.0
+
+    def _select_target_face_candidate(self, roi_bgr_u8: np.ndarray, target_face_meta: FaceMetadata):
+        try:
+            candidates = self._app.get(roi_bgr_u8)
+        except Exception:
+            return None
+        if not candidates:
+            return None
+        target_bbox = np.asarray(target_face_meta.bbox_xyxy, dtype=np.float32)
+        return max(
+            candidates,
+            key=lambda f: (
+                self._bbox_iou(np.asarray(getattr(f, "bbox", target_bbox), dtype=np.float32), target_bbox),
+                float((f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])) if hasattr(f, "bbox") else 0.0,
+            ),
+        )
+
+    def _target_face_from_meta(self, face_meta: FaceMetadata):
+        return SimpleNamespace(
+            bbox=np.asarray(face_meta.bbox_xyxy, dtype=np.float32),
+            kps=self._extract_target_kps5(face_meta),
+            det_score=float(face_meta.det_score) if face_meta.det_score is not None else 1.0,
+        )
+
+    def _recognize_target_face_from_meta(self, roi_bgr_u8: np.ndarray, target_face_meta: FaceMetadata):
+        """Run ArcFace recognition using pipeline-selected face metadata instead of re-detecting the face."""
+        face = self._target_face_from_meta(target_face_meta)
+        models = getattr(self._app, "models", {}) or {}
+        model_values = list(models.values()) if isinstance(models, dict) else list(models)
+        recognizers = [
+            m for m in model_values
+            if str(getattr(m, "taskname", "")).lower() == "recognition"
+        ]
+        recognizers.extend([m for m in model_values if m not in recognizers and hasattr(m, "get")])
+
+        for model in recognizers:
+            try:
+                model.get(roi_bgr_u8, face)
+                if self._face_embedding(face) is not None:
+                    return face
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _embedding_cosine(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
+        if a is None or b is None:
+            return None
+        aa = np.asarray(a, dtype=np.float32).reshape(-1)
+        bb = np.asarray(b, dtype=np.float32).reshape(-1)
+        denom = float(np.linalg.norm(aa) * np.linalg.norm(bb))
+        if denom <= 0.0:
+            return None
+        return float(np.dot(aa, bb) / denom)
+
+    def _set_last_embedding_metrics(
+        self,
+        *,
+        source_embedding: Optional[np.ndarray],
+        target_embedding: Optional[np.ndarray],
+        mixed_embedding: Optional[np.ndarray],
+        target_candidate_found: bool,
+        mode: str,
+        target_embedding_source: str = "none",
+    ) -> None:
+        target_used = target_embedding is not None
+        self.last_swap_metrics = {
+            "embedding_mode": mode,
+            "face_swapper_weight": float(self.face_swapper_weight),
+            "target_candidate_found": bool(target_candidate_found),
+            "target_embedding_source": str(target_embedding_source),
+            "target_embedding_used": bool(target_used),
+            "target_embedding_missing": bool(not target_used and self.face_swapper_weight < 0.999),
+            "mixed_embedding_used": bool(str(mode).startswith("mixed") and target_used and self.face_swapper_weight < 0.999),
+            "source_to_target_cos": self._embedding_cosine(source_embedding, target_embedding),
+            "source_to_mixed_cos": self._embedding_cosine(source_embedding, mixed_embedding),
+            "target_to_mixed_cos": self._embedding_cosine(target_embedding, mixed_embedding),
+        }
+
+    @staticmethod
+    def _mix_embeddings(source_embedding: np.ndarray, target_embedding: Optional[np.ndarray], weight: float) -> np.ndarray:
+        if target_embedding is None:
+            return source_embedding
+        w = float(max(0.0, min(1.0, weight)))
+        mixed = source_embedding.astype(np.float32) * w + target_embedding.astype(np.float32) * (1.0 - w)
+        return SimSwapWorker._normalize_embedding(mixed)
+
+    def _prepare_source_embedding_raw(self) -> np.ndarray:
+        emb = self._face_embedding(self._src_face)
         if emb is None:
             raise RuntimeError("Source face embedding missing from insightface result.")
+        return emb
 
+    def _convert_simswap_embedding(self, emb: np.ndarray) -> np.ndarray:
         emb = np.asarray(emb, dtype=np.float32).reshape(1, -1)
-
         if self._embedding_converter is not None:
             conv_inputs = self._embedding_converter.get_inputs()
             conv_name = conv_inputs[0].name if conv_inputs else "input"
             emb = self._embedding_converter.run(None, {conv_name: emb})[0]
+        return self._normalize_embedding(emb)
 
-        emb = np.asarray(emb, dtype=np.float32).reshape(1, -1)
-        norm = float(np.linalg.norm(emb))
-        if norm > 0.0:
-            emb = emb / norm
+    def _runtime_simswap_embedding(self, roi_bgr_u8: np.ndarray, target_face_meta: FaceMetadata) -> np.ndarray:
+        if self.face_swapper_weight >= 0.999:
+            self._set_last_embedding_metrics(
+                source_embedding=self._src_embedding_raw,
+                target_embedding=None,
+                mixed_embedding=self._src_embedding_raw,
+                target_candidate_found=False,
+                mode="source_only",
+                target_embedding_source="none",
+            )
+            return self._src_embedding
+        target_embedding_source = "detector_candidate"
+        target_candidate = self._select_target_face_candidate(roi_bgr_u8, target_face_meta)
+        target_embedding = self._face_embedding(target_candidate) if target_candidate is not None else None
 
-        return np.ascontiguousarray(emb.astype(np.float32, copy=False))
+        if target_embedding is None:
+            target_embedding_source = "metadata_recognition"
+            target_candidate = self._recognize_target_face_from_meta(roi_bgr_u8, target_face_meta)
+            target_embedding = self._face_embedding(target_candidate) if target_candidate is not None else None
+
+        if target_embedding is None:
+            target_embedding_source = "failed"
+
+        mixed_raw = self._mix_embeddings(self._src_embedding_raw, target_embedding, self.face_swapper_weight)
+        self._set_last_embedding_metrics(
+            source_embedding=self._src_embedding_raw,
+            target_embedding=target_embedding,
+            mixed_embedding=mixed_raw,
+            target_candidate_found=target_candidate is not None,
+            mode="mixed" if target_embedding is not None else "target_lookup_failed",
+            target_embedding_source=target_embedding_source,
+        )
+        return self._convert_simswap_embedding(mixed_raw)
 
     @staticmethod
     def _extract_target_kps5(face_meta: FaceMetadata) -> np.ndarray:
@@ -525,7 +677,7 @@ class SimSwapWorker:
         aligned_bgr_u8, affine_matrix = self._align_face(roi_bgr_u8, kps5)
 
         img_in = self._prepare_simswap_image(aligned_bgr_u8)
-        emb_in = self._src_embedding
+        emb_in = self._runtime_simswap_embedding(roi_bgr_u8, target_face_meta)
         raw = self._run_simswap_once(img_in, emb_in)
         swapped_crop_raw_bgr_u8 = self._decode_simswap_output(raw)
 

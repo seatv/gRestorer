@@ -94,6 +94,18 @@ def _cfg_str(cfg: Config, key_paths: List[Tuple[str, ...]], *, env_name: Optiona
         return str(os.getenv(env_name, default))
     return str(default)
 
+def _cfg_int_list(cfg: Config, key_paths: List[Tuple[str, ...]], *, default: Optional[List[int]] = None) -> List[int]:
+    value = cfg_first(cfg, key_paths, default=None)
+    if value is None:
+        return list(default or [])
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.replace(",", " ").split() if p.strip()]
+        return [int(p) for p in parts]
+    if isinstance(value, (list, tuple)):
+        return [int(v) for v in value]
+    return [int(value)]
+
+
 def _cfg_str_list(cfg: Config, key_paths: List[Tuple[str, ...]], *, default: Optional[List[str]] = None) -> List[str]:
     value = cfg_first(cfg, key_paths, default=None)
     if value is None:
@@ -417,6 +429,11 @@ class Pipeline:
         self.det_conf: float = float(cfg_first(self.cfg, conf_paths, default=0.30))
         self.det_iou: float = float(cfg_first(self.cfg, iou_paths, default=0.70))
         self.det_fp16: bool = bool(cfg_first(self.cfg, fp16_paths, default=True))
+        self.face_det_angles: List[int] = _cfg_int_list(
+            self.cfg,
+            [("face_detection", "angles"), ("face_detection", "det_angles"), ("detection", "face_angles")],
+            default=[0],
+        )
         self.face_det_suppress_onnx_warnings: bool = _cfg_bool(
             self.cfg,
             [("face_detection", "suppress_onnx_warnings")],
@@ -461,6 +478,95 @@ class Pipeline:
                     ("face_restoration", "swap_pixel_boost"),
                     ("restoration", "swap_pixel_boost"),
                 ],
+                default="",
+            )
+            or ""
+        ).strip()
+        self.face_swapper_weight: float = float(
+            cfg_first(
+                self.cfg,
+                [("face_restoration", "face_swapper_weight"), ("restoration", "face_swapper_weight")],
+                default=1.0,
+            )
+        )
+        self.swap_policy: str = str(
+            cfg_first(
+                self.cfg,
+                [("face_restoration", "swap_policy"), ("restoration", "swap_policy")],
+                default="detected",
+            )
+            or "detected"
+        ).lower()
+        self.force_swap_detected_faces: bool = _cfg_bool(
+            self.cfg,
+            [("face_restoration", "force_swap_detected_faces"), ("restoration", "force_swap_detected_faces")],
+            default=False,
+        )
+        self.force_swap_synthesize_meta: bool = _cfg_bool(
+            self.cfg,
+            [("face_restoration", "force_swap_synthesize_meta"), ("restoration", "force_swap_synthesize_meta")],
+            default=True,
+        )
+
+        self.allow_bbox_landmark_fallback: bool = _cfg_bool(
+            self.cfg,
+            [("face_restoration", "allow_bbox_landmark_fallback"), ("restoration", "allow_bbox_landmark_fallback")],
+            default=True,
+        )
+        self.reuse_previous_on_swap_failure: bool = _cfg_bool(
+            self.cfg,
+            [("face_restoration", "reuse_previous_on_swap_failure"), ("restoration", "reuse_previous_on_swap_failure")],
+            default=False,
+        )
+        self.face_geometry_stabilization_enabled: bool = _cfg_bool(
+            self.cfg,
+            [("face_restoration", "geometry_stabilization_enabled"), ("restoration", "geometry_stabilization_enabled")],
+            default=False,
+        )
+        self.face_geometry_stabilization_window: int = int(
+            cfg_first(
+                self.cfg,
+                [("face_restoration", "geometry_stabilization_window"), ("restoration", "geometry_stabilization_window")],
+                default=5,
+            )
+        )
+        self.face_geometry_stabilization_bbox: float = float(
+            cfg_first(
+                self.cfg,
+                [("face_restoration", "geometry_stabilization_bbox"), ("restoration", "geometry_stabilization_bbox")],
+                default=0.65,
+            )
+        )
+        self.face_geometry_stabilization_kps: float = float(
+            cfg_first(
+                self.cfg,
+                [("face_restoration", "geometry_stabilization_kps"), ("restoration", "geometry_stabilization_kps")],
+                default=0.65,
+            )
+        )
+        self.face_geometry_stabilization_max_bbox_jump_px: float = float(
+            cfg_first(
+                self.cfg,
+                [("face_restoration", "geometry_stabilization_max_bbox_jump_px"), ("restoration", "geometry_stabilization_max_bbox_jump_px")],
+                default=0.0,
+            )
+        )
+        self.face_geometry_stabilization_max_kps_jump_px: float = float(
+            cfg_first(
+                self.cfg,
+                [("face_restoration", "geometry_stabilization_max_kps_jump_px"), ("restoration", "geometry_stabilization_max_kps_jump_px")],
+                default=0.0,
+            )
+        )
+        self.face_swap_metrics_enabled: bool = _cfg_bool(
+            self.cfg,
+            [("face_restoration", "metrics_enabled"), ("restoration", "face_swap_metrics_enabled")],
+            default=False,
+        )
+        self.face_swap_metrics_path: str = str(
+            cfg_first(
+                self.cfg,
+                [("face_restoration", "metrics_path"), ("restoration", "face_swap_metrics_path")],
                 default="",
             )
             or ""
@@ -792,7 +898,11 @@ class Pipeline:
             from gRestorer.detector.lada_yolo import LadaYoloDetector
             return LadaYoloDetector(**common)
         elif self.det_type == "face":
-            return FaceDetector(**common, suppress_onnx_warnings=self.face_det_suppress_onnx_warnings)
+            return FaceDetector(
+                **common,
+                suppress_onnx_warnings=self.face_det_suppress_onnx_warnings,
+                angles=self.face_det_angles,
+            )
         else:
             raise ValueError(f"Unknown detector_type: {self.det_type}")
 
@@ -835,6 +945,20 @@ class Pipeline:
                 swap_model_path=self.swap_model_path,
                 swap_input_size=self.swap_input_size,
                 provider=self.swap_provider,
+                face_swapper_weight=self.face_swapper_weight,
+                swap_policy=self.swap_policy,
+                force_swap_detected_faces=self.force_swap_detected_faces,
+                force_swap_synthesize_meta=self.force_swap_synthesize_meta,
+                allow_bbox_landmark_fallback=self.allow_bbox_landmark_fallback,
+                reuse_previous_on_swap_failure=self.reuse_previous_on_swap_failure,
+                geometry_stabilization_enabled=self.face_geometry_stabilization_enabled,
+                geometry_stabilization_window=self.face_geometry_stabilization_window,
+                geometry_stabilization_bbox=self.face_geometry_stabilization_bbox,
+                geometry_stabilization_kps=self.face_geometry_stabilization_kps,
+                geometry_stabilization_max_bbox_jump_px=self.face_geometry_stabilization_max_bbox_jump_px,
+                geometry_stabilization_max_kps_jump_px=self.face_geometry_stabilization_max_kps_jump_px,
+                metrics_enabled=self.face_swap_metrics_enabled,
+                metrics_path=self.face_swap_metrics_path,
                 face_comp_mask_mode=self.face_comp_mask_mode,
                 face_comp_geom_expand=self.face_comp_geom_expand,
                 face_comp_mask_erode=self.face_comp_mask_erode,

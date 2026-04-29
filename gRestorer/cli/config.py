@@ -101,6 +101,7 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--det-iou", type=float, default=None)
     p.add_argument("--det-imgsz", type=int, default=None)
     p.add_argument("--det-fp16", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--face-det-angles", "--det-angles", dest="face_det_angles", nargs="+", type=int, choices=[0, 90, 180, 270], default=None, help="Face detector roll angles to try, e.g. 0 90 270")
 
     # --- Restoration ---
     p.add_argument("--rest-model", default=None)
@@ -119,6 +120,20 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--swap-provider", choices=["auto", "cuda", "cpu"], default=None)
     p.add_argument("--swap-backend", choices=["auto", "inswapper", "simswap", "hyperswap"], default=None, help="Face swap backend override (default: auto by model path)")
     p.add_argument("--swap-pixel-boost", default=None, help="HyperSwap pixel boost size, e.g. 512x512")
+    p.add_argument("--face-swapper-weight", type=float, default=None, help="Source identity weight 0.0..1.0; lower values preserve more target identity/expression")
+    p.add_argument("--swap-policy", choices=["strict", "detected", "aggressive"], default=None, help="Swap attempt policy for face_swap: strict, detected, or aggressive")
+    p.add_argument("--force-swap-detected-faces", action=argparse.BooleanOptionalAction, default=None, help="Treat detector face hits as authoritative and attempt swap without selector/identity refusal")
+    p.add_argument("--force-swap-synthesize-meta", action=argparse.BooleanOptionalAction, default=None, help="When force-swap is enabled, synthesize FaceMetadata from the detector ROI mask if metadata is missing")
+    p.add_argument("--allow-bbox-landmark-fallback", action=argparse.BooleanOptionalAction, default=None, help="Synthesize 5-point landmarks from bbox when landmarks are missing/invalid")
+    p.add_argument("--reuse-previous-on-swap-failure", action=argparse.BooleanOptionalAction, default=None, help="Reuse previous good swapped ROI if current frame swap fails")
+    p.add_argument("--face-geometry-stabilization-enabled", "--geometry-stabilization-enabled", dest="face_geometry_stabilization_enabled", action=argparse.BooleanOptionalAction, default=None, help="Smooth face bbox/keypoints across each clip before swapping")
+    p.add_argument("--face-geometry-window", type=int, default=None, help="Odd temporal window for face geometry stabilization")
+    p.add_argument("--face-geometry-bbox", type=float, default=None, help="Face bbox stabilization blend 0.0..1.0")
+    p.add_argument("--face-geometry-kps", type=float, default=None, help="Face keypoint stabilization blend 0.0..1.0")
+    p.add_argument("--face-geometry-max-bbox-jump-px", type=float, default=None, help="Clamp stabilized bbox coordinate jumps to this many crop-space pixels; 0 disables clamp")
+    p.add_argument("--face-geometry-max-kps-jump-px", type=float, default=None, help="Clamp stabilized keypoint jumps to this many crop-space pixels; 0 disables clamp")
+    p.add_argument("--face-swap-metrics-enabled", action=argparse.BooleanOptionalAction, default=None, help="Write face-swap per-frame metrics JSONL")
+    p.add_argument("--face-swap-metrics-path", default=None, help="Path for face-swap per-frame metrics JSONL")
     p.add_argument("--face-enhancer-model", default=None, help="Optional ONNX face enhancer model path (GFPGAN-like single-input model)")
     p.add_argument("--face-enhancer-blend", type=int, default=None, help="Optional face enhancer blend 0..100")
     p.add_argument("--expression-restorer-enabled", action=argparse.BooleanOptionalAction, default=None, help="Enable FaceFusion-style LivePortrait expression restoration after face swap")
@@ -296,6 +311,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_many_if_not_none(cfg, [("detection", "iou_threshold"), ("mosaic_detection", "iou_threshold"), ("face_detection", "iou_threshold")], args.det_iou)
     _set_many_if_not_none(cfg, [("detection", "imgsz"), ("mosaic_detection", "imgsz"), ("face_detection", "imgsz")], args.det_imgsz)
     _set_many_if_not_none(cfg, [("detection", "fp16"), ("mosaic_detection", "fp16"), ("face_detection", "fp16")], args.det_fp16)
+    _set_if_not_none(cfg, ("face_detection", "angles"), args.face_det_angles)
 
     # Restoration
     _set_many_if_not_none(cfg, [("restoration", "rest_model_path"), ("mosaic_restoration", "rest_model_path")], args.rest_model)
@@ -321,6 +337,20 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_many_if_not_none(cfg, [("restoration", "swap_provider"), ("face_restoration", "provider")], args.swap_provider)
     _set_many_if_not_none(cfg, [("restoration", "swap_backend"), ("face_restoration", "swap_backend")], args.swap_backend)
     _set_many_if_not_none(cfg, [("restoration", "swap_pixel_boost"), ("face_restoration", "swap_pixel_boost"), ("face_restoration", "pixel_boost")], args.swap_pixel_boost)
+    _set_many_if_not_none(cfg, [("restoration", "face_swapper_weight"), ("face_restoration", "face_swapper_weight")], args.face_swapper_weight)
+    _set_many_if_not_none(cfg, [("restoration", "swap_policy"), ("face_restoration", "swap_policy")], args.swap_policy)
+    _set_many_if_not_none(cfg, [("restoration", "force_swap_detected_faces"), ("face_restoration", "force_swap_detected_faces")], args.force_swap_detected_faces)
+    _set_many_if_not_none(cfg, [("restoration", "force_swap_synthesize_meta"), ("face_restoration", "force_swap_synthesize_meta")], args.force_swap_synthesize_meta)
+    _set_many_if_not_none(cfg, [("restoration", "allow_bbox_landmark_fallback"), ("face_restoration", "allow_bbox_landmark_fallback")], args.allow_bbox_landmark_fallback)
+    _set_many_if_not_none(cfg, [("restoration", "reuse_previous_on_swap_failure"), ("face_restoration", "reuse_previous_on_swap_failure")], args.reuse_previous_on_swap_failure)
+    _set_many_if_not_none(cfg, [("restoration", "geometry_stabilization_enabled"), ("face_restoration", "geometry_stabilization_enabled")], args.face_geometry_stabilization_enabled)
+    _set_many_if_not_none(cfg, [("restoration", "geometry_stabilization_window"), ("face_restoration", "geometry_stabilization_window")], args.face_geometry_window)
+    _set_many_if_not_none(cfg, [("restoration", "geometry_stabilization_bbox"), ("face_restoration", "geometry_stabilization_bbox")], args.face_geometry_bbox)
+    _set_many_if_not_none(cfg, [("restoration", "geometry_stabilization_kps"), ("face_restoration", "geometry_stabilization_kps")], args.face_geometry_kps)
+    _set_many_if_not_none(cfg, [("restoration", "geometry_stabilization_max_bbox_jump_px"), ("face_restoration", "geometry_stabilization_max_bbox_jump_px")], args.face_geometry_max_bbox_jump_px)
+    _set_many_if_not_none(cfg, [("restoration", "geometry_stabilization_max_kps_jump_px"), ("face_restoration", "geometry_stabilization_max_kps_jump_px")], args.face_geometry_max_kps_jump_px)
+    _set_many_if_not_none(cfg, [("restoration", "face_swap_metrics_enabled"), ("face_restoration", "metrics_enabled")], args.face_swap_metrics_enabled)
+    _set_many_if_not_none(cfg, [("restoration", "face_swap_metrics_path"), ("face_restoration", "metrics_path")], args.face_swap_metrics_path)
     _set_many_if_not_none(cfg, [("restoration", "face_enhancer_model_path"), ("enhancement", "model_path")], args.face_enhancer_model)
     _set_many_if_not_none(cfg, [("restoration", "face_enhancer_blend"), ("enhancement", "blend")], args.face_enhancer_blend)
     if args.face_enhancer_model is not None:
@@ -435,6 +465,25 @@ def parse_args(argv: list[str] | None = None) -> Config:
         swap_model_path = Path(swap_model_s)
         if not swap_model_path.exists():
             raise FileNotFoundError(f"Swap model not found: {swap_model_path}")
+
+        face_swapper_weight = float(_cfg_first(cfg, [("face_restoration", "face_swapper_weight"), ("restoration", "face_swapper_weight")], default=1.0))
+        if face_swapper_weight < 0.0 or face_swapper_weight > 1.0:
+            raise ValueError("face_restoration.face_swapper_weight must be in 0.0..1.0")
+        swap_policy = str(_cfg_first(cfg, [("face_restoration", "swap_policy"), ("restoration", "swap_policy")], default="detected") or "detected").lower()
+        if swap_policy not in ("strict", "detected", "aggressive"):
+            raise ValueError("face_restoration.swap_policy must be one of: strict, detected, aggressive")
+        _ = bool(_cfg_first(cfg, [("face_restoration", "force_swap_detected_faces"), ("restoration", "force_swap_detected_faces")], default=False))
+        _ = bool(_cfg_first(cfg, [("face_restoration", "force_swap_synthesize_meta"), ("restoration", "force_swap_synthesize_meta")], default=True))
+        _ = bool(_cfg_first(cfg, [("face_restoration", "geometry_stabilization_enabled"), ("restoration", "geometry_stabilization_enabled")], default=False))
+        _ = int(_cfg_first(cfg, [("face_restoration", "geometry_stabilization_window"), ("restoration", "geometry_stabilization_window")], default=5))
+        _ = float(_cfg_first(cfg, [("face_restoration", "geometry_stabilization_bbox"), ("restoration", "geometry_stabilization_bbox")], default=0.65))
+        _ = float(_cfg_first(cfg, [("face_restoration", "geometry_stabilization_kps"), ("restoration", "geometry_stabilization_kps")], default=0.65))
+        _ = float(_cfg_first(cfg, [("face_restoration", "geometry_stabilization_max_bbox_jump_px"), ("restoration", "geometry_stabilization_max_bbox_jump_px")], default=0.0))
+        _ = float(_cfg_first(cfg, [("face_restoration", "geometry_stabilization_max_kps_jump_px"), ("restoration", "geometry_stabilization_max_kps_jump_px")], default=0.0))
+        metrics_enabled = bool(_cfg_first(cfg, [("face_restoration", "metrics_enabled"), ("restoration", "face_swap_metrics_enabled")], default=False))
+        metrics_path = str(_cfg_first(cfg, [("face_restoration", "metrics_path"), ("restoration", "face_swap_metrics_path")], default="") or "").strip()
+        if metrics_enabled and not metrics_path:
+            cfg.set("face_restoration", "metrics_path", value="face_swap_metrics.jsonl")
 
         expression_enabled = bool(_cfg_first(cfg, [("expression_restoration", "enabled")], default=False))
         if expression_enabled:
