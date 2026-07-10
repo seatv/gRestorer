@@ -1,4 +1,4 @@
-# gRestorer
+# gRestorer - Development Paused - Checkout ChitraMaya
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
 
 gRestorer is a **GPU-first** video pipeline for mosaic detection, restoration, and face swapping:
